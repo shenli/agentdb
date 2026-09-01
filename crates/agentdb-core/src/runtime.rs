@@ -54,6 +54,7 @@ use crate::segment::{
 use crate::session::{ForkRef, Lifecycle, NewSession, Session, SnapshotLayer, SnapshotRef};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tablet_state::{
+    decode_sst_snapshot_payload, encode_sst_snapshot_payload, is_sst_snapshot_payload,
     LoggedTabletStateMachine, TabletCommand, TabletSnapshotShardFilter, TabletStateMachine,
     TabletStateSnapshot, TabletStorageStats, TabletWriteOp,
 };
@@ -1688,6 +1689,18 @@ impl RuntimeTabletRouterKvStore {
 
     fn export_snapshot_payload(&self, tablet_id: i64) -> agentdb_storage::Result<Vec<u8>> {
         self.with_handle(tablet_id, |handle| {
+            // Fast path: eager whole-tablet SST movement (hardening §7), when
+            // enabled and the tablet clears the size threshold. This ships an
+            // `ADSS` payload the target bulk-loads via `IngestExternalFile`
+            // instead of replaying every key. Falls back to the logical
+            // compact-encoded snapshot when disabled, below threshold, empty,
+            // or unsupported by the store backend. Shard-range (split/merge)
+            // moves never reach here — they use the `_for_shard_range` export.
+            if sst_movement_enabled() {
+                if let Some(payload) = try_export_sst_snapshot_payload(&handle.state_machine)? {
+                    return Ok(payload);
+                }
+            }
             Ok(handle.state_machine.export_snapshot()?.encode())
         })
     }
@@ -1710,6 +1723,13 @@ impl RuntimeTabletRouterKvStore {
         tablet_id: i64,
         payload: &[u8],
     ) -> agentdb_storage::Result<()> {
+        // Whole-tablet SST movement payload (`ADSS`): range-delete the tablet
+        // scope and bulk-load the SST. Any build recognizing the format can
+        // install it regardless of whether *its own* movement flag is set, so
+        // a rolling upgrade stays safe (senders are enabled last).
+        if is_sst_snapshot_payload(payload) {
+            return self.install_sst_snapshot_payload(tablet_id, payload);
+        }
         let snapshot = TabletStateSnapshot::decode(payload).map_err(|err| {
             agentdb_storage::Error::Other(format!(
                 "decode tablet {tablet_id} runtime snapshot: {err}"
@@ -1717,6 +1737,62 @@ impl RuntimeTabletRouterKvStore {
         })?;
         self.with_handle(tablet_id, |handle| {
             handle.state_machine.install_snapshot(&snapshot)
+        })
+    }
+
+    fn install_sst_snapshot_payload(
+        &self,
+        tablet_id: i64,
+        payload: &[u8],
+    ) -> agentdb_storage::Result<()> {
+        let decoded = decode_sst_snapshot_payload(payload)?;
+        // The SST is a byte-copy carrying the *source* tablet's key prefix, so
+        // it is only valid when the move preserves the tablet id (the raft
+        // whole-tablet replacement / add-replica path always does). A mismatch
+        // means a caller wrongly routed a retarget through the SST path.
+        if decoded.tablet_id != tablet_id {
+            return Err(agentdb_storage::Error::Other(format!(
+                "SST snapshot tablet_id {} does not match target tablet_id {tablet_id}; SST movement cannot retarget",
+                decoded.tablet_id
+            )));
+        }
+        self.with_handle(tablet_id, |handle| {
+            // Place the incoming SST on the DB's own filesystem, and refuse the
+            // install when it would not leave the disk reservation intact. On
+            // the receiving side we fail fast (rather than fall back) so the
+            // node surfaces "add disk" instead of driving the data disk to zero
+            // and wedging every future write, compaction, and recovery — the
+            // snapshot-apply doom loop TiKV's `reserve-space` guards against.
+            let Some(data_dir) = handle.state_machine.store().data_dir() else {
+                return Err(agentdb_storage::Error::Other(format!(
+                    "tablet {tablet_id} store backend cannot ingest an SST movement payload"
+                )));
+            };
+            let scratch_root = movement_scratch_root(&data_dir)?;
+            let reserve = movement_disk_reserve_bytes();
+            let needed = decoded.sst.len() as u64;
+            if let Some(available) = agentdb_storage::available_disk_bytes(&scratch_root) {
+                if available < needed.saturating_add(reserve) {
+                    return Err(agentdb_storage::Error::Other(format!(
+                        "tablet {tablet_id} SST movement install needs {needed} bytes + {reserve} reserve but only {available} free; add disk (AGENTDB_MOVEMENT_DISK_RESERVE_BYTES)"
+                    )));
+                }
+            }
+            let dir = tempfile::tempdir_in(&scratch_root).map_err(|err| {
+                agentdb_storage::Error::Other(format!("sst install tempdir: {err}"))
+            })?;
+            let path = dir.path().join("tablet.sst");
+            std::fs::write(&path, decoded.sst)
+                .map_err(|err| agentdb_storage::Error::Other(format!("write sst: {err}")))?;
+            if !handle
+                .state_machine
+                .install_snapshot_sst(&path, decoded.applied_index)?
+            {
+                return Err(agentdb_storage::Error::Other(format!(
+                    "tablet {tablet_id} store backend cannot ingest an SST movement payload"
+                )));
+            }
+            Ok(())
         })
     }
 
@@ -1966,6 +2042,110 @@ fn startup_hydration_max_bytes() -> u64 {
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(512 * 1024 * 1024)
+}
+
+/// Whether eager SST-based whole-tablet movement is enabled. Default off: a
+/// node must never *produce* an `ADSS` payload for a peer that might be running
+/// an older build unable to decode it. Enable (`AGENTDB_SST_MOVEMENT=1`) only
+/// after the whole fleet runs a build that recognizes the format; every such
+/// build can always *decode* an `ADSS` payload regardless of this flag, so a
+/// rolling upgrade stays safe as long as senders are enabled last.
+fn sst_movement_enabled() -> bool {
+    std::env::var("AGENTDB_SST_MOVEMENT")
+        .ok()
+        .map(|raw| {
+            let raw = raw.trim();
+            raw == "1" || raw.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+/// Minimum whole-tablet SST size (bytes) before the fast movement path is
+/// used. Ingest has a fixed per-file overhead, so small tablets stay on the
+/// logical path where they are already cheap.
+fn sst_movement_min_bytes() -> u64 {
+    std::env::var("AGENTDB_SST_MOVEMENT_MIN_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(256 * 1024)
+}
+
+/// Disk-space reservation (bytes) that snapshot generate/apply must leave free
+/// on the data filesystem. Movement never consumes into this floor: a snapshot
+/// that fills the disk otherwise wedges the node into a doom loop, because even
+/// compaction and recovery need scratch space (TiKV's store `reserve-space`
+/// lesson). Default 2 GiB.
+fn movement_disk_reserve_bytes() -> u64 {
+    std::env::var("AGENTDB_MOVEMENT_DISK_RESERVE_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(2 * 1024 * 1024 * 1024)
+}
+
+/// Try to build a whole-tablet SST movement payload for `sm`. Returns `None`
+/// (so the caller falls back to the logical snapshot) when the store backend
+/// has no SST support, the tablet is empty, or the SST is below the movement
+/// size threshold. Exports to a temp SST and inlines its bytes into an `ADSS`
+/// payload.
+fn try_export_sst_snapshot_payload(
+    sm: &LoggedTabletStateMachine,
+) -> agentdb_storage::Result<Option<Vec<u8>>> {
+    // Place the scratch SST on the DB's own filesystem (so the reservation
+    // check below measures the right disk, and the later ingest avoids a
+    // cross-filesystem copy). No data dir → non-Rocks backend → no SST support.
+    let Some(data_dir) = sm.store().data_dir() else {
+        return Ok(None);
+    };
+    let scratch_root = movement_scratch_root(&data_dir)?;
+    // Reservation floor: never even begin generating an SST when the disk is
+    // already at/below the reserve — degrade to the logical path, whose payload
+    // is built in memory and needs no scratch file. This keeps the export side
+    // out of the doom loop.
+    if let Some(available) = agentdb_storage::available_disk_bytes(&scratch_root) {
+        if available <= movement_disk_reserve_bytes() {
+            tracing::warn!(
+                available,
+                reserve = movement_disk_reserve_bytes(),
+                "movement: disk at/below reserve, exporting logical snapshot instead of SST"
+            );
+            return Ok(None);
+        }
+    }
+    let dir = tempfile::tempdir_in(&scratch_root)
+        .map_err(|err| agentdb_storage::Error::Other(format!("sst export tempdir: {err}")))?;
+    let path = dir.path().join("tablet.sst");
+    let meta = match sm.export_snapshot_sst(&path) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return Ok(None), // backend has no SST support
+        Err(err) => {
+            // A failed generate (e.g. ENOSPC mid-write) must not abort the move:
+            // fall back to the logical path rather than propagate.
+            tracing::warn!(%err, "movement: SST export failed, falling back to logical snapshot");
+            return Ok(None);
+        }
+    };
+    if meta.sst_bytes == 0 || meta.sst_bytes < sst_movement_min_bytes() {
+        return Ok(None); // empty or below threshold → cheaper on the logical path
+    }
+    let sst = std::fs::read(&path)
+        .map_err(|err| agentdb_storage::Error::Other(format!("read exported sst: {err}")))?;
+    Ok(Some(encode_sst_snapshot_payload(
+        meta.tablet_id,
+        meta.applied_index,
+        &sst,
+    )))
+}
+
+/// Ensure and return a movement scratch directory alongside the data dir. Kept
+/// on the same filesystem as the DB so disk-reservation math and ingest both
+/// see the right disk.
+fn movement_scratch_root(
+    data_dir: &std::path::Path,
+) -> agentdb_storage::Result<std::path::PathBuf> {
+    let root = data_dir.join("movement_scratch");
+    std::fs::create_dir_all(&root)
+        .map_err(|err| agentdb_storage::Error::Other(format!("movement scratch dir: {err}")))?;
+    Ok(root)
 }
 
 fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 17] {
@@ -3469,6 +3649,24 @@ impl Runtime {
         let Some(persist) = self.persist.as_ref() else {
             return Ok(());
         };
+        // A whole-tablet SST payload cannot be enumerated key-by-key without
+        // reading the SST, so the per-category row caps (a logical-hydration
+        // concern) do not apply. Guard the total instead: the compressed SST
+        // must not itself exceed the hydrated-bytes budget — a conservative
+        // bound, since the decompressed range is what lands in memory.
+        if is_sst_snapshot_payload(payload) {
+            let max_bytes = startup_hydration_max_bytes();
+            let payload_bytes = payload.len() as u64;
+            if payload_bytes > max_bytes {
+                return Err(Error::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "tablet {tablet_id} SST movement payload {payload_bytes} bytes > AGENTDB_STARTUP_MAX_HYDRATED_BYTES {max_bytes}"
+                    ),
+                ));
+            }
+            return Ok(());
+        }
         let snapshot = TabletStateSnapshot::decode(payload).map_err(|error| {
             Error::new(
                 ErrorCode::Internal,

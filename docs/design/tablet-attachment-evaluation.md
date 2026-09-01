@@ -1,11 +1,14 @@
 # Manifest-Based Tablet Attachment — Evaluation
 
-**Status: evaluation (P2), not a committed feature.** This document records
-the evidence and reasoning for the hardening-plan §7 question — *can a
-cold/read-mostly tablet move without copying its complete durable history?*
-— and gives a go/no-go recommendation. Per the plan, the local hot-tablet
-path is not to be replaced unless the AgentDB session-native workload shows
-an operational or cost win.
+**Status: eager SST movement built (opt-in); lazy-block attach still
+gated.** This document records the evidence and reasoning for the
+hardening-plan §7 question — *can a cold/read-mostly tablet move without
+copying its complete durable history?* — and the go/no-go outcome. The
+eager rung (SST export/ingest for whole-tablet moves) is now implemented
+behind `AGENTDB_SST_MOVEMENT` with a disk reservation; the full lazy-block
+attach remains gated behind a demonstrated need. Per the plan, the local
+hot-tablet path is not replaced unless the AgentDB session-native workload
+shows an operational or cost win.
 
 ## The question
 
@@ -156,20 +159,46 @@ and correctness risk, so it should not be built speculatively.
   `ingest_ssts`) plus a prototype benchmark proving the target-side win
   (~flat ~1 ms install, 59× at 80k events, growing).
 
-**Recommended next — eager SST-based whole-tablet movement (the proven win):**
-Wire whole-tablet moves (replacement, adding a replica) through
-checkpoint/SST → transfer → ingest instead of the logical KV dump. It has
-the big proven payoff and *far* less risk than lazy attach — no on-read
-object-store dependency, no block-cache management. Design points:
-- **Whole-tablet moves only**; shard-range moves (split/merge) keep the
-  logical path (you can't cheaply carve a shard subset out of an SST).
-- **Fallback + version negotiation**: SSTs carry a `format_version`; if the
-  target's RocksDB can't ingest (mixed builds during a rolling upgrade),
-  fall back to the logical compact-encoded path. Keep the logical path as
-  the always-safe default.
-- **Size threshold**: ingest has fixed overhead; small tablets stay logical.
-- **Object-store staging** (optional, toward §7): put the SST in the bucket
-  and ship a manifest reference instead of the bytes inline.
+**Built — eager SST-based whole-tablet movement (the proven win):**
+Whole-tablet moves (replacement, adding a replica) now flow through
+SST export → transfer → ingest instead of the logical KV dump, behind an
+opt-in flag. It has the big proven payoff and *far* less risk than lazy
+attach — no on-read object-store dependency, no block-cache management.
+As shipped:
+- **Whole-tablet moves only.** The raft snapshot-transfer path
+  (`Runtime::export_tablet_snapshot_payload` →
+  `install_tablet_snapshot_payload_and_rehydrate`) takes the SST path;
+  shard-range moves (split/merge) keep the logical path (you can't cheaply
+  carve a shard subset out of an SST, and the SST is a byte-copy that
+  preserves the tablet id).
+- **Idempotent, any-target install.** `RocksKvStore::replace_prefix_from_sst`
+  range-deletes the tablet scope, then ingests the SST with a global seqno,
+  so it overwrites even a target that already holds a stale copy of the
+  range — not just a fresh replica.
+- **Self-describing payload + rolling-upgrade safety.** The wire payload is
+  framed with an `ADSS` magic (distinct from the logical `ADBS`), so a
+  receiver routes it correctly and an old build rejects rather than
+  mis-parses it. Movement is **off by default** (`AGENTDB_SST_MOVEMENT`);
+  any build recognizing `ADSS` can always *decode* one, so enabling senders
+  last keeps a rolling upgrade safe. The logical compact-encoded path stays
+  the always-safe default and the automatic fallback (disabled, below
+  threshold, empty, or non-RocksDB backend).
+- **Size threshold.** `AGENTDB_SST_MOVEMENT_MIN_BYTES` (default 256 KiB);
+  ingest has fixed overhead, so small tablets stay logical where they are
+  already cheap.
+- **Disk-space reservation.** Snapshot generate/apply never consumes the
+  data disk below `AGENTDB_MOVEMENT_DISK_RESERVE_BYTES` (default 2 GiB):
+  export degrades to the in-memory logical path, and install fails fast with
+  an "add disk" error rather than driving the disk to zero — which would
+  wedge the node into a doom loop, since even compaction and recovery need
+  scratch space (TiKV's store `reserve-space` lesson). Scratch SSTs are
+  written on the DB's own filesystem so the reservation measures the right
+  disk.
+
+**Still open (optional, toward §7):**
+- **Object-store staging**: put the SST in the bucket and ship a manifest
+  reference instead of the bytes inline, so the transfer does not ride the
+  raft snapshot payload.
 
 **Still gated — the full lazy-block attach:**
 - Only worth it beyond eager SST if a workload needs to attach *without*
@@ -179,5 +208,5 @@ object-store dependency, no block-cache management. Design points:
   measure the plan's eight metrics before adopting.
 
 Net: the compact-encoding win is delivered and the **eager SST path is
-proven and recommended to build next**; the full lazy-block attach stays
-gated behind a demonstrated need.
+built (opt-in, with a disk-space reservation)**; the full lazy-block attach
+stays gated behind a demonstrated need.

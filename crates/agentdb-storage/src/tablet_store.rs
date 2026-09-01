@@ -115,6 +115,41 @@ impl TabletKvStore {
     fn key(&self, key: &[u8]) -> Vec<u8> {
         scoped_key(&self.scope, key)
     }
+
+    /// On-disk directory backing the underlying store, when it has one. Movement
+    /// places scratch SSTs here so the disk-reservation check measures the right
+    /// filesystem.
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        self.kv.data_dir()
+    }
+
+    /// Byte prefix identifying this tablet's key range in the underlying store:
+    /// the shared-store tablet prefix, or empty for a physical (whole-DB) scope.
+    fn scope_prefix(&self) -> &[u8] {
+        match &self.scope {
+            TabletKvScope::SharedPrefix(prefix) => prefix,
+            TabletKvScope::Physical => b"",
+        }
+    }
+
+    /// Export this tablet's entire key range to a self-contained SST file at
+    /// `out_path` — the fast movement path (`SstFileWriter`, bulk-loadable via
+    /// [`replace_scope_from_sst`](Self::replace_scope_from_sst)). Returns
+    /// `Some(bytes)` (`Some(0)` for an empty range), or `None` when the backend
+    /// has no SST support so the caller falls back to the logical KV path.
+    pub fn export_scope_sst(&self, out_path: &Path) -> Result<Option<u64>> {
+        self.kv.export_prefix_sst(self.scope_prefix(), out_path)
+    }
+
+    /// Replace this tablet's entire key range with the SST at `sst_path`
+    /// (range-delete the scope, then global-seqno ingest). Idempotent and safe
+    /// even when the target already held keys in the range. Returns `true` on
+    /// success, or `false` when the backend has no SST support so the caller
+    /// falls back to the logical KV path.
+    pub fn replace_scope_from_sst(&self, sst_path: &Path) -> Result<bool> {
+        self.kv
+            .replace_prefix_from_sst(self.scope_prefix(), sst_path)
+    }
 }
 
 impl KvStore for TabletKvStore {

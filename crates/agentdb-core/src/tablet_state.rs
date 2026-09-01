@@ -5,6 +5,7 @@
 //! works with `SingleNodeReplicatedLog`; replacing the log with Raft should not
 //! change command application semantics.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agentdb_storage::{
@@ -64,6 +65,16 @@ pub struct TabletStateSnapshot {
 pub struct TabletSnapshotEntry {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
+}
+
+/// Result of a whole-tablet SST export ([`LoggedTabletStateMachine::export_snapshot_sst`]):
+/// the identity + applied index the target must adopt, and the SST size the
+/// caller uses to decide whether the fast path clears its size threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SstSnapshotMeta {
+    pub tablet_id: i64,
+    pub applied_index: u64,
+    pub sst_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +143,80 @@ impl TabletSnapshotShardFilter {
 /// begins with `{`.
 const SNAPSHOT_MAGIC: &[u8; 4] = b"ADBS";
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
+
+/// Magic for a whole-tablet SST movement payload (the eager §7 fast path).
+/// Distinct from `SNAPSHOT_MAGIC` (`ADBS`) at byte 2 (`S` vs `B`), so a
+/// receiver can tell the two apart, and an *old* build's `TabletStateSnapshot::decode`
+/// — which only recognizes `ADBS` — rejects it (falls through to a failing
+/// JSON parse) rather than silently mis-reading it. SST movement is therefore
+/// only safe to enable once every node runs a build that recognizes `ADSS`.
+const SST_SNAPSHOT_MAGIC: &[u8; 4] = b"ADSS";
+const SST_SNAPSHOT_ENCODING_VERSION: u8 = 1;
+
+/// A whole-tablet SST movement payload decoded from the wire: the tablet
+/// identity and applied index the target must adopt, plus the raw SST bytes to
+/// ingest. Borrows the SST slice from the input buffer to avoid a copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedSstSnapshot<'a> {
+    pub tablet_id: i64,
+    pub applied_index: u64,
+    pub sst: &'a [u8],
+}
+
+/// Whether `bytes` is a whole-tablet SST movement payload (see [`encode_sst_snapshot_payload`]).
+/// Callers check this before attempting a logical [`TabletStateSnapshot::decode`].
+pub fn is_sst_snapshot_payload(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && &bytes[..4] == SST_SNAPSHOT_MAGIC
+}
+
+/// Encode a whole-tablet SST movement payload.
+///
+/// Layout: `ADSS` | version:u8 | tablet_id:i64 | applied_index:u64 |
+/// sst_len:u64 | sst_bytes, integers big-endian.
+pub fn encode_sst_snapshot_payload(tablet_id: i64, applied_index: u64, sst: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 1 + 8 + 8 + 8 + sst.len());
+    out.extend_from_slice(SST_SNAPSHOT_MAGIC);
+    out.push(SST_SNAPSHOT_ENCODING_VERSION);
+    out.extend_from_slice(&tablet_id.to_be_bytes());
+    out.extend_from_slice(&applied_index.to_be_bytes());
+    out.extend_from_slice(&(sst.len() as u64).to_be_bytes());
+    out.extend_from_slice(sst);
+    out
+}
+
+/// Decode a payload produced by [`encode_sst_snapshot_payload`]. Errors if the
+/// magic, version, or length framing is wrong. Call [`is_sst_snapshot_payload`]
+/// first to route logical vs SST payloads.
+pub fn decode_sst_snapshot_payload(bytes: &[u8]) -> StorageResult<DecodedSstSnapshot<'_>> {
+    let err = |msg: &str| agentdb_storage::Error::Other(format!("decode SST snapshot: {msg}"));
+    if !is_sst_snapshot_payload(bytes) {
+        return Err(err("bad magic"));
+    }
+    let mut pos = 4;
+    let take = |pos: &mut usize, n: usize| -> StorageResult<&[u8]> {
+        if *pos + n > bytes.len() {
+            return Err(agentdb_storage::Error::Other(
+                "decode SST snapshot: truncated".into(),
+            ));
+        }
+        let slice = &bytes[*pos..*pos + n];
+        *pos += n;
+        Ok(slice)
+    };
+    let version = take(&mut pos, 1)?[0];
+    if version != SST_SNAPSHOT_ENCODING_VERSION {
+        return Err(err(&format!("unsupported encoding version {version}")));
+    }
+    let tablet_id = i64::from_be_bytes(take(&mut pos, 8)?.try_into().unwrap());
+    let applied_index = u64::from_be_bytes(take(&mut pos, 8)?.try_into().unwrap());
+    let sst_len = u64::from_be_bytes(take(&mut pos, 8)?.try_into().unwrap()) as usize;
+    let sst = take(&mut pos, sst_len)?;
+    Ok(DecodedSstSnapshot {
+        tablet_id,
+        applied_index,
+        sst,
+    })
+}
 
 impl TabletStateSnapshot {
     /// Encode for transfer/persistence. Uses a compact length-prefixed
@@ -308,6 +393,47 @@ impl LoggedTabletStateMachine {
         filter: TabletSnapshotShardFilter,
     ) -> StorageResult<TabletStateSnapshot> {
         self.export_snapshot()?.filter_for_shard_range(filter)
+    }
+
+    /// Export this tablet's entire applied state to a self-contained SST file
+    /// at `out_path` — the fast whole-tablet movement path. Applies committed
+    /// entries first, so the SST is a physically consistent byte-copy of the
+    /// tablet's whole key range (user keys *and* the reserved applied-index
+    /// key move atomically, so the header and data cannot diverge). Returns
+    /// [`SstSnapshotMeta`] on success (`sst_bytes == 0` for an empty tablet,
+    /// no file produced), or `None` when the store backend has no SST support
+    /// so the caller falls back to the logical snapshot.
+    pub fn export_snapshot_sst(&self, out_path: &Path) -> StorageResult<Option<SstSnapshotMeta>> {
+        self.apply_committed()?;
+        let applied_index = self.applied_index();
+        match self.store.export_scope_sst(out_path)? {
+            Some(sst_bytes) => Ok(Some(SstSnapshotMeta {
+                tablet_id: self.tablet_id,
+                applied_index,
+                sst_bytes,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Install a whole-tablet SST produced by [`export_snapshot_sst`],
+    /// replacing this tablet's entire key range (range-delete + global-seqno
+    /// ingest) and adopting `applied_index`. The SST already carries the
+    /// source's applied-index key, but it is re-stamped explicitly afterward so
+    /// the value is authoritative regardless of the file's contents. Returns
+    /// `false` when the store backend has no SST support so the caller falls
+    /// back to the logical path.
+    pub fn install_snapshot_sst(&self, sst_path: &Path, applied_index: u64) -> StorageResult<bool> {
+        if !self.store.replace_scope_from_sst(sst_path)? {
+            return Ok(false);
+        }
+        self.store
+            .put(APPLIED_INDEX_KEY, &applied_index.to_be_bytes())?;
+        *self
+            .applied_index
+            .lock()
+            .expect("tablet applied-index lock poisoned") = applied_index;
+        Ok(true)
     }
 
     pub fn install_snapshot(&self, snapshot: &TabletStateSnapshot) -> StorageResult<()> {
@@ -1145,6 +1271,105 @@ mod tests {
             restarted.store().get(b"k").unwrap().as_deref(),
             Some(&b"fresh"[..])
         );
+    }
+
+    #[test]
+    fn sst_snapshot_round_trip_moves_state_and_applied_index() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_kv = Arc::new(RocksKvStore::open(source_dir.path()).unwrap());
+        let source = LoggedTabletStateMachine::single_node(source_kv, 7).unwrap();
+        for i in 0..64 {
+            source
+                .commit(TabletCommand::WriteBatch {
+                    ops: vec![TabletWriteOp::Put {
+                        key: format!("record/session/tenant-a/sess_{i:04}").into_bytes(),
+                        value: vec![0xAB; 128],
+                    }],
+                })
+                .unwrap();
+        }
+        let expected_index = source.applied_index();
+
+        let sst_dir = tempfile::tempdir().unwrap();
+        let sst_path = sst_dir.path().join("move.sst");
+        let meta = source.export_snapshot_sst(&sst_path).unwrap().unwrap();
+        assert_eq!(meta.tablet_id, 7);
+        assert_eq!(meta.applied_index, expected_index);
+        assert!(meta.sst_bytes > 0);
+
+        // Fresh target with unrelated stale state under the same tablet scope.
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_kv = Arc::new(RocksKvStore::open(target_dir.path()).unwrap());
+        let target = LoggedTabletStateMachine::single_node(target_kv.clone(), 7).unwrap();
+        target
+            .store()
+            .put(b"record/session/tenant-a/stale", b"gone")
+            .unwrap();
+
+        assert!(target
+            .install_snapshot_sst(&sst_path, meta.applied_index)
+            .unwrap());
+        assert_eq!(target.applied_index(), expected_index);
+        assert_eq!(
+            target
+                .store()
+                .get(b"record/session/tenant-a/sess_0000")
+                .unwrap()
+                .as_deref(),
+            Some(&vec![0xAB; 128][..])
+        );
+        // Stale key absent from the SST is gone; moved range is exactly present.
+        assert!(target
+            .store()
+            .get(b"record/session/tenant-a/stale")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            target
+                .store()
+                .scan_prefix(b"record/session/")
+                .unwrap()
+                .count(),
+            64
+        );
+
+        // Survives restart: applied index and data are durable.
+        let restarted = LoggedTabletStateMachine::single_node(target_kv, 7).unwrap();
+        assert_eq!(restarted.applied_index(), expected_index);
+        assert_eq!(
+            restarted
+                .store()
+                .get(b"record/session/tenant-a/sess_0063")
+                .unwrap()
+                .as_deref(),
+            Some(&vec![0xAB; 128][..])
+        );
+    }
+
+    #[test]
+    fn sst_snapshot_payload_codec_round_trips() {
+        let sst = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let payload = encode_sst_snapshot_payload(42, 9001, &sst);
+        assert!(is_sst_snapshot_payload(&payload));
+        // The logical decoder must reject an SST payload (distinct magic), so a
+        // receiver never mis-parses one as a logical snapshot.
+        assert!(TabletStateSnapshot::decode(&payload).is_err());
+
+        let decoded = decode_sst_snapshot_payload(&payload).unwrap();
+        assert_eq!(decoded.tablet_id, 42);
+        assert_eq!(decoded.applied_index, 9001);
+        assert_eq!(decoded.sst, &sst[..]);
+
+        // Truncated payload is rejected, not silently accepted.
+        assert!(decode_sst_snapshot_payload(&payload[..payload.len() - 3]).is_err());
+        // A logical payload is not mistaken for an SST payload.
+        let logical = TabletStateSnapshot {
+            tablet_id: 1,
+            applied_index: 2,
+            entries: vec![],
+        }
+        .encode();
+        assert!(!is_sst_snapshot_payload(&logical));
     }
 
     #[test]

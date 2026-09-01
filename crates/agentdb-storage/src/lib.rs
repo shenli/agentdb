@@ -31,7 +31,9 @@ pub use kms::{
     AllowAllKmsKeyResolver, KeyOperation, KeyResolution, KmsError, KmsKeyResolver, KmsResult,
     StaticKeyState, StaticKmsKeyResolver,
 };
-pub use kv::{InMemoryKvStore, KvIter, KvSnapshot, KvStore, KvStoreMetrics, WriteOp};
+pub use kv::{
+    available_disk_bytes, InMemoryKvStore, KvIter, KvSnapshot, KvStore, KvStoreMetrics, WriteOp,
+};
 pub use metadata_crypto::{
     IdentityMetadataCryptoAdapter, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
 };

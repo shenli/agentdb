@@ -123,6 +123,70 @@ pub trait KvStore: Send + Sync {
     fn compact_all(&self) -> Result<()> {
         self.compact_range(None, None)
     }
+
+    /// Export every KV pair under `prefix` to one self-contained SST file at
+    /// `out_path`, for bulk-loading into another store via
+    /// [`replace_prefix_from_sst`](KvStore::replace_prefix_from_sst). This is
+    /// the fast path for moving a whole tablet's key range — the file lands at
+    /// the target's LSM bottom with no per-key memtable/compaction work.
+    ///
+    /// Returns `Some(bytes)` with the SST size, `Some(0)` when the range is
+    /// empty (no file produced), or `None` when the backend has no SST support
+    /// (the caller then falls back to the logical KV path).
+    fn export_prefix_sst(&self, prefix: &[u8], out_path: &Path) -> Result<Option<u64>> {
+        let _ = (prefix, out_path);
+        Ok(None)
+    }
+
+    /// Replace the entire `prefix` range with the contents of the SST at
+    /// `sst_path`: range-delete the prefix, then ingest the SST *above* that
+    /// tombstone so its keys win even if the target already held keys in the
+    /// range (any stale key absent from the SST stays deleted). This makes the
+    /// install idempotent and safe for a re-move to a non-empty target, not
+    /// only a fresh replica.
+    ///
+    /// Returns `true` on success, or `false` when the backend has no SST
+    /// support (the caller then falls back to the logical KV path).
+    fn replace_prefix_from_sst(&self, prefix: &[u8], sst_path: &Path) -> Result<bool> {
+        let _ = (prefix, sst_path);
+        Ok(false)
+    }
+
+    /// On-disk directory backing this store, when it has one. Used to place
+    /// movement scratch (SST) files on the *same* filesystem as the data — so a
+    /// disk-space reservation check measures the disk that actually matters —
+    /// and to let ingest avoid a cross-filesystem copy. `None` for stores with
+    /// no filesystem home (e.g. in-memory).
+    fn data_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// Bytes currently available to an unprivileged process on the filesystem that
+/// holds `path` (the directory must exist). `None` if the query fails. Used by
+/// the movement path to keep a disk-space reservation: a snapshot generate/apply
+/// that fills the disk otherwise wedges the node into a doom loop, since even
+/// compaction and recovery need scratch space (a lesson from TiKV's store
+/// `reserve-space`).
+pub fn available_disk_bytes(path: &Path) -> Option<u64> {
+    fs2::available_space(path).ok()
+}
+
+/// Smallest key strictly greater than every key that has `prefix` as a prefix,
+/// i.e. the exclusive upper bound of the prefix range. Increments the last
+/// byte below `0xFF`, dropping trailing `0xFF` bytes. Returns `None` when the
+/// prefix is empty or all `0xFF` (the range is unbounded above — the whole
+/// remaining keyspace).
+pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last().copied() {
+        if last < 0xFF {
+            *end.last_mut().unwrap() = last + 1;
+            return Some(end);
+        }
+        end.pop();
+    }
+    None
 }
 
 #[derive(Default)]

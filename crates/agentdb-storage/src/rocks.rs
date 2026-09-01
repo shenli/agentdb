@@ -2,12 +2,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rocksdb::{
-    checkpoint::Checkpoint, DBCompressionType, Direction, IteratorMode, Options, WriteBatch,
-    WriteOptions, DB,
+    checkpoint::Checkpoint, DBCompressionType, Direction, IngestExternalFileOptions, IteratorMode,
+    Options, WriteBatch, WriteOptions, DB,
 };
 
 use crate::error::{Error, Result};
-use crate::kv::{KvIter, KvSnapshot, KvStore, KvStoreMetrics, WriteOp};
+use crate::kv::{prefix_upper_bound, KvIter, KvSnapshot, KvStore, KvStoreMetrics, WriteOp};
 
 /// Result type for KV operations.
 type KvResult = std::result::Result<(Vec<u8>, Vec<u8>), crate::error::Error>;
@@ -222,6 +222,56 @@ impl KvStore for RocksKvStore {
         }
         self.db.write_opt(batch, &self.write_options())?;
         Ok(())
+    }
+
+    fn export_prefix_sst(&self, prefix: &[u8], out_path: &Path) -> Result<Option<u64>> {
+        Ok(Some(self.write_range_to_sst(prefix, out_path)?))
+    }
+
+    fn replace_prefix_from_sst(&self, prefix: &[u8], sst_path: &Path) -> Result<bool> {
+        // 1. Range-delete the whole prefix so any stale key on the target that
+        //    the SST does not carry does not survive the move. A range
+        //    tombstone is O(1) to write regardless of how many keys it covers.
+        let mut batch = WriteBatch::default();
+        match prefix_upper_bound(prefix) {
+            Some(end) => batch.delete_range(prefix, &end),
+            None => {
+                // Empty / all-0xFF prefix: the range is unbounded above, so
+                // there is no single delete_range end key. Movement always
+                // passes a concrete tablet prefix; this branch is defensive —
+                // clear the remaining keyspace point-wise.
+                for item in self
+                    .db
+                    .iterator(IteratorMode::From(prefix, Direction::Forward))
+                {
+                    let (key, _) =
+                        item.map_err(|e| Error::Other(format!("sst replace scan: {e}")))?;
+                    if !key.starts_with(prefix) {
+                        break;
+                    }
+                    batch.delete(&key);
+                }
+            }
+        }
+        self.db.write_opt(batch, &self.write_options())?;
+
+        // 2. Ingest the SST above the tombstone. `allow_global_seqno` lets
+        //    RocksDB stamp the file with a sequence number newer than the
+        //    delete_range, so its keys win; `allow_blocking_flush` flushes the
+        //    memtable (which holds that tombstone) first so the ordering is
+        //    correct. Result: an idempotent whole-range replace, safe even when
+        //    the target already held keys in the range.
+        let mut opts = IngestExternalFileOptions::default();
+        opts.set_allow_global_seqno(true);
+        opts.set_allow_blocking_flush(true);
+        self.db
+            .ingest_external_file_opts(&opts, vec![sst_path])
+            .map_err(|e| Error::Other(format!("rocksdb ingest_external_file_opts: {e}")))?;
+        Ok(true)
+    }
+
+    fn data_dir(&self) -> Option<std::path::PathBuf> {
+        Some(self.db.path().to_path_buf())
     }
 
     fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>> {
@@ -509,6 +559,46 @@ mod owned_snapshot_tests {
         assert_eq!(dst.get(b"tablet/1/a").unwrap().as_deref(), Some(&b"1a"[..]));
         assert_eq!(dst.get(b"tablet/1/b").unwrap().as_deref(), Some(&b"1b"[..]));
         assert!(dst.get(b"tablet/2/a").unwrap().is_none());
+    }
+
+    #[test]
+    fn replace_prefix_from_sst_overwrites_a_non_empty_target() {
+        // The full movement path must be safe when the target already holds a
+        // (stale) copy of the tablet range — not only a fresh replica. Seed the
+        // source with the new state, and the target with a divergent old state
+        // (an extra key that must disappear, and a changed value), then replace.
+        let src_dir = TempDir::new().unwrap();
+        let src = RocksKvStore::open(src_dir.path()).unwrap();
+        src.put(b"tablet/1/a", b"new-a").unwrap();
+        src.put(b"tablet/1/b", b"new-b").unwrap();
+
+        let sst_dir = TempDir::new().unwrap();
+        let sst = sst_dir.path().join("t1.sst");
+        assert!(src.write_range_to_sst(b"tablet/1/", &sst).unwrap() > 0);
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = RocksKvStore::open(dst_dir.path()).unwrap();
+        dst.put(b"tablet/1/a", b"old-a").unwrap(); // will be overwritten
+        dst.put(b"tablet/1/stale", b"gone").unwrap(); // absent from SST → must vanish
+        dst.put(b"tablet/2/keep", b"other").unwrap(); // outside prefix → must survive
+
+        assert!(dst.replace_prefix_from_sst(b"tablet/1/", &sst).unwrap());
+
+        assert_eq!(
+            dst.get(b"tablet/1/a").unwrap().as_deref(),
+            Some(&b"new-a"[..])
+        );
+        assert_eq!(
+            dst.get(b"tablet/1/b").unwrap().as_deref(),
+            Some(&b"new-b"[..])
+        );
+        assert!(dst.get(b"tablet/1/stale").unwrap().is_none());
+        assert_eq!(
+            dst.get(b"tablet/2/keep").unwrap().as_deref(),
+            Some(&b"other"[..])
+        );
+        // Exactly the source range remains under the moved prefix.
+        assert_eq!(dst.scan_prefix(b"tablet/1/").unwrap().count(), 2);
     }
 
     #[test]

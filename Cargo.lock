@@ -151,6 +151,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "fs2",
  "futures",
  "object_store",
  "proptest",
