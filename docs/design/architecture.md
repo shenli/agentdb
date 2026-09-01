@@ -321,6 +321,14 @@ writes is a replicated local log/tablet path that commits after quorum, with
 object-store upload happening asynchronously for sealed history, artifacts, and
 archives.
 
+That direction is only partially implemented. AgentDB uploads session lifecycle
+objects, periodic recovery manifests, and some Raft snapshot payloads, but it
+does **not** yet continuously seal every committed per-tablet `ReplicatedLog`
+range into S3. The proposed index-addressed archive, regular S3 recovery
+checkpoints, archive-aware log compaction, and bucket-only replay contract are
+specified in
+[`s3-committed-log-archive.md`](s3-committed-log-archive.md).
+
 Cluster routing distinguishes virtual shards from physical tablets. A shard is
 a stable routing slot; it has no Raft group, LSM, snapshot, lease, or independent
 lifecycle. A tablet is the physical serving and placement unit that owns one or

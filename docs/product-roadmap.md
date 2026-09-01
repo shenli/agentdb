@@ -95,6 +95,13 @@ For the conceptual motivation and positioning, see
   machinery, but the production-default posture is still single-node. The
   distributed story needs a clear OSS/managed boundary, stable operator
   procedures, failure-mode runbooks, and sustained smoke coverage.
+- **S3-native committed-log recovery.** AgentDB has object-store content,
+  periodic whole-state recovery manifests, and retained Raft snapshot objects,
+  but it does not continuously archive committed tablet-log ranges by Raft
+  index. Durable upload intents, immutable log segments, regular per-tablet S3
+  checkpoints, archive-aware compaction, and checkpoint-plus-log bucket restore
+  remain proposed in
+  [`design/s3-committed-log-archive.md`](design/s3-committed-log-archive.md).
 - **Encryption at rest and BYOK.** KMS availability, key-ID resolution, crypto
   adapter seams, and envelope framing exist, but the default adapters preserve
   plaintext. Production authenticated encryption, durable-path coverage, a

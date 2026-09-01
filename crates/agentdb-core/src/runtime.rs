@@ -3495,6 +3495,37 @@ impl Runtime {
         )
     }
 
+    /// Grouped-tablet-store replicated runtime with an envelope keyring + tenant
+    /// key provisioner — the cluster shape for the grouped-rocksdb layout.
+    pub fn with_tablet_store_lifecycle_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
+        store_lifecycle: Arc<dyn TabletStoreLifecycle>,
+        content: Arc<dyn ContentBackend>,
+        keyring: Arc<dyn EnvelopeCrypto>,
+        key_provisioner: Arc<dyn TenantKeyProvisioner>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+        default_tablet_id: i64,
+    ) -> Arc<Self> {
+        let tablet_router = Arc::new(
+            RuntimeTabletRouterKvStore::new_with_lifecycle(store_lifecycle, default_tablet_id, logs)
+                .expect("open runtime tablet router"),
+        );
+        let persist = Persist::with_metadata_crypto(
+            tablet_router.clone(),
+            Arc::new(IdentityMetadataCryptoAdapter),
+        )
+        .with_keyring(keyring.clone());
+        Self::from_persist_with_tablet_router_and_mode(
+            persist,
+            content,
+            Arc::new(AllowAllKmsKeyResolver),
+            Arc::new(IdentityContentCryptoAdapter),
+            keyring,
+            Some(key_provisioner),
+            Some(tablet_router),
+            None,
+        )
+    }
+
     pub fn with_kv_kms_content_metadata_and_replicated_log(
         kv: Arc<dyn KvStore + Send + Sync>,
         content: Arc<dyn ContentBackend>,
@@ -5759,13 +5790,15 @@ impl Runtime {
             }
             t
         };
-        if let Some(p) = &self.persist {
-            p.put_tenant(&t).map_err(internal)?;
-        }
-        // Mint the tenant's data-encryption keys before any of its data can be
-        // written (cluster deployments; a no-op when unset).
+        // Mint the tenant's data-encryption keys BEFORE persisting it: the very
+        // first write (`put_tenant`, which also seals the tenant's export-ledger
+        // copy) needs the DEK to already exist (cluster deployments; a no-op when
+        // unset).
         if let Some(provisioner) = &self.key_provisioner {
             provisioner.provision_tenant(t.tenant_id.as_str()).await?;
+        }
+        if let Some(p) = &self.persist {
+            p.put_tenant(&t).map_err(internal)?;
         }
         Ok(t)
     }

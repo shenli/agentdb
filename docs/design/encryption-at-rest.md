@@ -226,11 +226,16 @@ still fails closed without a control plane, and (for now) on the grouped-rocksdb
 layout, which needs its own keyring+provisioner constructor. `encryption_kek_and_suite`
 is the shared KEK/suite parser for the single-node and cluster paths.
 
-**Not yet done:** the grouped-rocksdb cluster layout (a lifecycle+keyring+provisioner
-constructor); hooking `refresh` to the metadata change-notifier so a *follower*
-(or a newly-elected leader) picks up a tenant provisioned after its startup —
-without it, cluster reads are correct only where they route to the provisioning
-leader; and a real multi-node validation. The online DEK rotation worker
+**Milestone 14 (landed): cluster encryption is complete.** The **grouped-rocksdb**
+layout now has its keyring+provisioner constructor
+(`with_tablet_store_lifecycle_content_keyring_provisioner_and_replicated_logs_for_default_tablet`),
+so both replicated layouts encrypt. A background **refresh loop** reloads each
+node's key cache on an interval (`AGENTDB_ENCRYPTION_REFRESH_MS`, default 5 s),
+so a follower — or a node that becomes leader — picks up a tenant provisioned
+after its startup (bounded eventual consistency, closing the failover gap). With
+this, a real multi-node cluster encrypts tenant events and content end-to-end.
+
+**Not yet done:** the online DEK rotation worker
 (new DEK version + data
 re-encryption walk) and the admin API/CLI to drive rewrap and rotation are not
 built; and the
