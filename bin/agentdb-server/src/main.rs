@@ -447,6 +447,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     }
     let mut recovery_kv: Option<Arc<dyn agentdb_storage::KvStore + Send + Sync>> = None;
     let (runtime, content_mirror) = if config.in_memory {
+        if std::env::var("AGENTDB_ENCRYPTION_MODE").as_deref() == Ok("envelope") {
+            anyhow::bail!(
+                "AGENTDB_ENCRYPTION_MODE=envelope is not supported with the in-memory runtime \
+                 (state, including the key catalog, is ephemeral); use a persistent backend"
+            );
+        }
         tracing::info!("using in-memory runtime (state lost on shutdown)");
         (agentdb_core::Runtime::in_memory(), None)
     } else {
@@ -460,6 +466,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         };
 
         recovery_kv = Some(kv.clone());
+        let encryption_keyring = build_encryption_keyring(&kv)?;
         let (content, content_mirror) = build_content_backend(&config)?;
         if let Some(logs) = runtime_raft_logs {
             tracing::info!(
@@ -467,6 +474,18 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 tablet_store_layout = ?config.tablet_store_layout,
                 "opened runtime with raft-rs replicated tablet logs"
             );
+            if encryption_keyring.is_some() {
+                // A per-node local key catalog would mint a different DEK on
+                // each node, so nodes could not read each other's ciphertext.
+                // Cluster envelope encryption needs a shared/replicated key
+                // catalog — a dedicated follow-up. Fail closed rather than
+                // encrypt inconsistently.
+                anyhow::bail!(
+                    "AGENTDB_ENCRYPTION_MODE=envelope is not yet supported with the replicated \
+                     tablet layout (the key catalog is node-local); it is currently supported for \
+                     the single-node persistent layout only"
+                );
+            }
             let runtime = match config.tablet_store_layout {
                 TabletStoreLayoutKind::PrefixScoped => {
                     agentdb_core::Runtime::with_kv_and_replicated_logs_for_default_tablet(
@@ -517,7 +536,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             };
             (runtime, content_mirror)
         } else {
-            (agentdb_core::Runtime::with_kv(kv, content), content_mirror)
+            let runtime = match encryption_keyring {
+                Some(keyring) => {
+                    agentdb_core::Runtime::with_kv_content_and_keyring(kv, content, keyring)
+                }
+                None => agentdb_core::Runtime::with_kv(kv, content),
+            };
+            (runtime, content_mirror)
         }
     };
 
@@ -1886,6 +1911,74 @@ impl RaftSnapshotObjectStore {
             "tablet-{tablet_id}/from-{from}/to-{to}/idx-{index}.snapshot"
         ));
         ObjectPath::from(path)
+    }
+}
+
+/// Build the tenant envelope keyring from `AGENTDB_ENCRYPTION_*` configuration,
+/// or `None` when encryption is disabled (the default). The wrapped-DEK catalog
+/// lives in `kv` under the reserved control-plane prefix. Fails closed if
+/// envelope mode is requested without a KEK secret, rather than silently storing
+/// plaintext.
+fn build_encryption_keyring(
+    kv: &Arc<dyn agentdb_storage::KvStore + Send + Sync>,
+) -> anyhow::Result<Option<Arc<dyn agentdb_storage::EnvelopeCrypto>>> {
+    let mode = std::env::var("AGENTDB_ENCRYPTION_MODE").unwrap_or_else(|_| "disabled".to_string());
+    let secret = std::env::var("AGENTDB_ENCRYPTION_KEK_SECRET").ok();
+    let kek_ref =
+        std::env::var("AGENTDB_ENCRYPTION_KEK_REF").unwrap_or_else(|_| "local:v1".to_string());
+    let suite = std::env::var("AGENTDB_ENCRYPTION_SUITE").ok();
+    keyring_from_settings(&mode, secret.as_deref(), &kek_ref, suite.as_deref(), kv)
+}
+
+/// Pure builder (env-free, so it is unit-testable): turn resolved encryption
+/// settings into a keyring, or `None` when disabled. Fails closed if envelope
+/// mode is requested without a KEK secret.
+fn keyring_from_settings(
+    mode: &str,
+    secret: Option<&str>,
+    kek_ref: &str,
+    suite: Option<&str>,
+    kv: &Arc<dyn agentdb_storage::KvStore + Send + Sync>,
+) -> anyhow::Result<Option<Arc<dyn agentdb_storage::EnvelopeCrypto>>> {
+    match mode.trim() {
+        "" | "disabled" => Ok(None),
+        "envelope" => {
+            let secret = secret.filter(|s| !s.is_empty()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "AGENTDB_ENCRYPTION_MODE=envelope requires a non-empty \
+                     AGENTDB_ENCRYPTION_KEK_SECRET (the key-encryption-key secret; losing it \
+                     makes encrypted data unreadable)"
+                )
+            })?;
+            let suite = match suite {
+                Some("aes-256-gcm") => agentdb_storage::Suite::Aes256Gcm,
+                Some("xchacha20-poly1305") | None => agentdb_storage::Suite::XChaCha20Poly1305,
+                Some(other) => anyhow::bail!(
+                    "unknown AGENTDB_ENCRYPTION_SUITE {other:?} (expected aes-256-gcm|xchacha20-poly1305)"
+                ),
+            };
+            let kek = Arc::new(agentdb_storage::LocalKekProvider::from_secret(
+                secret.as_bytes(),
+                kek_ref.to_string(),
+            ));
+            let provider = Arc::new(agentdb_storage::CatalogKeyProvider::new(
+                agentdb_storage::KeyCatalog::new(kv.clone()),
+                kek,
+            ));
+            let keyring = agentdb_storage::AeadTenantKeyring::new(
+                provider,
+                suite,
+                agentdb_storage::DekCacheConfig::default(),
+            );
+            tracing::info!(
+                suite = suite.as_str(),
+                "tenant envelope encryption enabled (wrapped-DEK catalog + local KEK)"
+            );
+            Ok(Some(Arc::new(keyring)))
+        }
+        other => {
+            anyhow::bail!("unknown AGENTDB_ENCRYPTION_MODE {other:?} (expected disabled|envelope)")
+        }
     }
 }
 
@@ -6158,6 +6251,49 @@ mod tests {
         node_operational, nodes, tablet_movements, tablet_ranges, tablets, MetaStore,
     };
     use agentdb_storage::ReplicatedLog;
+
+    fn test_kv() -> Arc<dyn agentdb_storage::KvStore + Send + Sync> {
+        Arc::new(agentdb_storage::InMemoryKvStore::default())
+    }
+
+    #[test]
+    fn keyring_settings_disabled_or_unset_yields_none() {
+        let kv = test_kv();
+        assert!(keyring_from_settings("disabled", None, "local:v1", None, &kv)
+            .unwrap()
+            .is_none());
+        assert!(keyring_from_settings("", None, "local:v1", None, &kv)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn keyring_settings_envelope_requires_a_kek_secret() {
+        let kv = test_kv();
+        // Missing or empty secret fails closed.
+        assert!(keyring_from_settings("envelope", None, "local:v1", None, &kv).is_err());
+        assert!(keyring_from_settings("envelope", Some(""), "local:v1", None, &kv).is_err());
+        // With a secret, a real (enabled) keyring is built.
+        let kr = keyring_from_settings("envelope", Some("kek-secret"), "local:v1", None, &kv)
+            .unwrap()
+            .expect("keyring built");
+        assert!(kr.is_enabled());
+    }
+
+    #[test]
+    fn keyring_settings_reject_unknown_mode_and_suite() {
+        let kv = test_kv();
+        assert!(keyring_from_settings("bogus", Some("s"), "local:v1", None, &kv).is_err());
+        assert!(
+            keyring_from_settings("envelope", Some("s"), "local:v1", Some("rot13"), &kv).is_err()
+        );
+        // Both valid suites are accepted.
+        for suite in ["aes-256-gcm", "xchacha20-poly1305"] {
+            assert!(
+                keyring_from_settings("envelope", Some("s"), "local:v1", Some(suite), &kv).is_ok()
+            );
+        }
+    }
 
     /// Pins the structural fix for F_postgres_pool_starvation /
     /// F_LEUSS. A meta query that hangs longer than the renewal

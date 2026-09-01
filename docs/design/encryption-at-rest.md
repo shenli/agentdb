@@ -142,10 +142,22 @@ proves a catalog-backed keyring's ciphertext survives a process restart (the
 DEK is durably wrapped, not re-derived) and is unreadable under a different KEK
 — i.e. losing/rotating-away the KEK crypto-shreds the data.
 
-**Not yet done:** the server does not yet build a keyring from configuration, so
-this catalog/KEK path is reachable through the library + tests but not yet
-wired into server startup (that, plus the online rotation worker and admin
-API/CLI, is the next "operations" milestone). Agent/session/tenant records,
+**Milestone 7 (landed): the server builds the keyring from configuration
+(single-node).** `AGENTDB_ENCRYPTION_MODE=envelope` plus
+`AGENTDB_ENCRYPTION_KEK_SECRET` (and optional `_KEK_REF` / `_SUITE`) makes the
+server build a `CatalogKeyProvider` (wrapped-DEK catalog in the runtime KV) + a
+`LocalKekProvider` + an `AeadTenantKeyring`, and wire it into the persistent
+single-node runtime. It **fails closed** when envelope mode is requested without
+a KEK secret, with the in-memory runtime (ephemeral keys), or with the
+replicated tablet layout — the per-node local key catalog would mint a different
+DEK per node, so cluster envelope encryption needs a shared/replicated catalog
+(a dedicated follow-up). So encryption is now flippable end-to-end for a
+single-node persistent deployment.
+
+**Not yet done:** cluster (multi-node) envelope encryption needs a shared key
+catalog; the online DEK rotation worker and admin API/CLI are not built; and the
+`LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
+Agent/session/tenant records, searchable records, and skills
 searchable records, and skills are still plaintext (records are additionally
 entangled with the export ledger + search index). Event AAD binds tenant +
 session + kind (not yet the per-event seq). Two-phase revocation/crypto-shred
