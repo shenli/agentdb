@@ -580,6 +580,86 @@ object-store namespace and KMS scope, and a rollout boundary an enterprise
 can schedule — and it is cheap to offer because a cell is already the unit
 of operational replication.
 
+## Metadata self-hosting: shrink the external DB to a bootstrap root
+
+**Motivation (empirical).** The 2026-08-31 S8 investigation showed
+operational metadata leaking onto the data path: replica-health rows were
+UPDATEd from the raft message pump (two SQL round trips per message), and
+the raft tick worker ran three control-plane queries before every tick — a
+slow metadata database froze heartbeats and turned transient DB stalls into
+60s commit timeouts. The immediate fixes (tick in an SQL-free task, health
+deduped and time-boxed) treat the symptom. The disease is how much lives in
+the metadata DB at all, and it is the same disease as the PD lesson this
+review already cites: a control-plane store whose cardinality grows with
+tenants and whose availability sits under every request.
+
+**The three-layer split.** Classify every table `agentdb-meta` holds today
+by what actually needs it:
+
+| Layer | Tables (today) | Property | Where it belongs |
+|---|---|---|---|
+| **Bootstrap root** | `nodes` (membership/addresses), `cells`, `tablets` + `tablet_ranges` + `shards` + `placement_scopes` (placement/routing), `scheduler_leader`, `config`, `schema_migrations` | Needed *before* AgentDB's own raft groups can form or be found; O(nodes + cells + tablets), low write rate | Stays in SQLite/Postgres forever. This is the circularity boundary — a tablet cannot discover its own peers from data stored inside a tablet that is not up yet. Analog: Spanner's membership layer, FoundationDB's coordinators. |
+| **Ephemeral operational state** | `tablet_replicas` (health, applied/match indexes), `tablet_stats` (+ write rate, compaction debt), the heartbeat columns of `nodes` | Observed, high-write, reconstructible from the live system in seconds; durability adds nothing but pool pressure | Out of SQL entirely: in-memory on the observing node, exposed through the admin API (which mostly exists), aggregated by the scheduler from live reports. Losing it on restart is *correct* — stale health is worse than no health. |
+| **Tenant-scale metadata** | `tenants`, `tenant_policies`, `tenant_quotas`, `session_locators`, `session_overrides`, `admin_tokens`, `admin_audit` (`users` is dead SCRAM residue — delete, don't migrate) | Cardinality grows with tenants and sessions — `session_locators` is O(sessions), the single largest control-plane table | Into AgentDB itself: a **system tenant** on a **system tablet**, stored as records/events. The external DB stays O(nodes + cells + tablets); tenant growth stops pressuring it. |
+
+**Why self-hosting is the right shape here** (not just dogfooding vanity):
+
+- The primitives already exist. The change-notifier becomes AgentDB
+  **watch**; metadata durability and DR ride the existing raft +
+  recovery-root manifests instead of a separate Postgres backup story;
+  per-cell metadata partitioning falls out of the cell design (the system
+  tablet is just a tablet in the cell).
+- It completes the no-SPOF rule this review set: "metadata never on the
+  data path" is enforced structurally when tenant metadata IS data-path
+  data, cached and replicated like everything else, and the external DB is
+  consulted only at bootstrap/topology-change time.
+- It is the two-level design the cited systems converged on: a tiny
+  static root (coordinators/membership) below self-hosted metadata
+  (Spanner directories, CockroachDB system ranges).
+
+**Costs, stated honestly:**
+
+- **Layering discipline becomes load-bearing.** The system tablet must be
+  placeable, recoverable, and elect a leader using ONLY the bootstrap
+  root. Every code path that runs before tablets are up must be audited
+  for reads of migrated tables. One violation reintroduces the circular
+  dependency as a rare, terrible outage.
+- **Recovery drills need a metadata variant.** S16 proves data-tablet
+  restore from the recovery root; a system-tablet variant must prove the
+  metadata tablet restores first and alone, then data tablets restore
+  using it.
+- **SQL inspection is lost for migrated data.** Mitigation: admin
+  endpoints (most exist) plus `agentdbctl` read paths for the system
+  tenant.
+- **Auth bootstrap ordering.** Admin/tenant tokens moving into the system
+  tenant means auth verification depends on the system tablet being up;
+  the static installation token (which lives in config, not the DB) must
+  remain sufficient to operate a cell whose system tablet is down.
+
+**Staged path** (each stage independently shippable and reversible):
+
+1. **Evict ephemeral state from SQL** — replica health, applied/match
+   indexes, tablet stats become in-memory/leader-observed, surfaced via
+   the admin API. Biggest immediate win; needs no self-hosting machinery.
+   Deletes the highest-write tables outright.
+2. **System tenant for tenant-scale metadata** — tenants, policies,
+   quotas, locators, tokens move to records under a reserved system
+   tenant on a dedicated system tablet; change-notifier subscriptions
+   become watch; S16 gains the metadata-restore drill.
+3. **Shrink `agentdb-meta` to the bootstrap root** — what remains is
+   membership, cells, placement, and the scheduler lease. Single-node
+   mode barely changes: the root is already a local SQLite file.
+
+The implementation-grade design (data model, bootstrap ordering, migration
+tool, recovery drill, test matrix) is in
+[`docs/design/metadata-self-hosting.md`](design/metadata-self-hosting.md).
+
+Design decision still open before stage 2: whether the system tenant's
+rows are AgentDB *records* (search/watch for free, but the record schema
+becomes a public-ish contract) or a dedicated key range on the system
+tablet with purpose-built codecs (tighter, but re-implements watch). Lean
+records until a concrete blocker appears — subtraction over invention.
+
 ## Simplification pass: cut, quarantine, keep
 
 Anti-over-design rule set: keep what serves the hot loop and the durability
@@ -725,3 +805,4 @@ chaos test covers cache eviction invariants under fault.
 | 10 | Tier matrix as one contract (share-a-tablet / own-tablets / own-a-cell) with a machine-readable tier descriptor | M | Tiers become selectable and verifiable by agent platforms; enterprise gets per-tenant blast radius |
 | 11 | Subtraction pass: remove wire listener, SlateDB backend, legacy quorum log, dead auth code; externalize ClickStack/Parquet; freeze tablet automation | M | One protocol, one backend, one quorum path; closes the worst P7 hole; attention lands on findings 1-2 |
 | 12 | S3 as recovery root: self-describing objects, listing + cell inventory, measured recovery lag, GC-after-verify, tested restore-from-bucket | M–L | Cell loss and metadata loss become bounded-RPO recoveries instead of disasters. **Partially implemented on this branch**: versioned self-describing recovery manifests with a periodic backup worker, object-store listing, `GET /api/admin/recovery` with `recovery_lag_ms`, `agentdb restore-from-bucket`, and the managed local content cache in mirror mode (TTL eviction after verified upload, touch-on-read, never evicts the only copy — cold content lives only in the object store; see `docs/operations/recovery.md`). Remaining: per-cell inventory, manifest-less scavenge, automated restore drills. |
+| 13 | Metadata self-hosting: evict ephemeral state from SQL, system tenant for tenant-scale metadata, shrink agentdb-meta to a bootstrap root | L | Control plane stops scaling with tenants and leaves the data path entirely; see the "Metadata self-hosting" section. Staged: (1) ephemeral eviction is standalone and immediately de-risks the S8 class of stall; (2)-(3) need the metadata-restore drill first |
