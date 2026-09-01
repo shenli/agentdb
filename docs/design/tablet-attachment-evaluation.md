@@ -81,6 +81,36 @@ Two findings:
    raft-snapshot transfer now ships the smaller encoding. See the
    before/after in the movement benchmark.
 
+## RocksDB SST-ingest prototype (eager §7 attach)
+
+The compact encoding removes the *encoding* cost, but both the old and new
+logical paths still **re-insert every key on the target** via `write_batch`
+— through the memtable, flush, and compaction. RocksDB can skip that: write
+the source range to a self-contained SST (`SstFileWriter`) and bulk-load it
+into the target with `IngestExternalFile`, which lands the file at the
+bottom of the LSM with no per-key work. AgentDB already uses RocksDB
+`Checkpoint` for backups; this adds the ingest half.
+
+Prototype (`crates/agentdb-storage/src/rocks.rs` — `write_range_to_sst` /
+`ingest_ssts`; benchmark `crates/agentdb-storage/tests/sst_movement_bench.rs`)
+measured the target-side install of a tablet key range:
+
+| events | range bytes | sst bytes | replay_ms (write_batch) | ingest_ms | speedup |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 227 KB | 9 KB | 0.9 | 0.6 | 1.4× |
+| 5,000 | 1.14 MB | 42 KB | 4.1 | 0.6 | 7× |
+| 20,000 | 4.54 MB | 167 KB | 15.0 | 0.5 | 28× |
+| 80,000 | 18.16 MB | 666 KB | 61.8 | 1.0 | **59×** |
+
+Two things stand out: **ingest time is ~flat (~1 ms) regardless of tablet
+size**, because the SST is placed, not replayed — so the win over
+`write_batch` grows without bound with the tablet. And the SST is
+**compressed** (the transfer shrinks too; the 27× here is inflated by the
+uniform test payload, but real SSTs are always ≤ the raw range). This is
+the eager form of §7: move the SST (optionally staged in the object store)
+instead of the full KV dump, without the on-read object-store dependency of
+lazy attach.
+
 ## Feasibility against the current architecture
 
 The "manifest + shared objects" primitives partly exist:
@@ -121,20 +151,33 @@ and correctness risk, so it should not be built speculatively.
   `export_ms` per movement, so real replacements and the S9 smoke report
   this in production.
 - The **compact snapshot encoding** — a large, low-risk win with no
-  storage-engine change: 3.4× smaller snapshots and ~44× faster serialize
-  (see the before/after table above).
+  storage-engine change: 3.4× smaller snapshots and ~44× faster serialize.
+- The **SST export/ingest primitives** (`RocksKvStore::write_range_to_sst` /
+  `ingest_ssts`) plus a prototype benchmark proving the target-side win
+  (~flat ~1 ms install, 59× at 80k events, growing).
 
-**Gate for the storage-engine change:**
-- Prototype a manifest+lazy-block attach for **cold tablets only**, behind a
-  flag, and measure the plan's eight metrics (bytes transferred,
-  time-to-learner, time-to-p99, object-store GET count/cost, cache size +
-  warm-up bandwidth, retained unflushed Raft tail, recovery-after-cache-loss,
-  compaction read/write amplification) on the session-native benchmark.
-- **Adopt only if** the session-native workload (`append → commit → apply →
-  fetch recent tail`) shows an operational or cost win over the compact
-  full-snapshot path. Generic point-put throughput is not sufficient
-  evidence.
+**Recommended next — eager SST-based whole-tablet movement (the proven win):**
+Wire whole-tablet moves (replacement, adding a replica) through
+checkpoint/SST → transfer → ingest instead of the logical KV dump. It has
+the big proven payoff and *far* less risk than lazy attach — no on-read
+object-store dependency, no block-cache management. Design points:
+- **Whole-tablet moves only**; shard-range moves (split/merge) keep the
+  logical path (you can't cheaply carve a shard subset out of an SST).
+- **Fallback + version negotiation**: SSTs carry a `format_version`; if the
+  target's RocksDB can't ingest (mixed builds during a rolling upgrade),
+  fall back to the logical compact-encoded path. Keep the logical path as
+  the always-safe default.
+- **Size threshold**: ingest has fixed overhead; small tablets stay logical.
+- **Object-store staging** (optional, toward §7): put the SST in the bucket
+  and ship a manifest reference instead of the bytes inline.
 
-Net: **no-go on building the storage-engine change now**; the compact-encoding
-win (3.4× smaller, ~44× faster moves) is delivered, and the lazy-attach
-prototype stays gated behind a demonstrated need.
+**Still gated — the full lazy-block attach:**
+- Only worth it beyond eager SST if a workload needs to attach *without*
+  even transferring the tail (serve from object-store blocks on demand).
+  That is the storage-engine change with read-path-p99 and
+  cache-loss-recovery risk; prototype it for **cold tablets only** and
+  measure the plan's eight metrics before adopting.
+
+Net: the compact-encoding win is delivered and the **eager SST path is
+proven and recommended to build next**; the full lazy-block attach stays
+gated behind a demonstrated need.
