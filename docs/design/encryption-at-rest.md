@@ -96,13 +96,33 @@ batcher's timing, not AEAD cost (the fast primitive proves it); it must be
 re-measured on RocksDB with the batcher configured before being read as a real
 regression.
 
-**Not yet done:** records, skills, indexes, idempotency, export, Raft,
-snapshots, checkpoints, and backups are not covered (only artifact + event
-values go through the metadata choke points today — extending `MetadataObjectKind`
-to every durable type, or moving encryption below typed serialization, is the
-next coverage stage). Event AAD binds tenant + session + kind (not yet the
+**Milestone 4 (landed): the raw-storage marker coverage map.** A single-marker
+invariant test (`tests/encryption_coverage.rs`) writes a distinct secret through
+every durable path and asserts, per path, whether it appears in raw storage —
+the regression detector the design's §4 calls for. It is two-sided: encrypted
+paths must show no marker (a leak is a regression), and not-yet-encrypted paths
+are asserted to *still* leak, so the test is also a tripwire that forces this map
+to be updated when a later milestone encrypts one of them. Current coverage:
+
+| Durable path | Value encrypted? |
+|---|---|
+| Session events | **Yes** (M3) |
+| Artifact content | **Yes** (M2) |
+| Artifact metadata row | **Yes** (M3) |
+| Session segments / archives / replay prefixes | **Yes** (M2) |
+| Agent / session / tenant records | No |
+| Searchable records (+ their export-ledger copy) | No |
+| Skills | No |
+| Secondary indexes, aliases, idempotency, commit/outbox | No (routing/control; keys stay plaintext for scans) |
+
+**Not yet done:** agent/session/tenant records, searchable records, and skills
+are still plaintext (records are additionally entangled with the export ledger,
+which keeps a plaintext copy, and the search index, so covering them is its own
+stage). Encryption is not yet verified to occur *before* a tenant payload enters
+a durable Raft log or tablet snapshot (the keyring is not wired into replicated
+constructors yet). Event AAD binds tenant + session + kind (not yet the
 per-event seq). There is still no KMS provider or wrapped-DEK catalog, rotation
-worker, or revocation, and the server does not yet build a keyring from
+worker, or revocation, and the server does not build a keyring from
 configuration.
 
 The pre-existing seams remain as the integration points those stages build on:
