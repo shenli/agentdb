@@ -16,188 +16,21 @@ use sqlx::AnyPool;
 use crate::error::{MetaError, MetaResult};
 use crate::MetaDialect;
 
-/// Every migration in order. Append new ones; NEVER renumber
-/// or reorder existing entries.
+/// The control-plane schema as a single consolidated migration.
+///
+/// There are no deployed clusters to migrate, so the historical 001-031
+/// incremental migrations were collapsed into one `001_initial` schema
+/// (derived by applying them to a fresh DB and dumping the result). If the
+/// schema needs to change before the first real deployment, edit
+/// `001_initial.{sql,pg.sql}` in place rather than adding a new numbered
+/// migration. Once there ARE clusters to preserve, resume appending new
+/// entries here (NEVER renumbering the consolidated `1`).
 const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
     (
         1,
         "initial control-plane schema",
         include_str!("../migrations/001_initial.sql"),
         include_str!("../migrations/001_initial.pg.sql"),
-    ),
-    (
-        2,
-        "scheduler leader singleton lease",
-        include_str!("../migrations/002_scheduler_leader.sql"),
-        include_str!("../migrations/002_scheduler_leader.pg.sql"),
-    ),
-    (
-        3,
-        "SCRAM-SHA-256 users",
-        include_str!("../migrations/003_users.sql"),
-        include_str!("../migrations/003_users.pg.sql"),
-    ),
-    (
-        4,
-        "admin bearer tokens",
-        include_str!("../migrations/004_admin_tokens.sql"),
-        include_str!("../migrations/004_admin_tokens.pg.sql"),
-    ),
-    (
-        5,
-        "admin audit log",
-        include_str!("../migrations/005_admin_audit.sql"),
-        include_str!("../migrations/005_admin_audit.pg.sql"),
-    ),
-    (
-        6,
-        "global per-tenant rate limits",
-        include_str!("../migrations/006_tenant_quotas.sql"),
-        include_str!("../migrations/006_tenant_quotas.pg.sql"),
-    ),
-    (
-        7,
-        "admin token scope (RBAC)",
-        include_str!("../migrations/007_admin_token_scope.sql"),
-        include_str!("../migrations/007_admin_token_scope.pg.sql"),
-    ),
-    (
-        8,
-        "legacy node peer address column",
-        include_str!("../migrations/008_node_mongo_address.sql"),
-        include_str!("../migrations/008_node_mongo_address.pg.sql"),
-    ),
-    (
-        9,
-        "Postgres LISTEN/NOTIFY triggers (SQLite no-op)",
-        include_str!("../migrations/009_pg_notify_triggers.sql"),
-        include_str!("../migrations/009_pg_notify_triggers.pg.sql"),
-    ),
-    (
-        10,
-        "tablets.handoff_target_node_id for cooperative handoff",
-        include_str!("../migrations/010_tablet_handoff.sql"),
-        include_str!("../migrations/010_tablet_handoff.pg.sql"),
-    ),
-    (
-        11,
-        "session_locators (M26 Phase 1: session-centric identity)",
-        include_str!("../migrations/011_session_locators.sql"),
-        include_str!("../migrations/011_session_locators.pg.sql"),
-    ),
-    (
-        12,
-        "session_locators.tenant_external_id (M26 Phase 1b: skip the internal-id round-trip)",
-        include_str!("../migrations/012_session_locator_external_tenant.sql"),
-        include_str!("../migrations/012_session_locator_external_tenant.pg.sql"),
-    ),
-    (
-        13,
-        "nodes.availability_zone (cross-AZ failure-domain awareness)",
-        include_str!("../migrations/013_nodes_availability_zone.sql"),
-        include_str!("../migrations/013_nodes_availability_zone.pg.sql"),
-    ),
-    (
-        14,
-        "nodes.region (durable residency routing metadata)",
-        include_str!("../migrations/014_nodes_region.sql"),
-        include_str!("../migrations/014_nodes_region.pg.sql"),
-    ),
-    (
-        15,
-        "session_locators LISTEN/NOTIFY trigger",
-        include_str!("../migrations/015_session_locator_notify.sql"),
-        include_str!("../migrations/015_session_locator_notify.pg.sql"),
-    ),
-    (
-        16,
-        "placement scopes, tablet lifecycle, and compressed shard ranges",
-        include_str!("../migrations/016_tablet_ranges.sql"),
-        include_str!("../migrations/016_tablet_ranges.pg.sql"),
-    ),
-    (
-        17,
-        "tenant placement and encryption policy metadata",
-        include_str!("../migrations/017_tenant_placement_policies.sql"),
-        include_str!("../migrations/017_tenant_placement_policies.pg.sql"),
-    ),
-    (
-        18,
-        "retained tablet snapshot catalog",
-        include_str!("../migrations/018_tablet_snapshots.sql"),
-        include_str!("../migrations/018_tablet_snapshots.pg.sql"),
-    ),
-    (
-        19,
-        "tablet split/merge state movement queue",
-        include_str!("../migrations/019_tablet_movements.sql"),
-        include_str!("../migrations/019_tablet_movements.pg.sql"),
-    ),
-    (
-        20,
-        "tablet replica change notifications",
-        include_str!("../migrations/020_tablet_replica_notify.sql"),
-        include_str!("../migrations/020_tablet_replica_notify.pg.sql"),
-    ),
-    (
-        21,
-        "tablet runtime storage statistics",
-        include_str!("../migrations/021_tablet_stats.sql"),
-        include_str!("../migrations/021_tablet_stats.pg.sql"),
-    ),
-    (
-        22,
-        "tablet runtime write-rate statistics",
-        include_str!("../migrations/022_tablet_stats_write_rate.sql"),
-        include_str!("../migrations/022_tablet_stats_write_rate.pg.sql"),
-    ),
-    (
-        23,
-        "tablet runtime compaction-debt statistics",
-        include_str!("../migrations/023_tablet_stats_compaction_debt.sql"),
-        include_str!("../migrations/023_tablet_stats_compaction_debt.pg.sql"),
-    ),
-    (
-        24,
-        "logical cells and placement policy fields",
-        include_str!("../migrations/024_cells_and_placement_policy.sql"),
-        include_str!("../migrations/024_cells_and_placement_policy.pg.sql"),
-    ),
-    (
-        25,
-        "manual tablet movement types",
-        include_str!("../migrations/025_manual_tablet_movements.sql"),
-        include_str!("../migrations/025_manual_tablet_movements.pg.sql"),
-    ),
-    (
-        26,
-        "tenant-scoped bearer tokens",
-        include_str!("../migrations/026_admin_token_tenant_scope.sql"),
-        include_str!("../migrations/026_admin_token_tenant_scope.pg.sql"),
-    ),
-    (
-        27,
-        "node operational summaries; tablet_replicas becomes placement intent",
-        include_str!("../migrations/027_node_operational.sql"),
-        include_str!("../migrations/027_node_operational.pg.sql"),
-    ),
-    (
-        28,
-        "metadata self-hosting: tokens/locators/tenant registry move to the system tenant",
-        include_str!("../migrations/028_metadata_self_hosting.sql"),
-        include_str!("../migrations/028_metadata_self_hosting.pg.sql"),
-    ),
-    (
-        29,
-        "notify triggers ignore heartbeat/lease-only touches",
-        include_str!("../migrations/029_notify_ignores_heartbeat_touches.sql"),
-        include_str!("../migrations/029_notify_ignores_heartbeat_touches.pg.sql"),
-    ),
-    (
-        30,
-        "store-incarnation registry for durable store identity admission",
-        include_str!("../migrations/030_store_incarnations.sql"),
-        include_str!("../migrations/030_store_incarnations.pg.sql"),
     ),
 ];
 

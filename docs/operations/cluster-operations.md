@@ -352,6 +352,41 @@ Inspect the incarnation history at any time with
 whose incarnation was retired will refuse to boot until its data directory
 is re-provisioned.
 
+## Cluster Root And Metadata Rollback
+
+Beyond node and store identity, each node cross-checks the **metadata
+database itself** at startup against a singleton `cluster_root` record. The
+first node to boot roots the cluster with its store's cluster id; every node
+thereafter fails closed if its cluster id does not match the root. This
+catches a node pointed at the **wrong metadata database** — a stale
+`AGENTDB_META_URL`, a copied or restored control plane, or two clusters
+accidentally sharing one database.
+
+The cluster-id match requires a **shared** id, so it is enforced only when
+`AGENTDB_CLUSTER_ID` is set on every node. Without it each node mints its own
+random cluster id (fine for single-node / unconfigured use) and the match is
+skipped — the generation guard below still applies. **Set `AGENTDB_CLUSTER_ID`
+identically across a multi-node cluster** to enable the wrong-database check.
+
+The cluster root also carries a monotonic `bootstrap_generation`. Each node
+records the highest generation it has seen in
+`<data_dir>/CLUSTER_WATERMARK.json`. If the metadata database later presents
+a **lower** generation than a node already saw — the signature of a restore
+from an older backup — that node fails closed rather than risk split-brain
+against state it has already observed.
+
+Recovering after an intended metadata restore or re-bootstrap:
+
+- **Same-point restore** (metadata restored to where it was): no action; the
+  generation is unchanged and nodes rejoin normally.
+- **Deliberate forward re-bootstrap**: bump the cluster generation
+  (`agentdb_meta::cluster_root::bump_generation`) so it exceeds every node's
+  watermark; nodes then adopt the new generation on their next boot.
+- **Emergency accept of a detected rollback** (you are certain the older
+  metadata is the intended state): remove `CLUSTER_WATERMARK.json` from the
+  affected node's data directory so it re-learns the current generation as a
+  first boot would. Do this only when the rollback is intentional.
+
 ## Failure Handling Expectations
 
 ### Node Lost

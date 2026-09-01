@@ -366,6 +366,41 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             ?admission,
             "store incarnation admitted by control plane"
         );
+
+        // Cluster-root cross-check: confirm the metadata database is rooted for
+        // THIS store's cluster (a stale AGENTDB_META_URL or a replaced control
+        // plane otherwise attaches a node to the wrong cluster), and detect a
+        // metadata DB restored to an OLDER bootstrap generation than this node
+        // already saw (a rollback / split-brain hazard). Completes the durable-
+        // identity trio: local IDENTITY.json + store-incarnation admission +
+        // cluster root.
+        let seen_generation =
+            agentdb_storage::store_identity::read_cluster_watermark(&config.data_dir);
+        // Only enforce the cluster-id match when AGENTDB_CLUSTER_ID was
+        // explicitly configured — then it is a shared cross-node invariant.
+        // Unconfigured deployments mint a random cluster id per node, which
+        // legitimately differs across nodes, so the id match is skipped and
+        // only the generation-rollback guard runs.
+        let enforce_cluster_id = config.cluster_id.is_some();
+        let root = agentdb_meta::cluster_root::verify_join(
+            startup.meta.pool(),
+            &identity.cluster_id,
+            enforce_cluster_id,
+            seen_generation,
+            now_ms_i64(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("cluster root cross-check failed: {error}"))?;
+        agentdb_storage::store_identity::record_cluster_watermark(
+            &config.data_dir,
+            root.bootstrap_generation,
+        )
+        .map_err(|error| anyhow::anyhow!("record cluster watermark: {error}"))?;
+        tracing::info!(
+            cluster_id = %root.cluster_id,
+            bootstrap_generation = root.bootstrap_generation,
+            "cluster root verified"
+        );
     }
     let auth_meta = if let Some(startup) = route_startup.as_ref() {
         startup.meta.clone()

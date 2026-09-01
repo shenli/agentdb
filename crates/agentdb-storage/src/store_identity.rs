@@ -102,6 +102,49 @@ pub fn identity_path(data_dir: &Path) -> PathBuf {
     data_dir.join(IDENTITY_FILE_NAME)
 }
 
+const CLUSTER_WATERMARK_FILE_NAME: &str = "CLUSTER_WATERMARK.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterWatermark {
+    bootstrap_generation: i64,
+}
+
+pub fn cluster_watermark_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLUSTER_WATERMARK_FILE_NAME)
+}
+
+/// The highest cluster bootstrap generation this store has ever observed, or
+/// `None` if it has never recorded one. Used by the control-plane cluster-root
+/// cross-check to detect a metadata database that was restored to an *older*
+/// generation than this node already saw (a rollback / split-brain hazard).
+/// Unlike `IDENTITY.json`, this file is mutable and not integrity-sealed: it is
+/// a monotonic hint, and a corrupt/absent file simply reads as `None` (the
+/// check then trusts the control plane, exactly as a first boot would).
+pub fn read_cluster_watermark(data_dir: &Path) -> Option<i64> {
+    let bytes = std::fs::read(cluster_watermark_path(data_dir)).ok()?;
+    serde_json::from_slice::<ClusterWatermark>(&bytes)
+        .ok()
+        .map(|watermark| watermark.bootstrap_generation)
+}
+
+/// Persist an observed cluster bootstrap generation. Monotonic: a value at or
+/// below the current watermark is ignored, so a transient misread can never
+/// lower the watermark and erase rollback detection.
+pub fn record_cluster_watermark(data_dir: &Path, generation: i64) -> Result<()> {
+    if let Some(current) = read_cluster_watermark(data_dir) {
+        if generation <= current {
+            return Ok(());
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&ClusterWatermark {
+        bootstrap_generation: generation,
+    })
+    .map_err(|error| Error::Other(format!("serialize cluster watermark: {error}")))?;
+    let path = cluster_watermark_path(data_dir);
+    std::fs::write(&path, bytes)
+        .map_err(|error| Error::Other(format!("write cluster watermark {}: {error}", path.display())))
+}
+
 /// Load and verify the store identity, or initialize it on first boot.
 ///
 /// First boot (no file): mint an incarnation, adopt the expected cluster
@@ -250,6 +293,22 @@ mod tests {
         std::fs::write(identity_path(dir.path()), b"{ not valid json").unwrap();
         let err = load_or_init(dir.path(), &expected("node-a"), 2_000).unwrap_err();
         assert!(format!("{err:?}").contains("malformed or truncated"));
+    }
+
+    #[test]
+    fn cluster_watermark_round_trips_and_only_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        // Never recorded → None.
+        assert_eq!(read_cluster_watermark(dir.path()), None);
+        record_cluster_watermark(dir.path(), 3).unwrap();
+        assert_eq!(read_cluster_watermark(dir.path()), Some(3));
+        // A higher generation advances it.
+        record_cluster_watermark(dir.path(), 5).unwrap();
+        assert_eq!(read_cluster_watermark(dir.path()), Some(5));
+        // A lower or equal generation is ignored (monotonic).
+        record_cluster_watermark(dir.path(), 4).unwrap();
+        record_cluster_watermark(dir.path(), 5).unwrap();
+        assert_eq!(read_cluster_watermark(dir.path()), Some(5));
     }
 
     #[test]
