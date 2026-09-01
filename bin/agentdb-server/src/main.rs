@@ -466,7 +466,6 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         };
 
         recovery_kv = Some(kv.clone());
-        let encryption_keyring = build_encryption_keyring(&kv)?;
         let (content, content_mirror) = build_content_backend(&config)?;
         if let Some(logs) = runtime_raft_logs {
             tracing::info!(
@@ -474,28 +473,46 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 tablet_store_layout = ?config.tablet_store_layout,
                 "opened runtime with raft-rs replicated tablet logs"
             );
-            if encryption_keyring.is_some() {
-                // A per-node local key catalog would mint a different DEK on
-                // each node, so nodes could not read each other's ciphertext.
-                // Cluster envelope encryption needs a shared/replicated key
-                // catalog — a dedicated follow-up. Fail closed rather than
-                // encrypt inconsistently.
-                anyhow::bail!(
-                    "AGENTDB_ENCRYPTION_MODE=envelope is not yet supported with the replicated \
-                     tablet layout (the key catalog is node-local); it is currently supported for \
-                     the single-node persistent layout only"
-                );
-            }
+            // Cluster envelope encryption uses the shared meta-DB key catalog:
+            // one node mints a tenant's DEK at creation, every node reads it.
+            let cluster_crypto = match route_startup.as_ref() {
+                Some(startup) => build_cluster_keyring_and_provisioner(&startup.meta).await?,
+                None => {
+                    if encryption_kek_and_suite()?.is_some() {
+                        anyhow::bail!(
+                            "AGENTDB_ENCRYPTION_MODE=envelope requires the control plane (meta \
+                             store) to share the key catalog across nodes"
+                        );
+                    }
+                    None
+                }
+            };
             let runtime = match config.tablet_store_layout {
-                TabletStoreLayoutKind::PrefixScoped => {
-                    agentdb_core::Runtime::with_kv_and_replicated_logs_for_default_tablet(
+                TabletStoreLayoutKind::PrefixScoped => match cluster_crypto {
+                    Some((keyring, provisioner)) => {
+                        agentdb_core::Runtime::with_kv_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
+                            kv,
+                            content,
+                            keyring,
+                            provisioner,
+                            logs,
+                            config.route_default_tablet_id,
+                        )
+                    }
+                    None => agentdb_core::Runtime::with_kv_and_replicated_logs_for_default_tablet(
                         kv,
                         content,
                         logs,
                         config.route_default_tablet_id,
-                    )
-                }
+                    ),
+                },
                 TabletStoreLayoutKind::GroupedRocksDb => {
+                    if cluster_crypto.is_some() {
+                        anyhow::bail!(
+                            "AGENTDB_ENCRYPTION_MODE=envelope is not yet supported with the \
+                             grouped-rocksdb tablet layout; use the prefix-scoped layout"
+                        );
+                    }
                     std::fs::create_dir_all(&config.tablet_store_root_dir)?;
                     let rocks_config = agentdb_storage::RocksKvStoreConfig {
                         write_buffer_size_bytes: config.tablet_store_domain_write_buffer_size_mib
@@ -536,7 +553,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             };
             (runtime, content_mirror)
         } else {
-            let runtime = match encryption_keyring {
+            let runtime = match build_encryption_keyring(&kv)? {
                 Some(keyring) => {
                     agentdb_core::Runtime::with_kv_content_and_keyring(kv, content, keyring)
                 }
@@ -1980,6 +1997,78 @@ fn keyring_from_settings(
             anyhow::bail!("unknown AGENTDB_ENCRYPTION_MODE {other:?} (expected disabled|envelope)")
         }
     }
+}
+
+/// Parse the KEK + AEAD suite from `AGENTDB_ENCRYPTION_*`. `None` when disabled;
+/// fails closed if envelope mode lacks a KEK secret. Shared by the single-node
+/// (KV catalog) and cluster (meta catalog) keyring builders.
+fn encryption_kek_and_suite(
+) -> anyhow::Result<Option<(Arc<dyn agentdb_storage::KekProvider>, agentdb_storage::Suite)>> {
+    let mode = std::env::var("AGENTDB_ENCRYPTION_MODE").unwrap_or_else(|_| "disabled".to_string());
+    match mode.trim() {
+        "" | "disabled" => Ok(None),
+        "envelope" => {
+            let secret = std::env::var("AGENTDB_ENCRYPTION_KEK_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "AGENTDB_ENCRYPTION_MODE=envelope requires a non-empty \
+                         AGENTDB_ENCRYPTION_KEK_SECRET"
+                    )
+                })?;
+            let kek_ref = std::env::var("AGENTDB_ENCRYPTION_KEK_REF")
+                .unwrap_or_else(|_| "local:v1".to_string());
+            let suite = match std::env::var("AGENTDB_ENCRYPTION_SUITE").as_deref() {
+                Ok("aes-256-gcm") => agentdb_storage::Suite::Aes256Gcm,
+                Ok("xchacha20-poly1305") | Err(_) => agentdb_storage::Suite::XChaCha20Poly1305,
+                Ok(other) => anyhow::bail!(
+                    "unknown AGENTDB_ENCRYPTION_SUITE {other:?} (expected aes-256-gcm|xchacha20-poly1305)"
+                ),
+            };
+            let kek: Arc<dyn agentdb_storage::KekProvider> = Arc::new(
+                agentdb_storage::LocalKekProvider::from_secret(secret.as_bytes(), kek_ref),
+            );
+            Ok(Some((kek, suite)))
+        }
+        other => {
+            anyhow::bail!("unknown AGENTDB_ENCRYPTION_MODE {other:?} (expected disabled|envelope)")
+        }
+    }
+}
+
+/// Build the cluster keyring + tenant key provisioner over the shared meta-DB
+/// key catalog. `None` when encryption is disabled. Both the keyring's key
+/// source and the provisioner are the one `MetaCatalogKeyProvider` (pre-warmed
+/// from the catalog at load).
+async fn build_cluster_keyring_and_provisioner(
+    meta: &agentdb_meta::MetaStore,
+) -> anyhow::Result<
+    Option<(
+        Arc<dyn agentdb_storage::EnvelopeCrypto>,
+        Arc<dyn agentdb_core::TenantKeyProvisioner>,
+    )>,
+> {
+    let Some((kek, suite)) = encryption_kek_and_suite()? else {
+        return Ok(None);
+    };
+    let provider = Arc::new(
+        agentdb_api::dek_provider::MetaCatalogKeyProvider::load(meta.pool().clone(), kek)
+            .await
+            .map_err(|e| anyhow::anyhow!("load cluster key catalog: {e}"))?,
+    );
+    let keyring: Arc<dyn agentdb_storage::EnvelopeCrypto> =
+        Arc::new(agentdb_storage::AeadTenantKeyring::new(
+            provider.clone(),
+            suite,
+            agentdb_storage::DekCacheConfig::default(),
+        ));
+    let provisioner: Arc<dyn agentdb_core::TenantKeyProvisioner> = provider;
+    tracing::info!(
+        suite = suite.as_str(),
+        "cluster tenant envelope encryption enabled (shared meta-DB key catalog + local KEK)"
+    );
+    Ok(Some((keyring, provisioner)))
 }
 
 fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<ContentBackendBundle> {
