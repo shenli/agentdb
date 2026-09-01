@@ -37,6 +37,7 @@ use agentdb_storage::keys::{
 };
 use agentdb_storage::Error as StorageError;
 use agentdb_storage::{
+    is_envelope_v2, CryptoContext, DisabledEnvelopeCrypto, EnvelopeCrypto, KeyPurpose,
     KeyResolution, KvStore, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
     Result as KvResult, WriteOp,
 };
@@ -1004,6 +1005,12 @@ fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Opti
 pub(crate) struct Persist {
     pub kv: Arc<dyn KvStore + Send + Sync>,
     metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+    /// Tenant envelope keyring for durable metadata/event values. When enabled,
+    /// each value is sealed as an `AGDB-ENVELOPE-v2` frame before the KV write;
+    /// when disabled (the default) values take the legacy metadata-adapter path.
+    /// Reads detect the frame version, so a disabled→enabled rollout stays
+    /// readable.
+    keyring: Arc<dyn EnvelopeCrypto>,
     export_ledger_sequencer: Arc<ExportLedgerSequencer>,
     adaptive_write_batcher: Option<Arc<AdaptiveWriteBatcher>>,
 }
@@ -1048,9 +1055,18 @@ impl Persist {
         Self {
             kv,
             metadata_crypto,
+            keyring: Arc::new(DisabledEnvelopeCrypto),
             export_ledger_sequencer,
             adaptive_write_batcher,
         }
+    }
+
+    /// Attach an envelope keyring so durable metadata/event values are sealed
+    /// as `AGDB-ENVELOPE-v2` before the KV write. Pass `DisabledEnvelopeCrypto`
+    /// (the default) for the legacy plaintext/metadata-adapter path.
+    pub fn with_keyring(mut self, keyring: Arc<dyn EnvelopeCrypto>) -> Self {
+        self.keyring = keyring;
+        self
     }
 
     /// Drop the adaptive write batcher, reverting every write to a direct
@@ -1064,11 +1080,36 @@ impl Persist {
         self.adaptive_write_batcher = None;
     }
 
+    /// The keyring `CryptoContext` for a metadata value: the tenant object,
+    /// under the `Metadata` key purpose.
+    fn metadata_keyring_context<'a>(
+        context: &'a MetadataCryptoContext<'a>,
+    ) -> CryptoContext<'a> {
+        CryptoContext {
+            tenant_id: context.tenant_id,
+            purpose: KeyPurpose::Metadata,
+            object_kind: context.object_kind.as_str(),
+            object_id: context.object_id,
+        }
+    }
+
     fn encrypt_metadata(
         &self,
         context: &MetadataCryptoContext<'_>,
         plaintext: &[u8],
     ) -> KvResult<Vec<u8>> {
+        if self.keyring.is_enabled() {
+            return self
+                .keyring
+                .seal(&Self::metadata_keyring_context(context), plaintext)
+                .map_err(|e| {
+                    StorageError::Other(format!(
+                        "metadata seal failed for {} {}: {e}",
+                        context.object_kind.as_str(),
+                        context.object_id
+                    ))
+                });
+        }
         let ciphertext = self
             .metadata_crypto
             .encrypt(context, plaintext)
@@ -1090,6 +1131,21 @@ impl Persist {
         context: &MetadataCryptoContext<'_>,
         ciphertext: &[u8],
     ) -> KvResult<Vec<u8>> {
+        // A v2 frame is always opened through the keyring — even when this
+        // process has encryption disabled, so a value written under the keyring
+        // fails closed (missing-key error) rather than being mis-read.
+        if is_envelope_v2(ciphertext) {
+            return self
+                .keyring
+                .open(&Self::metadata_keyring_context(context), ciphertext)
+                .map_err(|e| {
+                    StorageError::Other(format!(
+                        "metadata open failed for {} {}: {e}",
+                        context.object_kind.as_str(),
+                        context.object_id
+                    ))
+                });
+        }
         let decoded = decode_keyed_envelope(ciphertext)
             .map_err(|e| StorageError::Other(format!("metadata envelope decode failed: {e}")))?;
         let (recorded_key, ciphertext) = match decoded {

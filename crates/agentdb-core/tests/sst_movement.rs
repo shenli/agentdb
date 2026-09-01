@@ -129,7 +129,7 @@ async fn install_refuses_when_disk_reservation_would_be_breached() {
 
     // An impossibly large reservation forces the install to fail fast rather
     // than consume the disk down into the reserve (the doom-loop guard).
-    std::env::set_var("AGENTDB_MOVEMENT_DISK_RESERVE_BYTES", &u64::MAX.to_string());
+    std::env::set_var("AGENTDB_MOVEMENT_DISK_RESERVE_BYTES", u64::MAX.to_string());
 
     let target_dir = TempDir::new().unwrap();
     let target_kv: Arc<dyn KvStore + Send + Sync> =

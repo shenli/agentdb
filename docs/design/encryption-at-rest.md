@@ -77,12 +77,33 @@ identical content for two tenants yields independent ciphertext.
 `Runtime::with_kv_content_and_keyring` injects a keyring; the default stays
 disabled, so existing deployments are unchanged until they opt in.
 
-**Not yet done:** the *event and metadata* hot paths are still plaintext (only
-content-backend objects are wired); records, skills, indexes, idempotency,
-export, Raft, snapshots, checkpoints, and backups are not covered; there is no
-KMS provider or wrapped-DEK catalog, rotation worker, or revocation; and the
-server does not yet build a keyring from configuration. The remaining stages add
-these, plus the benchmark matrix.
+**Milestone 3 (landed): the event and metadata hot paths are wired.** Persist's
+`encrypt_metadata`/`decrypt_metadata` choke points route durable event values
+and artifact-metadata rows through the keyring — sealed as `AGDB-ENVELOPE-v2`
+before the KV write when enabled, legacy metadata-adapter path when disabled,
+with the same version-detecting mixed reader. A raw-KV marker test proves an
+event payload never appears in a stored KV value, and legacy plaintext events
+stay readable after enabling. The bounded plaintext-DEK cache from M1 carries
+the per-value hot path (the seal path was fixed to hit the cache instead of
+re-deriving the DEK on every write). An `#[ignore]`d benchmark
+(`tests/encryption_bench.rs`) measures both the crypto primitive and the append
+hot path. On li-dev (x86, AES-NI) the **primitive** seals/opens a 256-byte value
+at ~0.75M ops/s (XChaCha20-Poly1305) to ~1.8–2.2M ops/s (AES-256-GCM) — roughly
+1–2 µs, well under 1% of a ~1 ms append, so the crypto cost clears the ≤10%
+gate with large margin. The append **macro** benchmark shows a larger swing at
+in-memory tight-loop scale, but that is dominated by the adaptive write
+batcher's timing, not AEAD cost (the fast primitive proves it); it must be
+re-measured on RocksDB with the batcher configured before being read as a real
+regression.
+
+**Not yet done:** records, skills, indexes, idempotency, export, Raft,
+snapshots, checkpoints, and backups are not covered (only artifact + event
+values go through the metadata choke points today — extending `MetadataObjectKind`
+to every durable type, or moving encryption below typed serialization, is the
+next coverage stage). Event AAD binds tenant + session + kind (not yet the
+per-event seq). There is still no KMS provider or wrapped-DEK catalog, rotation
+worker, or revocation, and the server does not yet build a keyring from
+configuration.
 
 The pre-existing seams remain as the integration points those stages build on:
 
