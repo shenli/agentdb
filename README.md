@@ -61,7 +61,7 @@ The API listens on `http://127.0.0.1:7878`, and the dashboard is available at
 Run the Python quickstart in another terminal:
 
 ```bash
-pip install -e clients/python
+python3 -m pip install -e clients/python
 AGENTDB_URL=http://127.0.0.1:7878 python3 examples/agents/python/quickstart.py
 ```
 

@@ -1,6 +1,0 @@
-AgentDB listening on http://127.0.0.1:32120
-  deployment: single_node
-  mode: persistent (kv: rocksdb, content: localfs, data: /home/lishen/work/agentdb/test-sessions/agentdb-project-wide-distributed-tests/20260518T190214Z/artifacts/S12-upgrade/data, artifacts: /home/lishen/work/agentdb/test-sessions/agentdb-project-wide-distributed-tests/20260518T190214Z/artifacts/S12-upgrade/content)
-  health:    http://127.0.0.1:32120/health/ready
-  dashboard: http://127.0.0.1:32120/dashboard/
-  internal raft rpc: disabled

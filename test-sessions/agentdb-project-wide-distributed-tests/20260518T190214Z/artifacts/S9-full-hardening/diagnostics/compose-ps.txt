@@ -1,3 +1,0 @@
-NAME                                      IMAGE                        COMMAND                  SERVICE    CREATED          STATUS                    PORTS
-agentdb-cluster-smoke-s9hard-minio-1      quay.io/minio/minio:latest   "/usr/bin/docker-ent…"   minio      13 minutes ago   Up 13 minutes             0.0.0.0:19000->9000/tcp, [::]:19000->9000/tcp, 0.0.0.0:19001->9001/tcp, [::]:19001->9001/tcp
-agentdb-cluster-smoke-s9hard-postgres-1   postgres:16                  "docker-entrypoint.s…"   postgres   13 minutes ago   Up 13 minutes (healthy)   0.0.0.0:55432->5432/tcp, [::]:55432->5432/tcp

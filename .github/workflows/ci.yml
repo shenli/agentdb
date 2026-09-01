@@ -1,11 +1,13 @@
-# Manual CI. Automatic GitHub CI is intentionally disabled for
-# cost control; the default pre-merge validation path is the
-# local runner:
+# CI runs automatically on pull requests (open-source
+# contributors can't run the local runner pre-merge), plus
+# on-demand via workflow_dispatch. The heavyweight validation
+# path for maintainers remains the local runner:
 #
 #   ops/local-ci/scripts/local-ci.sh
 #
-# Keep this workflow as an on-demand cloud fallback when a PR
-# needs GitHub-hosted verification.
+# (quick profile pre-merge; nightly/release profiles carry the
+# chaos harnesses and cluster smokes, which stay off GH Actions
+# for cost.)
 #
 # Linux-only by design. macOS minutes on GH Actions are 10×
 # Linux minutes; we don't need OS coverage for build correctness
@@ -23,6 +25,8 @@
 name: ci
 
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       run_sdks:
@@ -110,7 +114,9 @@ jobs:
 
   sdks:
     name: SDK smoke (Python + TypeScript)
-    if: ${{ inputs.run_sdks }}
+    # Always on PRs (the SDK surface is where the eval suite keeps
+    # finding regressions); opt-in on manual dispatch.
+    if: ${{ github.event_name == 'pull_request' || inputs.run_sdks }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
