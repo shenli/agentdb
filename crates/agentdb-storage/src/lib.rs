@@ -28,9 +28,10 @@ pub use content_crypto::{
     ContentCryptoAdapter, ContentCryptoContext, IdentityContentCryptoAdapter,
 };
 pub use crypto::{
-    is_envelope_v2, AeadTenantKeyring, CryptoConfig, CryptoContext, CryptoError, CryptoMode, Dek,
-    DekCacheConfig, DekLease, DisabledEnvelopeCrypto, EnvelopeCrypto, EnvelopeParts, KeyMetadata,
-    KeyProvider, KeyPurpose, LocalKeyProvider, Suite,
+    is_envelope_v2, AeadTenantKeyring, CatalogKeyProvider, CryptoConfig, CryptoContext, CryptoError,
+    CryptoMode, Dek, DekCacheConfig, DekLease, DekRecord, DekStatus, DisabledEnvelopeCrypto,
+    EnvelopeCrypto, EnvelopeParts, KekProvider, KeyCatalog, KeyMetadata, KeyProvider, KeyPurpose,
+    LocalKekProvider, LocalKeyProvider, Suite, WrappedDek,
 };
 pub use error::{Error, Result};
 pub use kms::{
