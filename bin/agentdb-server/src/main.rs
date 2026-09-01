@@ -64,6 +64,11 @@ const DEFAULT_RAFT_SNAPSHOT_PRUNE_INTERVAL_MS: u64 = 5 * 60_000;
 const DEFAULT_RAFT_SNAPSHOT_PRUNE_BATCH: i64 = 256;
 const DEFAULT_RAFT_SNAPSHOT_RESTORE_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
+/// Default byte ceiling on the pending object-store upload backlog before
+/// writes are throttled (hardening §5). 512 MiB — generous enough that a
+/// healthy mirror never trips it, tight enough that a stalled object store
+/// cannot grow node memory without bound. 0 disables.
+const DEFAULT_CONTENT_MIRROR_MAX_BACKLOG_BYTES: u64 = 512 * 1024 * 1024;
 
 type ContentBackendBundle = (
     Arc<dyn agentdb_storage::ContentBackend>,
@@ -1846,18 +1851,40 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
                     .as_ref()
                     .expect("object-store content backend requires object store config"),
             )?;
-            let mirror: Arc<dyn agentdb_storage::ContentBackend> =
+            let mut mirror: Arc<dyn agentdb_storage::ContentBackend> =
                 Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
                     object_store,
                     OBJECT_STORE_CONTENT_PREFIX,
                 ));
+            // Test/measurement knob (hardening §5): delay every object-store
+            // op to demonstrate that the upload backlog stays bounded and
+            // writers are throttled rather than blocked.
+            let inject_latency_ms = env_u64("AGENTDB_CONTENT_MIRROR_INJECT_LATENCY_MS", 0);
+            if inject_latency_ms > 0 {
+                tracing::warn!(
+                    inject_latency_ms,
+                    "injecting artificial object-store latency (test/measurement mode)"
+                );
+                mirror = Arc::new(agentdb_storage::LatencyContentBackend::new(
+                    mirror,
+                    inject_latency_ms,
+                ));
+            }
             let queue_capacity = env_usize(
                 "AGENTDB_CONTENT_MIRROR_QUEUE_CAPACITY",
                 DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY,
             )
             .max(1);
+            // Byte ceiling on the pending upload backlog: beyond it, writes
+            // are throttled (429 + Retry-After) so a slow object store cannot
+            // grow the backlog — and node memory — without bound. 0 disables.
+            let max_backlog_bytes = env_u64(
+                "AGENTDB_CONTENT_MIRROR_MAX_BACKLOG_BYTES",
+                DEFAULT_CONTENT_MIRROR_MAX_BACKLOG_BYTES,
+            );
             let mut mirror_backend =
-                agentdb_storage::AsyncMirrorContentBackend::new(primary, mirror, queue_capacity);
+                agentdb_storage::AsyncMirrorContentBackend::new(primary, mirror, queue_capacity)
+                    .with_max_backlog_bytes(max_backlog_bytes);
             if let Some(ttl_ms) = config.content_local_cache_ttl_ms {
                 mirror_backend = mirror_backend.with_local_cache_ttl_ms(ttl_ms);
             }
@@ -1866,6 +1893,7 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
                 primary_path = %content_dir.display(),
                 mirror_prefix = %OBJECT_STORE_CONTENT_PREFIX,
                 queue_capacity,
+                max_backlog_bytes,
                 local_cache_ttl_ms = ?config.content_local_cache_ttl_ms,
                 "opened async mirrored artifact content backend"
             );
