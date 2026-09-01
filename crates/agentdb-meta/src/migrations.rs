@@ -193,6 +193,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/029_notify_ignores_heartbeat_touches.sql"),
         include_str!("../migrations/029_notify_ignores_heartbeat_touches.pg.sql"),
     ),
+    (
+        30,
+        "store-incarnation registry for durable store identity admission",
+        include_str!("../migrations/030_store_incarnations.sql"),
+        include_str!("../migrations/030_store_incarnations.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
@@ -366,6 +372,7 @@ mod tests {
             "schema_migrations",
             "scheduler_leader",
             "shards",
+            "store_incarnations",
             "tablet_movements",
             "tablets",
         ] {

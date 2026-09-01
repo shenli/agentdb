@@ -14,10 +14,11 @@
 //!
 //! `store_incarnation` is a random id minted once, when the directory is
 //! first initialized. It identifies the physical store, not the logical
-//! node — rebuilding a node onto a fresh disk mints a new incarnation,
-//! which is what a control-plane admission step keys on (that cross-check
-//! is a separate step; this module owns the local, self-contained half:
-//! cluster id, node id, and integrity).
+//! node — rebuilding a node onto a fresh disk mints a new incarnation.
+//! This module owns the local, self-contained half (cluster id, node id,
+//! and integrity); in cluster mode the incarnation is additionally admitted
+//! against the control-plane registry in `agentdb_meta::store_admission`,
+//! which is what catches a retired or displaced disk trying to rejoin.
 
 use std::path::{Path, PathBuf};
 

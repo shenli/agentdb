@@ -371,6 +371,10 @@ async fn reset_cluster_meta(meta: &MetaStore) -> Result<()> {
         "tablets",
         "nodes",
         "scheduler_leader",
+        // Fresh data dirs each run mint new store incarnations; without
+        // clearing the registry a rerun would fail closed against the
+        // previous run's still-"active" incarnation for the same node id.
+        "store_incarnations",
     ] {
         sqlx::query(&format!("DELETE FROM {table}"))
             .execute(pool)
