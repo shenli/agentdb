@@ -144,6 +144,35 @@ deployment choices, see [deployment.md](deployment.md).
 - [ ] Runbook is documented:
   [tiered-storage.md](tiered-storage.md).
 
+## Tenant Envelope Encryption (optional)
+
+Tenant payloads (session events, artifact content and metadata) can be sealed
+at rest under per-tenant keys. This is **opt-in** and currently supported for
+the **single-node persistent** layout only (the in-memory and replicated
+layouts fail closed if it is requested).
+
+- [ ] To enable, set on the server:
+
+  ```bash
+  AGENTDB_ENCRYPTION_MODE=envelope
+  AGENTDB_ENCRYPTION_KEK_SECRET=<high-entropy secret>   # the key-encryption key
+  AGENTDB_ENCRYPTION_KEK_REF=local:v1                   # optional label (default)
+  AGENTDB_ENCRYPTION_SUITE=xchacha20-poly1305           # or aes-256-gcm (default xchacha)
+  ```
+
+- [ ] **The KEK secret is critical.** It wraps every per-tenant data key; losing
+  it makes all encrypted data permanently unreadable (that is also the
+  crypto-shred property). Store it in a secrets manager, back it up
+  independently of the data volume, and never log it.
+- [ ] Enabling on an existing deployment encrypts **new** writes; previously
+  written plaintext stays readable (mixed reader). There is no in-place bulk
+  migration yet.
+- [ ] Wrapped DEKs live in the runtime store under a reserved control-plane
+  prefix; they are included in a normal backup and are useless without the KEK.
+- [ ] Startup **fails closed** if `envelope` is set without a KEK secret, with
+  the in-memory runtime, or with the replicated tablet layout. See
+  [../design/encryption-at-rest.md](../design/encryption-at-rest.md).
+
 ## Routine Operations
 
 - [ ] Daily readiness and status checks are assigned to an owner.
