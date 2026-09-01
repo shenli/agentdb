@@ -215,11 +215,22 @@ wires a keyring + provisioner for the cluster shape, and `MetaCatalogKeyProvider
 implements the trait. A test confirms `create_tenant` provisions the tenant's
 keys; the serve path stays unchanged when no provisioner is set (single-node).
 
-**Not yet done:** the last server wiring — build the provider + keyring for the
-replicated layout in the server startup (using the new constructor), lift the
-replicated-layout fail-closed from M7, hook `refresh` to the metadata
-change-notifier so followers pick up new keys, and add a real multi-node test.
-The online DEK rotation worker
+**Milestone 13 (landed): the server enables cluster encryption.** For the
+replicated **prefix-scoped** layout, server startup now builds the shared-catalog
+keyring + provisioner (`build_cluster_keyring_and_provisioner`: a
+`MetaCatalogKeyProvider` over the meta pool, used as both the keyring's key
+source and the tenant provisioner) and wires them via
+`with_kv_content_keyring_provisioner_and_replicated_logs_for_default_tablet` —
+so the M7 replicated fail-closed is **lifted** for this layout. Envelope mode
+still fails closed without a control plane, and (for now) on the grouped-rocksdb
+layout, which needs its own keyring+provisioner constructor. `encryption_kek_and_suite`
+is the shared KEK/suite parser for the single-node and cluster paths.
+
+**Not yet done:** the grouped-rocksdb cluster layout (a lifecycle+keyring+provisioner
+constructor); hooking `refresh` to the metadata change-notifier so a *follower*
+(or a newly-elected leader) picks up a tenant provisioned after its startup —
+without it, cluster reads are correct only where they route to the provisioning
+leader; and a real multi-node validation. The online DEK rotation worker
 (new DEK version + data
 re-encryption walk) and the admin API/CLI to drive rewrap and rotation are not
 built; and the

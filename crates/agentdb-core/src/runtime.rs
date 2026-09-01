@@ -3414,8 +3414,28 @@ impl Runtime {
         key_provisioner: Arc<dyn TenantKeyProvisioner>,
         logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
     ) -> Arc<Self> {
+        Self::with_kv_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
+            kv,
+            content,
+            keyring,
+            key_provisioner,
+            logs,
+            RUNTIME_PRIMARY_TABLET_ID,
+        )
+    }
+
+    /// As above, with an explicit default tablet id (the server's configured
+    /// `route_default_tablet_id`).
+    pub fn with_kv_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        keyring: Arc<dyn EnvelopeCrypto>,
+        key_provisioner: Arc<dyn TenantKeyProvisioner>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+        default_tablet_id: i64,
+    ) -> Arc<Self> {
         let tablet_router = Arc::new(
-            RuntimeTabletRouterKvStore::new(kv, RUNTIME_PRIMARY_TABLET_ID, logs)
+            RuntimeTabletRouterKvStore::new(kv, default_tablet_id, logs)
                 .expect("open runtime tablet router"),
         );
         let persist = Persist::with_metadata_crypto(
