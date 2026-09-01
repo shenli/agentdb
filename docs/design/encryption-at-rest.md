@@ -165,9 +165,23 @@ opens under v2 while v1 alone no longer serves it. This is the design's "KMS
 material rotation under one logical KEK." (Online *DEK* rotation — minting a new
 DEK version and re-encrypting data v1→v2 — is separate and still to come.)
 
-**Not yet done:** cluster (multi-node) envelope encryption needs a shared key
-catalog; the online DEK rotation worker (new DEK version + data re-encryption
-walk) and the admin API/CLI to drive rewrap/rotation are not built; and the
+**Milestone 9 (landed, first cluster step): read-only provider + coordinated
+provisioning.** `CatalogKeyProvider::new_read_only` makes the serve (seal/open)
+path never mint a DEK — it fails closed on an unprovisioned key — while
+`provision(tenant, purpose)` is the single coordinated entry point that mints,
+wraps, and stores a DEK. This is the pre-provisioning model the cluster design
+picked: a leader provisions a tenant's DEK once (e.g. at tenant creation) into
+the shared/replicated catalog, and every node's read-only path then serves the
+same key with no cross-node minting race. A test with two providers over one
+shared catalog (two simulated nodes) shows a follower serving the exact DEK the
+leader provisioned. The remaining cluster wiring — provisioning at tenant
+creation, the catalog on the replicated store, and follower cache consistency —
+is the next step.
+
+**Not yet done:** cluster (multi-node) envelope encryption needs the runtime
+wiring above on top of the M9 primitive; the online DEK rotation worker (new DEK
+version + data re-encryption walk) and the admin API/CLI to drive rewrap and
+rotation are not built; and the
 `LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
 Agent/session/tenant records, searchable records, and skills are still plaintext
 (records are additionally entangled with the export ledger + search index).

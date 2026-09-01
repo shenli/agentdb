@@ -213,18 +213,58 @@ fn parse_purpose(s: &str) -> Result<KeyPurpose, CryptoError> {
 pub struct CatalogKeyProvider {
     catalog: KeyCatalog,
     kek: Arc<dyn KekProvider>,
+    /// When `true` (single-writer deployments), a serve of a not-yet-provisioned
+    /// `(tenant, purpose)` mints the DEK lazily. When `false` (multi-node), the
+    /// serve path is **read-only**: DEKs must be [`provision`](Self::provision)ed
+    /// by a coordinated caller (e.g. at tenant creation on the leader), so two
+    /// nodes cannot race to mint two different DEKs for the same tenant.
+    auto_generate: bool,
     /// Serializes first-DEK generation so two racing writers cannot mint two
     /// active versions for the same (tenant, purpose).
     generate_lock: Mutex<()>,
 }
 
 impl CatalogKeyProvider {
+    /// Single-writer provider: serving an unprovisioned `(tenant, purpose)`
+    /// mints its DEK on demand. Correct for single-node deployments.
     pub fn new(catalog: KeyCatalog, kek: Arc<dyn KekProvider>) -> Self {
         Self {
             catalog,
             kek,
+            auto_generate: true,
             generate_lock: Mutex::new(()),
         }
+    }
+
+    /// Read-only (multi-node) provider: the serve path never mints a DEK — it
+    /// fails closed on an unprovisioned key. DEKs are minted only through
+    /// [`provision`](Self::provision), driven by a single coordinated caller, so
+    /// every node agrees on one DEK per tenant read from the shared catalog.
+    pub fn new_read_only(catalog: KeyCatalog, kek: Arc<dyn KekProvider>) -> Self {
+        Self {
+            catalog,
+            kek,
+            auto_generate: false,
+            generate_lock: Mutex::new(()),
+        }
+    }
+
+    /// Explicitly ensure a DEK exists for `(tenant, purpose)`, minting, wrapping,
+    /// and storing one if absent, and return its (non-secret) metadata. This is
+    /// the coordinated provisioning entry point: call it once per tenant on the
+    /// leader when the catalog is a shared/replicated store, and afterwards every
+    /// node's read-only serve path finds the DEK. Idempotent.
+    pub fn provision(
+        &self,
+        tenant_id: &str,
+        purpose: KeyPurpose,
+    ) -> Result<KeyMetadata, CryptoError> {
+        if let Some(version) = self.catalog.active_version(tenant_id, purpose)? {
+            if let Some(record) = self.catalog.get_record(tenant_id, purpose, version)? {
+                return Ok(self.lease_from_record(tenant_id, purpose, &record)?.metadata().clone());
+            }
+        }
+        Ok(self.generate_active(tenant_id, purpose)?.metadata().clone())
     }
 
     fn lease_from_record(
@@ -300,7 +340,16 @@ impl KeyProvider for CatalogKeyProvider {
                 return self.lease_from_record(tenant_id, purpose, &record);
             }
         }
-        self.generate_active(tenant_id, purpose)
+        if self.auto_generate {
+            return self.generate_active(tenant_id, purpose);
+        }
+        Err(CryptoError::KeyUnavailable {
+            tenant_id: tenant_id.to_string(),
+            purpose: purpose.as_str(),
+            reason: "no active DEK provisioned (read-only provider; provision it on the leader \
+                     before writing this tenant's data)"
+                .into(),
+        })
     }
 
     fn dek_version(
@@ -405,6 +454,49 @@ mod tests {
         // A keyring with a DIFFERENT KEK cannot open it: the wrapped DEK will not
         // unwrap, so losing/rotating-away the KEK crypto-shreds the data.
         assert!(keyring(b"other-kek", "local:v2").open(&ctx, &sealed).is_err());
+    }
+
+    #[test]
+    fn read_only_provider_fails_closed_until_provisioned() {
+        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+        let p = CatalogKeyProvider::new_read_only(
+            KeyCatalog::new(kv),
+            Arc::new(LocalKekProvider::from_secret(b"kek", "local:v1")),
+        );
+        // A read-only provider never mints on serve.
+        assert!(p.active_dek("ten_a", KeyPurpose::Content).is_err());
+        // Explicit provisioning creates it; then serve succeeds.
+        let meta = p.provision("ten_a", KeyPurpose::Content).unwrap();
+        assert_eq!(meta.version, 1);
+        assert_eq!(p.active_dek("ten_a", KeyPurpose::Content).unwrap().metadata().version, 1);
+        // Provisioning is idempotent.
+        assert_eq!(p.provision("ten_a", KeyPurpose::Content).unwrap(), meta);
+    }
+
+    #[test]
+    fn shared_catalog_serves_every_node_after_one_provisions() {
+        // Two providers over the SAME catalog KV model two cluster nodes sharing
+        // a replicated key catalog. Node A provisions (as the leader would at
+        // tenant creation); node B — a read-only follower — then serves the very
+        // same DEK, so both nodes seal/open under one key and can read each
+        // other's ciphertext.
+        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+        let kek = || Arc::new(LocalKekProvider::from_secret(b"cluster-kek", "local:v1"));
+        let node_a = CatalogKeyProvider::new_read_only(KeyCatalog::new(kv.clone()), kek());
+        let node_b = CatalogKeyProvider::new_read_only(KeyCatalog::new(kv.clone()), kek());
+
+        // Before provisioning, neither node can serve.
+        assert!(node_a.active_dek("ten_a", KeyPurpose::Content).is_err());
+        assert!(node_b.active_dek("ten_a", KeyPurpose::Content).is_err());
+
+        // The leader provisions once.
+        let leader_meta = node_a.provision("ten_a", KeyPurpose::Content).unwrap();
+
+        // The follower now serves the identical DEK from the shared catalog.
+        let a = node_a.active_dek("ten_a", KeyPurpose::Content).unwrap();
+        let b = node_b.active_dek("ten_a", KeyPurpose::Content).unwrap();
+        assert_eq!(a.metadata(), &leader_meta);
+        assert_eq!(a.metadata(), b.metadata());
     }
 
     #[test]
