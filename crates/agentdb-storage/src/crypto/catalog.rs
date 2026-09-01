@@ -126,6 +126,55 @@ impl KeyCatalog {
         Ok(Some(u32::from_be_bytes(arr)))
     }
 
+    /// Every DEK record in the catalog (all tenants, purposes, versions).
+    fn scan_records(&self) -> Result<Vec<DekRecord>, CryptoError> {
+        let prefix = format!("{CATALOG_PREFIX}dek/").into_bytes();
+        let mut out = Vec::new();
+        for item in self
+            .kv
+            .scan_prefix(&prefix)
+            .map_err(|e| CryptoError::Config(format!("key catalog scan: {e}")))?
+        {
+            let (_key, value) =
+                item.map_err(|e| CryptoError::Config(format!("key catalog scan: {e}")))?;
+            out.push(serde_json::from_slice(&value).map_err(|e| {
+                CryptoError::MalformedEnvelope(format!("key catalog record decode: {e}"))
+            })?);
+        }
+        Ok(out)
+    }
+
+    /// Rotate the key-encryption key: re-wrap every DEK from `old` to `new`.
+    ///
+    /// Each DEK is unwrapped under the old KEK and re-wrapped under the new one;
+    /// the DEK *bytes* — and therefore all ciphertext already sealed under them
+    /// — are unchanged, so **no tenant data is re-encrypted**. Records already
+    /// wrapped under `new` are skipped, making a re-run idempotent (e.g. after a
+    /// crash mid-rewrap). Returns the number of records re-wrapped. Fails closed
+    /// if any DEK cannot be unwrapped under `old` (wrong old KEK) — nothing is
+    /// left half-rotated for that record.
+    pub fn rewrap_all(
+        &self,
+        old: &dyn KekProvider,
+        new: &dyn KekProvider,
+    ) -> Result<usize, CryptoError> {
+        let mut count = 0;
+        for record in self.scan_records()? {
+            if record.wrapped.wrapping_key_ref == new.kek_ref() {
+                continue; // already under the new KEK
+            }
+            let purpose = parse_purpose(&record.purpose)?;
+            let dek = old.unwrap_dek(&record.tenant_id, purpose, &record.wrapped)?;
+            let rewrapped = new.wrap_dek(&record.tenant_id, purpose, &dek)?;
+            self.put_record(&DekRecord {
+                wrapped: rewrapped,
+                ..record
+            })?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Persist a record and, if it is `Active`, point the active version at it.
     fn put_record(&self, record: &DekRecord) -> Result<(), CryptoError> {
         let purpose = parse_purpose(&record.purpose)?;
@@ -448,6 +497,52 @@ mod tests {
         let b = node_b.active_dek("ten_a", KeyPurpose::Content).unwrap();
         assert_eq!(a.metadata(), &leader_meta);
         assert_eq!(a.metadata(), b.metadata());
+    }
+
+    #[test]
+    fn kek_rewrap_rotates_the_kek_without_re_encrypting_data() {
+        use crate::crypto::{AeadTenantKeyring, CryptoContext, DekCacheConfig, EnvelopeCrypto, Suite};
+
+        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+        let ctx = CryptoContext {
+            tenant_id: "ten_a",
+            purpose: KeyPurpose::Content,
+            object_kind: "event",
+            object_id: "o1",
+        };
+        let kek_v1 = Arc::new(LocalKekProvider::from_secret(b"kek-1", "local:v1"));
+        let kek_v2 = Arc::new(LocalKekProvider::from_secret(b"kek-2", "local:v2"));
+        let keyring = |kek: Arc<LocalKekProvider>| {
+            AeadTenantKeyring::new(
+                Arc::new(CatalogKeyProvider::new(KeyCatalog::new(kv.clone()), kek)),
+                Suite::XChaCha20Poly1305,
+                DekCacheConfig::default(),
+            )
+        };
+
+        // Seal under KEK v1 (mints + wraps DEK under v1).
+        let sealed = keyring(kek_v1.clone()).seal(&ctx, b"payload").unwrap();
+
+        // Rotate the KEK: re-wrap every DEK from v1 to v2. Data is untouched.
+        let catalog = KeyCatalog::new(kv.clone());
+        assert_eq!(
+            catalog.rewrap_all(kek_v1.as_ref(), kek_v2.as_ref()).unwrap(),
+            1
+        );
+        // Idempotent: a second rewrap re-wraps nothing.
+        assert_eq!(
+            catalog.rewrap_all(kek_v1.as_ref(), kek_v2.as_ref()).unwrap(),
+            0
+        );
+
+        // The same ciphertext now opens under KEK v2 (the DEK bytes are the same).
+        assert_eq!(
+            keyring(kek_v2).open(&ctx, &sealed).unwrap(),
+            b"payload"
+        );
+        // KEK v1 alone can no longer serve it — the catalog references v2, so the
+        // old KEK is retired.
+        assert!(keyring(kek_v1).open(&ctx, &sealed).is_err());
     }
 
     #[test]
