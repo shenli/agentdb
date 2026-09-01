@@ -52,32 +52,27 @@ falls back to a local read when quorum confirmation fails — that is the
 property that stops a partitioned or resumed former leader from serving
 stale data.
 
-### Known limitation: isolated re-elected leader
+### Why check_quorum is required
 
-The barrier reliably refuses a read whenever the serving node is a
-follower, or is a leader that cannot confirm quorum within the timeout —
-this is what the storage unit test pins
-(`read_barrier_confirms_on_healthy_leader_and_times_out_when_isolated`).
+The raft group runs with `check_quorum` **on** (paired with `pre_vote`),
+and this is load-bearing for linearizable reads, not incidental. raft-rs
+tracks a per-peer `recent_active` flag; `check_quorum` is the machinery
+that clears it each election timeout and steps a leader down when it can
+no longer re-confirm a quorum. With `check_quorum` off, `recent_active`
+is never reset, so an isolated former leader believes its peers are still
+reachable forever and its `Safe` ReadIndex keeps self-confirming against a
+quorum that no longer exists — i.e. it serves stale reads. (This was
+observed directly: an isolated leader's progress tracker still showed both
+partitioned peers as `recent_active=true`.)
 
-There is one real-cluster gap it does **not** yet close. The raft group
-runs with `check_quorum` disabled, and tablet ownership is a control-plane
-SQL lease that is independent of raft authority. An isolated former leader
-that is still the recorded SQL owner keeps heartbeating the metadata
-store, so the owner-campaign worker keeps re-electing it as raft leader.
-raft-rs `Safe` ReadIndex on that repeatedly-re-elected leader can
-intermittently self-confirm, so such a node can still serve a stale read.
-
-Closing this gap is not a `check_quorum` flip: enabling `check_quorum`
-alone just makes the isolated node flap between leader and follower as the
-owner-campaign fights the step-down, without closing the window. The
-proper fix is to **decouple raft authority from the SQL owner lease** so an
-isolated node stops campaigning once it cannot reach a quorum — after
-which `check_quorum` + `pre_vote` deliver the strict guarantee. This is
-tracked as the next hardening step (it belongs with the same
-routing-vs-authority work called out in
-`distributed-safety-hardening.md`). Until then these reads are
-**leader-confirmed (best-effort linearizable)**: strictly linearizable
-except for the isolated-re-elected-leader window described here. It is disabled only by the explicit kill switch
+With `check_quorum` on, the isolated leader clears `recent_active`, fails
+to re-confirm a quorum, and steps down; `pre_vote` then prevents it from
+winning another election while it cannot reach a quorum. So it never
+resumes leadership and never self-confirms a read. Reads that reach the
+former leader afterward either refuse locally (while it is still the
+routed owner) or forward to the healthy leader once ownership moves —
+both correct, neither a stale local serve. S22 verifies the isolated node
+leaves the leader role within a settle window and stays out of it. It is disabled only by the explicit kill switch
 `AGENTDB_READ_BARRIER=off`, which downgrades linearizable reads to
 eventually-consistent (documented, for incident mitigation only).
 
@@ -90,8 +85,8 @@ trip.
 
 | Surface | Label | Enforced by |
 |---|---|---|
-| `GET /api/tenants/{t}/sessions/{s}/events` | Leader-confirmed (best-effort linearizable) | read barrier before local serve; see limitation below |
-| `GET /api/tenants/{t}/sessions/{s}` | Leader-confirmed (best-effort linearizable) | read barrier before local serve; see limitation below |
+| `GET /api/tenants/{t}/sessions/{s}/events` | Linearizable | read barrier before local serve |
+| `GET /api/tenants/{t}/sessions/{s}` | Linearizable | read barrier before local serve |
 | append-and-fetch (`POST …/events` returning the tail) | Read-your-writes | the append's own applied index |
 | `GET …/sessions/{s}/watch` (changefeed) | Eventually consistent | cursor advances as entries apply; caller polls |
 | `GET /api/tenants/{t}/records/search` | Eventually consistent | **unrouted** — any node serves from local index state; see note |
@@ -113,6 +108,7 @@ The barrier's behavior is pinned by:
 - A storage unit test (`read_barrier_confirms_on_healthy_leader_and_times_out_when_isolated`):
   a healthy leader confirms; a non-leader is rejected; a leader isolated
   from its followers times out instead of serving locally.
-- The S22 real-cluster scenario, extended once the barrier is wired into
-  the read path: an isolated live leader must fail a linearizable read,
-  not just a write.
+- The S22 real-cluster scenario: an isolated live leader cannot commit,
+  and (check_quorum) must leave the leader role within a settle window and
+  stay out of it while partitioned, so it can never self-confirm a stale
+  local read.

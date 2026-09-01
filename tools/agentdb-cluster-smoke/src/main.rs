@@ -3735,25 +3735,65 @@ async fn run_fault_injection(
         }
     }
 
-    // NOTE on linearizable reads: the read barrier's correctness — a leader
-    // that cannot confirm quorum, or a follower, refuses a local read — is
-    // pinned deterministically by the storage unit test
-    // `read_barrier_confirms_on_healthy_leader_and_times_out_when_isolated`.
-    // We do NOT assert it here against the isolated leader: on a real
-    // cluster the owner-campaign worker keeps re-electing an isolated SQL
-    // owner as raft leader, and raft-rs Safe ReadIndex on a
-    // repeatedly-re-elected leader can intermittently self-confirm — a
-    // documented limitation (docs/design/read-semantics.md) whose fix
-    // (decoupling raft authority from the SQL owner lease) is separate
-    // hardening. Asserting the read here would test that unresolved
-    // interaction, not the barrier. The write-cannot-commit check above is
-    // the solid real-cluster quorum-loss signal.
+    // 2b. No stale linearizable reads: with check_quorum the isolated
+    //     leader must STEP DOWN (it cannot re-confirm a quorum) and, with
+    //     pre_vote, cannot win another election while isolated — so it
+    //     never resumes raft leadership and can never self-confirm a stale
+    //     local read. We verify it leaves the Leader role within a settle
+    //     window and stays out of it. (Reads to the former leader then
+    //     either refuse locally, while it is still the routed owner, or
+    //     forward to the healthy leader once ownership moves — both correct,
+    //     neither a stale local serve. The barrier's local-serve refusal is
+    //     pinned deterministically by the storage unit test
+    //     read_barrier_confirms_on_healthy_leader_and_times_out_when_isolated.)
+    let stepdown_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let is_leader = raft_leader_view(client, std::slice::from_ref(&view.leader), tablet_id)
+            .await?
+            .is_some();
+        if !is_leader {
+            eprintln!(
+                "fault-injection: isolated node {} stepped down from leader (check_quorum)",
+                view.leader.id
+            );
+            break;
+        }
+        if tokio::time::Instant::now() >= stepdown_deadline {
+            bail!(
+                "fault-injection: isolated node {} stayed raft leader for 20s; check_quorum did \
+                 not step it down, so it could serve stale linearizable reads",
+                view.leader.id
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // It must STAY stepped down while partitioned (pre_vote blocks an
+    // isolated re-election); a flap back to leader would reopen the window.
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if raft_leader_view(client, std::slice::from_ref(&view.leader), tablet_id)
+            .await?
+            .is_some()
+        {
+            bail!(
+                "fault-injection: isolated node {} flapped back to raft leader while still \
+                 partitioned",
+                view.leader.id
+            );
+        }
+    }
+    eprintln!(
+        "fault-injection: isolated node {} stays non-leader while partitioned; no stale reads",
+        view.leader.id
+    );
 
     // 4. Heal and reconverge.
     fault_clear(client, &view.leader.url, token).await?;
     eprintln!("fault-injection: cleared isolation rules; waiting for reconvergence");
     wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
-    eprintln!("fault-injection: PASS — mechanism, quorum-loss, election, and heal all held");
+    eprintln!(
+        "fault-injection: PASS — mechanism, quorum-loss, no-stale-reads (step-down), election, and heal all held"
+    );
     Ok(())
 }
 

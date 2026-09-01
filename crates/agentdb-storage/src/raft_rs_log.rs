@@ -1357,17 +1357,16 @@ fn raft_node_config(node_id: u64, applied: u64) -> Config {
         applied,
         max_size_per_msg: u64::MAX,
         max_inflight_msgs: 256,
-        // check_quorum stays off for now. Enabling it (the standard pairing
-        // with pre_vote for linearizable ReadIndex) makes an isolated
-        // leader step down — but the owner-campaign worker immediately
-        // re-elects it because it is still the control-plane tablet owner,
-        // producing leader/follower flapping under partition without
-        // actually closing the stale-read window. Closing it properly means
-        // decoupling raft authority from the SQL owner lease so an isolated
-        // node stops campaigning; that is tracked as hardening follow-up
-        // (see docs/design/read-semantics.md). Flipping check_quorum in
-        // isolation would add flapping and needs its own validation.
-        check_quorum: false,
+        // check_quorum is required for correct linearizable ReadIndex.
+        // Without it raft-rs never resets per-peer `recent_active`, so an
+        // isolated leader believes its peers are still reachable forever
+        // and keeps confirming ReadIndex against a quorum that no longer
+        // exists (it serves stale reads). With check_quorum the leader
+        // clears recent_active each election timeout and steps down when it
+        // cannot re-confirm a quorum, after which the read barrier fails
+        // closed. Paired with pre_vote (already on) so a stepped-down or
+        // isolated node cannot win an election without a reachable quorum.
+        check_quorum: true,
         pre_vote: true,
         ..Default::default()
     }
