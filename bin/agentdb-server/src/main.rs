@@ -605,16 +605,36 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 .await;
                 match exported {
                     Ok(Ok(bytes)) => {
-                        let header = agentdb_storage::read_recovery_manifest_header(&bytes).ok();
-                        match recovery_store.put_latest(&bytes, now_ms).await {
-                            Ok(_) => {
-                                let (entries, payload) = header
-                                    .map(|h| (h.entry_count, h.payload_bytes))
-                                    .unwrap_or((0, 0));
-                                status.record_success(now_ms, entries, payload);
+                        match agentdb_storage::read_recovery_manifest_header(&bytes) {
+                            Ok(header) => {
+                                // Reconcilable publish: an unchanged snapshot is
+                                // an idempotent no-op, and a stale retry cannot
+                                // clobber a newer manifest.
+                                match recovery_store.publish_latest(&bytes, &header).await {
+                                    Ok(outcome) => {
+                                        tracing::debug!(
+                                            outcome = outcome.as_str(),
+                                            change_id = %header.effective_change_id(),
+                                            watermark = header.effective_watermark(),
+                                            "recovery manifest publish"
+                                        );
+                                        status.record_publish(
+                                            now_ms,
+                                            header.entry_count,
+                                            header.payload_bytes,
+                                            header.effective_change_id(),
+                                            header.effective_watermark(),
+                                            outcome.as_str(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(?error, "recovery manifest upload failed");
+                                        status.record_failure(now_ms, error.to_string());
+                                    }
+                                }
                             }
                             Err(error) => {
-                                tracing::warn!(?error, "recovery manifest upload failed");
+                                tracing::warn!(?error, "recovery manifest header unreadable");
                                 status.record_failure(now_ms, error.to_string());
                             }
                         }

@@ -433,6 +433,14 @@ pub struct RecoveryBackupSnapshot {
     pub last_entry_count: Option<u64>,
     pub last_payload_bytes: Option<u64>,
     pub consecutive_failures: u64,
+    /// Content-derived id of the currently-published manifest (§4d): the
+    /// authoritative "what is applied" answer a worker reconciles against.
+    pub applied_change_id: Option<String>,
+    /// Watermark of the currently-published manifest.
+    pub applied_watermark: Option<u64>,
+    /// Outcome of the last publish attempt: applied / already_applied /
+    /// rejected_stale.
+    pub last_publish_outcome: Option<String>,
 }
 
 /// Shared status handle: the server backup worker writes, the admin route
@@ -461,6 +469,29 @@ impl RecoveryBackupStatus {
         g.last_entry_count = Some(entry_count);
         g.last_payload_bytes = Some(payload_bytes);
         g.consecutive_failures = 0;
+    }
+
+    /// Record a reconcilable publish: the authoritative applied change id +
+    /// watermark and the outcome of this attempt. Also counts as a success.
+    pub fn record_publish(
+        &self,
+        now_ms: i64,
+        entry_count: u64,
+        payload_bytes: u64,
+        applied_change_id: impl Into<String>,
+        applied_watermark: u64,
+        outcome: &str,
+    ) {
+        let mut g = self.inner.lock().expect("recovery status mutex poisoned");
+        g.last_attempt_ms = Some(now_ms);
+        g.last_success_ms = Some(now_ms);
+        g.last_error = None;
+        g.last_entry_count = Some(entry_count);
+        g.last_payload_bytes = Some(payload_bytes);
+        g.consecutive_failures = 0;
+        g.applied_change_id = Some(applied_change_id.into());
+        g.applied_watermark = Some(applied_watermark);
+        g.last_publish_outcome = Some(outcome.to_string());
     }
 
     pub fn record_failure(&self, now_ms: i64, error: impl Into<String>) {
