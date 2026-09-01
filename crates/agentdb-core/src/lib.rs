@@ -62,7 +62,9 @@ pub use segment::{
 pub use session::{Lifecycle, NewSession, Session, SnapshotLayer, SnapshotRef};
 pub use skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 pub use tablet_state::{
-    LoggedTabletStateMachine, TabletApplyResult, TabletCommand, TabletStateMachine, TabletWriteOp,
+    decode_sst_snapshot_payload, encode_sst_snapshot_payload, is_sst_snapshot_payload,
+    DecodedSstSnapshot, LoggedTabletStateMachine, SstSnapshotMeta, TabletApplyResult,
+    TabletCommand, TabletStateMachine, TabletWriteOp,
 };
 pub use tenant::{NewTenant, Tenant};
 

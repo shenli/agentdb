@@ -9,6 +9,7 @@ license.workspace = true
 thiserror = { workspace = true }
 rocksdb = { workspace = true }
 object_store = { workspace = true }
+fs2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 tracing = { workspace = true }
 async-trait = { workspace = true }

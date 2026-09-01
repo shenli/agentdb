@@ -3582,11 +3582,20 @@ async fn run_raft_rs_snapshot_tick(
                 continue;
             }
         };
+        // `path` distinguishes the eager SST fast path (hardening §7) from the
+        // logical compact-encoded fallback, so movement evidence (S9, real
+        // replacements) shows which one actually ran.
+        let movement_path = if agentdb_core::is_sst_snapshot_payload(&application_snapshot) {
+            "sst"
+        } else {
+            "logical"
+        };
         tracing::info!(
             tablet_id,
             snapshot_bytes = application_snapshot.len(),
             export_ms = export_started.elapsed().as_millis() as u64,
-            "movement snapshot: full tablet state export (§7 baseline)"
+            path = movement_path,
+            "movement snapshot: full tablet state export (§7)"
         );
         let mut compact_through = 0u64;
         for (to, node_id) in target_nodes {

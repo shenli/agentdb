@@ -100,3 +100,29 @@ then a small write in a non-critical tenant or local test tenant.
 - set retention for benchmark and smoke-test artifacts
 - record expected data growth after large imports or benchmark runs
 - leave headroom for compaction, checkpoints, and restore drills
+
+## Tablet-Movement Disk Reservation
+
+Tablet movement (adding or replacing a replica) transfers a snapshot of the
+tablet's state. When eager SST movement is enabled
+(`AGENTDB_SST_MOVEMENT=1`), both the generate and apply sides write a scratch
+SST on the data volume, and on the receiving side the range-delete + ingest
+transiently holds both the old and new range until compaction reclaims it.
+
+To keep snapshot generate/apply from driving the data disk to zero — which
+wedges the node into a doom loop, because compaction and recovery themselves
+need scratch space — movement never consumes the disk below a reservation:
+
+- `AGENTDB_MOVEMENT_DISK_RESERVE_BYTES` (default 2 GiB) — free bytes movement
+  must leave on the data filesystem. The **export** side degrades to the
+  in-memory logical snapshot when free space is at/below the reserve; the
+  **install** side fails fast with an "add disk" error rather than proceeding.
+- A refused install is expected back-pressure, not corruption: the replica
+  simply does not catch up until you add disk or lower the reserve. Add
+  capacity, then movement resumes on the next scheduler pass.
+- Scratch SSTs live under `<data_dir>/movement_scratch/` (same filesystem as
+  the DB) and are removed when the move completes. A stale directory here is
+  safe to delete while no move is in flight.
+
+Size the reserve to cover a worst-case tablet plus compaction headroom on the
+data volume.
