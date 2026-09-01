@@ -5,6 +5,7 @@
 //! context).
 
 mod auth;
+pub mod dek_provider;
 pub mod dto;
 pub mod errors;
 pub mod internal_raft_http;
