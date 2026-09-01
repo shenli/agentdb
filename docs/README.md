@@ -12,6 +12,9 @@ public docs path.
   workload requirements, positioning, and systems rationale
 - [design/design.md](design/design.md) - durable design commitments,
   implementation status, constraints, and non-goals
+- [design/product-simplification-proposal.md](design/product-simplification-proposal.md)
+  - proposal to narrow the first supported product to durable sessions, events,
+  artifacts, replay, fork, and a single changefeed
 - [product-roadmap.md](product-roadmap.md) - product progress, remaining gaps,
   deliberately out-of-scope work, and open questions
 - [design/architecture.md](design/architecture.md) - current crate

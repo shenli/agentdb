@@ -27,11 +27,11 @@ use agentdb_index::vector::{HnswVectorIndex, VectorIndex};
 use agentdb_storage::content::{sha256_hex, ContentBackend, InMemoryContentBackend};
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::{
-    AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
-    IdentityContentCryptoAdapter, IdentityMetadataCryptoAdapter, KeyOperation, KeyResolution,
-    KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter,
-    PrefixScopedTabletStore, ReplicatedLog, TabletKvStore, TabletStoreLifecycle,
-    TabletStoreManifest, WriteOp,
+    is_envelope_v2, AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
+    CryptoContext, DisabledEnvelopeCrypto, EnvelopeCrypto, IdentityContentCryptoAdapter,
+    IdentityMetadataCryptoAdapter, KeyOperation, KeyPurpose, KeyResolution, KmsError,
+    KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter, PrefixScopedTabletStore,
+    ReplicatedLog, TabletKvStore, TabletStoreLifecycle, TabletStoreManifest, WriteOp,
 };
 
 use crate::agent::{Agent, NewAgent};
@@ -1408,6 +1408,12 @@ pub struct Runtime {
     persist: Option<Persist>,
     content: Arc<dyn ContentBackend>,
     content_crypto: Arc<dyn ContentCryptoAdapter>,
+    /// Tenant envelope keyring for durable content (segments, archives, replay
+    /// prefixes, artifacts). When enabled, content is sealed as an
+    /// `AGDB-ENVELOPE-v2` frame before it reaches the content backend; when
+    /// disabled (the default), content takes the legacy v1/identity path. Reads
+    /// detect the frame version, so a disabled→enabled rollout stays readable.
+    keyring: Arc<dyn EnvelopeCrypto>,
     kms: Arc<dyn KmsKeyResolver>,
     /// Per-(tenant, namespace) BM25 text index for V2.2 searchable
     /// records. Wrapped in a `std::sync::Mutex` because
@@ -2799,6 +2805,89 @@ impl Runtime {
         }
     }
 
+    /// Seal durable content before it reaches the content backend.
+    ///
+    /// With the envelope keyring enabled, the plaintext is sealed as an
+    /// `AGDB-ENVELOPE-v2` frame under the tenant's content DEK, bound to
+    /// (tenant, object_kind, object_id). With the keyring disabled (default),
+    /// it takes the legacy path: the v1 content adapter (identity by default)
+    /// wrapped in the `AGDB-ENVELOPE-v1` keyed frame. `content_key` is the KMS
+    /// key resolution used only by the legacy path.
+    fn seal_content(
+        &self,
+        tenant_id: &str,
+        object_kind: &str,
+        object_id: &str,
+        content_key: &KeyResolution,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        if self.keyring.is_enabled() {
+            let context = CryptoContext {
+                tenant_id,
+                purpose: KeyPurpose::Content,
+                object_kind,
+                object_id,
+            };
+            return self.keyring.seal(&context, plaintext).map_err(|e| {
+                Error::new(ErrorCode::Internal, format!("{object_kind} seal failed: {e}"))
+            });
+        }
+        let crypto_context = ContentCryptoContext {
+            tenant_id,
+            artifact_id: object_id,
+            key: content_key,
+        };
+        let encrypted = self
+            .content_crypto
+            .encrypt(&crypto_context, plaintext)
+            .map_err(|e| {
+                Error::new(ErrorCode::Internal, format!("{object_kind} encrypt failed: {e}"))
+            })?;
+        Ok(encode_keyed_envelope(content_key, &encrypted))
+    }
+
+    /// Open durable content read back from the content backend. Detects the
+    /// frame version so a disabled→enabled rollout (or the reverse) stays
+    /// readable: `AGDB-ENVELOPE-v2` opens through the keyring; `AGDB-ENVELOPE-v1`
+    /// (or bare plaintext, the `None` case) opens through the legacy adapter
+    /// with `fallback_key`.
+    fn open_content(
+        &self,
+        tenant_id: &str,
+        object_kind: &str,
+        object_id: &str,
+        fallback_key: KeyResolution,
+        stored_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        if is_envelope_v2(&stored_bytes) {
+            let context = CryptoContext {
+                tenant_id,
+                purpose: KeyPurpose::Content,
+                object_kind,
+                object_id,
+            };
+            return self.keyring.open(&context, &stored_bytes).map_err(|e| {
+                Error::new(ErrorCode::Internal, format!("{object_kind} open failed: {e}"))
+            });
+        }
+        let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes).map_err(|e| {
+            Error::new(ErrorCode::Internal, format!("{object_kind} envelope failed: {e}"))
+        })? {
+            Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
+            None => (fallback_key, stored_bytes),
+        };
+        let crypto_context = ContentCryptoContext {
+            tenant_id,
+            artifact_id: object_id,
+            key: &content_key,
+        };
+        self.content_crypto
+            .decrypt(&crypto_context, &ciphertext)
+            .map_err(|e| {
+                Error::new(ErrorCode::Internal, format!("{object_kind} decrypt failed: {e}"))
+            })
+    }
+
     async fn read_session_segment_events(
         &self,
         segment: &SessionSegment,
@@ -2809,25 +2898,15 @@ impl Runtime {
             .get(segment.tenant_id.as_str(), segment.segment_id.as_str())
             .await
             .map_err(|e| Error::new(ErrorCode::Internal, format!("segment get failed: {e}")))?;
-        let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("segment envelope failed: {e}")))?
-        {
-            Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
-            None => (
-                key_from_parts(&segment.content_key_id, &segment.content_key_version)
-                    .unwrap_or(current_key),
-                stored_bytes,
-            ),
-        };
-        let crypto_context = ContentCryptoContext {
-            tenant_id: segment.tenant_id.as_str(),
-            artifact_id: segment.segment_id.as_str(),
-            key: &content_key,
-        };
-        let plaintext = self
-            .content_crypto
-            .decrypt(&crypto_context, &ciphertext)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("segment decrypt failed: {e}")))?;
+        let fallback_key = key_from_parts(&segment.content_key_id, &segment.content_key_version)
+            .unwrap_or(current_key);
+        let plaintext = self.open_content(
+            segment.tenant_id.as_str(),
+            "segment",
+            segment.segment_id.as_str(),
+            fallback_key,
+            stored_bytes,
+        )?;
         let file: SessionSegmentFile = serde_json::from_slice(&plaintext)
             .map_err(|e| Error::new(ErrorCode::Internal, format!("segment decode failed: {e}")))?;
         Ok(file.events)
@@ -2863,16 +2942,13 @@ impl Runtime {
         let plaintext = serde_json::to_vec(&file)
             .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
         let plaintext_sha256 = sha256_hex(&plaintext);
-        let crypto_context = ContentCryptoContext {
-            tenant_id: tenant_id.as_str(),
-            artifact_id: segment_id.as_str(),
-            key: &content_key,
-        };
-        let encrypted_bytes = self
-            .content_crypto
-            .encrypt(&crypto_context, &plaintext)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("segment encrypt failed: {e}")))?;
-        let stored_bytes = encode_keyed_envelope(&content_key, &encrypted_bytes);
+        let stored_bytes = self.seal_content(
+            tenant_id.as_str(),
+            "segment",
+            segment_id.as_str(),
+            &content_key,
+            &plaintext,
+        )?;
         self.content
             .put(tenant_id.as_str(), segment_id.as_str(), &stored_bytes)
             .await
@@ -2902,25 +2978,15 @@ impl Runtime {
             .get(manifest.tenant_id.as_str(), manifest.manifest_id.as_str())
             .await
             .map_err(|e| Error::new(ErrorCode::Internal, format!("archive get failed: {e}")))?;
-        let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("archive envelope failed: {e}")))?
-        {
-            Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
-            None => (
-                key_from_parts(&manifest.content_key_id, &manifest.content_key_version)
-                    .unwrap_or(current_key),
-                stored_bytes,
-            ),
-        };
-        let crypto_context = ContentCryptoContext {
-            tenant_id: manifest.tenant_id.as_str(),
-            artifact_id: manifest.manifest_id.as_str(),
-            key: &content_key,
-        };
-        let plaintext = self
-            .content_crypto
-            .decrypt(&crypto_context, &ciphertext)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("archive decrypt failed: {e}")))?;
+        let fallback_key = key_from_parts(&manifest.content_key_id, &manifest.content_key_version)
+            .unwrap_or(current_key);
+        let plaintext = self.open_content(
+            manifest.tenant_id.as_str(),
+            "archive",
+            manifest.manifest_id.as_str(),
+            fallback_key,
+            stored_bytes,
+        )?;
         let file: SessionArchiveFile = serde_json::from_slice(&plaintext)
             .map_err(|e| Error::new(ErrorCode::Internal, format!("archive decode failed: {e}")))?;
         Ok(file.events)
@@ -2946,16 +3012,13 @@ impl Runtime {
         let plaintext = serde_json::to_vec(&file)
             .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
         let plaintext_sha256 = sha256_hex(&plaintext);
-        let crypto_context = ContentCryptoContext {
-            tenant_id: tenant_id.as_str(),
-            artifact_id: manifest_id.as_str(),
-            key: &content_key,
-        };
-        let encrypted_bytes = self
-            .content_crypto
-            .encrypt(&crypto_context, &plaintext)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("archive encrypt failed: {e}")))?;
-        let stored_bytes = encode_keyed_envelope(&content_key, &encrypted_bytes);
+        let stored_bytes = self.seal_content(
+            tenant_id.as_str(),
+            "archive",
+            manifest_id.as_str(),
+            &content_key,
+            &plaintext,
+        )?;
         self.content
             .put(tenant_id.as_str(), manifest_id.as_str(), &stored_bytes)
             .await
@@ -2989,33 +3052,15 @@ impl Runtime {
                     format!("replay prefix get failed: {e}"),
                 )
             })?;
-        let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes).map_err(|e| {
-            Error::new(
-                ErrorCode::Internal,
-                format!("replay prefix envelope failed: {e}"),
-            )
-        })? {
-            Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
-            None => (
-                key_from_parts(&manifest.content_key_id, &manifest.content_key_version)
-                    .unwrap_or(current_key),
-                stored_bytes,
-            ),
-        };
-        let crypto_context = ContentCryptoContext {
-            tenant_id: manifest.tenant_id.as_str(),
-            artifact_id: manifest.prefix_id.as_str(),
-            key: &content_key,
-        };
-        let plaintext = self
-            .content_crypto
-            .decrypt(&crypto_context, &ciphertext)
-            .map_err(|e| {
-                Error::new(
-                    ErrorCode::Internal,
-                    format!("replay prefix decrypt failed: {e}"),
-                )
-            })?;
+        let fallback_key = key_from_parts(&manifest.content_key_id, &manifest.content_key_version)
+            .unwrap_or(current_key);
+        let plaintext = self.open_content(
+            manifest.tenant_id.as_str(),
+            "replay_prefix",
+            manifest.prefix_id.as_str(),
+            fallback_key,
+            stored_bytes,
+        )?;
         let file: ReplayPrefixFile = serde_json::from_slice(&plaintext).map_err(|e| {
             Error::new(
                 ErrorCode::Internal,
@@ -3053,21 +3098,13 @@ impl Runtime {
         let plaintext = serde_json::to_vec(&file)
             .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
         let plaintext_sha256 = sha256_hex(&plaintext);
-        let crypto_context = ContentCryptoContext {
-            tenant_id: tenant_id.as_str(),
-            artifact_id: prefix_id.as_str(),
-            key: &content_key,
-        };
-        let encrypted_bytes = self
-            .content_crypto
-            .encrypt(&crypto_context, &plaintext)
-            .map_err(|e| {
-                Error::new(
-                    ErrorCode::Internal,
-                    format!("replay prefix encrypt failed: {e}"),
-                )
-            })?;
-        let stored_bytes = encode_keyed_envelope(&content_key, &encrypted_bytes);
+        let stored_bytes = self.seal_content(
+            tenant_id.as_str(),
+            "replay_prefix",
+            prefix_id.as_str(),
+            &content_key,
+            &plaintext,
+        )?;
         self.content
             .put(tenant_id.as_str(), prefix_id.as_str(), &stored_bytes)
             .await
@@ -3116,6 +3153,7 @@ impl Runtime {
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
             content_crypto: Arc::new(IdentityContentCryptoAdapter),
+            keyring: Arc::new(DisabledEnvelopeCrypto),
             kms: Arc::new(AllowAllKmsKeyResolver),
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3134,6 +3172,7 @@ impl Runtime {
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
             content_crypto: Arc::new(IdentityContentCryptoAdapter),
+            keyring: Arc::new(DisabledEnvelopeCrypto),
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3155,6 +3194,7 @@ impl Runtime {
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
             content_crypto,
+            keyring: Arc::new(DisabledEnvelopeCrypto),
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3441,6 +3481,7 @@ impl Runtime {
             content,
             kms,
             content_crypto,
+            Arc::new(DisabledEnvelopeCrypto),
             tablet_router,
             None,
         )
@@ -3466,8 +3507,37 @@ impl Runtime {
             content,
             Arc::new(AllowAllKmsKeyResolver),
             Arc::new(IdentityContentCryptoAdapter),
+            Arc::new(DisabledEnvelopeCrypto),
             None,
             Some(mode),
+        )
+    }
+
+    /// Build a single-node persist-backed runtime with an explicit envelope
+    /// keyring, so a deployment (or test) can enable content encryption. The
+    /// keyring seals durable content (segments, archives, replay prefixes,
+    /// artifacts) as `AGDB-ENVELOPE-v2` before it reaches the content backend;
+    /// pass `DisabledEnvelopeCrypto` for the plaintext/legacy path. Other crypto
+    /// seams default to identity/allow-all.
+    pub fn with_kv_content_and_keyring(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        keyring: Arc<dyn EnvelopeCrypto>,
+    ) -> Arc<Self> {
+        let runtime_kv = Arc::new(
+            RuntimeTabletKvStore::single_node(kv, RUNTIME_PRIMARY_TABLET_ID)
+                .expect("open runtime tablet state"),
+        );
+        let persist =
+            Persist::with_metadata_crypto(runtime_kv, Arc::new(IdentityMetadataCryptoAdapter));
+        Self::from_persist_with_tablet_router_and_mode(
+            persist,
+            content,
+            Arc::new(AllowAllKmsKeyResolver),
+            Arc::new(IdentityContentCryptoAdapter),
+            keyring,
+            None,
+            None,
         )
     }
 
@@ -3476,6 +3546,7 @@ impl Runtime {
         content: Arc<dyn ContentBackend>,
         kms: Arc<dyn KmsKeyResolver>,
         content_crypto: Arc<dyn ContentCryptoAdapter>,
+        keyring: Arc<dyn EnvelopeCrypto>,
         tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
         hydration_override: Option<HydrationMode>,
     ) -> Arc<Self> {
@@ -3509,6 +3580,7 @@ impl Runtime {
             persist: Some(persist),
             content,
             content_crypto,
+            keyring,
             kms,
             text_index: StdMutex::new(hydration.text_index),
             vector_index: StdMutex::new(hydration.vector_index),
@@ -6847,16 +6919,13 @@ impl Runtime {
         let content_key = self.resolve_key(&req.tenant_id, KeyOperation::ContentWrite)?;
         let metadata_key = self.resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)?;
 
-        let crypto_context = ContentCryptoContext {
-            tenant_id: req.tenant_id.as_str(),
-            artifact_id: artifact_id.as_str(),
-            key: &content_key,
-        };
-        let encrypted_bytes = self
-            .content_crypto
-            .encrypt(&crypto_context, &bytes)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("content encrypt failed: {e}")))?;
-        let stored_bytes = encode_keyed_envelope(&content_key, &encrypted_bytes);
+        let stored_bytes = self.seal_content(
+            req.tenant_id.as_str(),
+            "artifact",
+            artifact_id.as_str(),
+            &content_key,
+            &bytes,
+        )?;
         if let Err(error) = self
             .content
             .put(req.tenant_id.as_str(), artifact_id.as_str(), &stored_bytes)
@@ -7140,25 +7209,15 @@ impl Runtime {
             .get(tenant_id.as_str(), artifact_id.as_str())
             .await
             .map_err(|e| Error::new(ErrorCode::Internal, format!("content get failed: {e}")))?;
-        let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("content envelope failed: {e}")))?
-        {
-            Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
-            None => (
-                key_from_parts(&art.content_key_id, &art.content_key_version)
-                    .unwrap_or(current_key),
-                stored_bytes,
-            ),
-        };
-        let crypto_context = ContentCryptoContext {
-            tenant_id: tenant_id.as_str(),
-            artifact_id: artifact_id.as_str(),
-            key: &content_key,
-        };
-        let plaintext = self
-            .content_crypto
-            .decrypt(&crypto_context, &ciphertext)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("content decrypt failed: {e}")))?;
+        let fallback_key =
+            key_from_parts(&art.content_key_id, &art.content_key_version).unwrap_or(current_key);
+        let plaintext = self.open_content(
+            tenant_id.as_str(),
+            "artifact",
+            artifact_id.as_str(),
+            fallback_key,
+            stored_bytes,
+        )?;
         let actual_sha256 = sha256_hex(&plaintext);
         if actual_sha256 != art.sha256 {
             return Err(Error::new(

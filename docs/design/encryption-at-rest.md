@@ -65,11 +65,24 @@ durable path.** `agentdb-storage/src/crypto/` provides the cohesive keyring the
   plaintext-DEK cache.
 - Explicit `CryptoConfig` (`disabled | envelope`, suite, cache bounds).
 
-**Not yet done:** no durable tenant-payload path calls the keyring, so nothing
-is encrypted on disk yet. The remaining stages wire content, then events and
-metadata, then records/skills/indexes/exports/Raft/snapshots/backups; add the
-KMS provider and wrapped-DEK catalog, rotation worker, and revocation; and add
-raw-storage marker tests and the benchmark matrix.
+**Milestone 2 (landed): durable content is wired through the keyring.** The
+runtime's `seal_content`/`open_content` helpers seal every durable content
+object — artifacts, session segments, session archives, and replay prefixes —
+as an `AGDB-ENVELOPE-v2` frame before it reaches the content backend when the
+keyring is enabled, and fall back to the legacy v1/identity path when it is
+disabled (the default). Reads detect the frame version, so a disabled→enabled
+rollout (and the reverse) stays readable — a mixed v1/v2/plaintext reader. A
+raw-storage marker test proves plaintext is absent from stored content, and
+identical content for two tenants yields independent ciphertext.
+`Runtime::with_kv_content_and_keyring` injects a keyring; the default stays
+disabled, so existing deployments are unchanged until they opt in.
+
+**Not yet done:** the *event and metadata* hot paths are still plaintext (only
+content-backend objects are wired); records, skills, indexes, idempotency,
+export, Raft, snapshots, checkpoints, and backups are not covered; there is no
+KMS provider or wrapped-DEK catalog, rotation worker, or revocation; and the
+server does not yet build a keyring from configuration. The remaining stages add
+these, plus the benchmark matrix.
 
 The pre-existing seams remain as the integration points those stages build on:
 
