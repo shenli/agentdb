@@ -117,6 +117,7 @@ AgentDB or still needs product hardening.
 | Packaging | Implemented baseline | Docker images and tagged release archives contain both `agentdb` and `agentdbctl`; Compose/Helm provide the required API bearer secret for their non-loopback listener. |
 | Single-node operations | Partially implemented | In-memory and RocksDB modes, config-first server flow, authenticated Docker/Compose/Helm examples, meaningful live/ready probes, startup hydration guarded by a 512 MiB serialized-KV budget plus per-prefix row caps, backup manifest/checkpoint endpoint, and runbooks exist. Whole-state hydration, decoded-memory overhead, and some restore/upgrade automation remain limits. |
 | Distributed/tablet operation | Evaluation/hardening | Metadata-backed routing, tablets, shard ranges, forwarding, tablet movement, snapshots, and Raft-backed write paths exist. This is not yet the default production deployment shape. |
+| Encryption at rest / BYOK | Adapter seams only | KMS availability and key-ID seams plus keyed envelope framing exist. Default adapters are identity transforms, so production cryptography, full durable-path coverage, rotation, revocation, restore validation, and performance qualification remain. |
 | Observability exporters | Partially implemented | Durable export primitives and managed consumers exist. First-party ClickHouse/ClickStack/JSONL/Parquet tooling is still maturing around those primitives. |
 
 ## Component Design Map
@@ -130,6 +131,7 @@ Use this map to avoid overloading one design doc with every subsystem detail.
 | Crate boundaries, request flow, API routes, and runtime implementation map | [`architecture.md`](architecture.md) |
 | Hot storage engine, tablet-local LSM state, Raft commit-before-apply, split/merge, placement classes, and index placement | [`tablet-storage-engine.md`](tablet-storage-engine.md) |
 | Cluster storage topology, cells, AZ placement, tenant blast radius, failover, scheduler behavior, and cluster validation | [`cluster-storage-topology.md`](cluster-storage-topology.md) |
+| Encryption at rest, BYOK, key hierarchy, rotation, revocation, storage coverage, and implementation plan | [`encryption-at-rest.md`](encryption-at-rest.md) |
 | Warm/cold/archive/derivative-only lifecycle, sealed segments, archive manifests, artifact byte lifecycle, and restore semantics | [`lifecycle-storage.md`](lifecycle-storage.md) |
 | Observability export ledger, managed consumers, ClickHouse/ClickStack path, sink contracts, and backfill | [`observability-export.md`](observability-export.md) |
 

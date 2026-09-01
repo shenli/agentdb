@@ -95,6 +95,12 @@ For the conceptual motivation and positioning, see
   machinery, but the production-default posture is still single-node. The
   distributed story needs a clear OSS/managed boundary, stable operator
   procedures, failure-mode runbooks, and sustained smoke coverage.
+- **Encryption at rest and BYOK.** KMS availability, key-ID resolution, crypto
+  adapter seams, and envelope framing exist, but the default adapters preserve
+  plaintext. Production authenticated encryption, durable-path coverage, a
+  wrapped-DEK catalog and bounded cache, rotation and revocation workflows,
+  backup/restore validation, and benchmark qualification remain. See
+  [`design/encryption-at-rest.md`](design/encryption-at-rest.md).
 - **Sandbox snapshot integration.** AgentDB owns refs and resolution; the
   external sandbox service still must implement capture, upload, copy-on-write
   fork, restore, byte retention, metrics, and dangling-ref handling.
