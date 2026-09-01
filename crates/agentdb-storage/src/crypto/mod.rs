@@ -12,12 +12,16 @@
 //! explicit `envelope` mode so identity/plaintext behavior can never be
 //! selected silently.
 
+mod catalog;
 mod config;
 mod envelope;
+mod kek;
 mod keyring;
 
+pub use catalog::{CatalogKeyProvider, DekRecord, DekStatus, KeyCatalog};
 pub use config::{CryptoConfig, CryptoMode, DekCacheConfig};
 pub use envelope::{is_envelope_v2, EnvelopeParts};
+pub use kek::{KekProvider, LocalKekProvider, WrappedDek};
 pub use keyring::{
     AeadTenantKeyring, CryptoContext, Dek, DekLease, DisabledEnvelopeCrypto, EnvelopeCrypto,
     KeyMetadata, KeyProvider, LocalKeyProvider,

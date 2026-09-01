@@ -126,15 +126,31 @@ round-trips through raft apply. This is the design's "verify Raft and snapshot
 ordering" requirement, and it extends the working event/content encryption to
 the production (clustered) deployment shape.
 
-**Not yet done:** agent/session/tenant records, searchable records, and skills
-are still plaintext (records are additionally entangled with the export ledger,
-which keeps a plaintext copy, and the search index, so covering them is its own
-stage). Event AAD binds tenant + session + kind (not yet the per-event seq).
-There is still no KMS provider or wrapped-DEK catalog, rotation worker, or
-revocation, and the server does not yet build a keyring from configuration —
-so encryption is reachable through the runtime constructors and tests but not
-yet flippable via server config (that lands with the real key catalog, since
-the current `LocalKeyProvider` is a dev/single-key source, not BYOK).
+**Milestone 6 (landed): the wrapped-DEK key catalog and KEK.** `crypto/kek.rs`
+adds a `KekProvider` seam (wrap/unwrap DEKs under a key-encryption key that
+never leaves the manager) with a `LocalKekProvider` (a KMS-backed KEK is a
+drop-in). `crypto/catalog.rs` adds a durable `KeyCatalog` (one wrapped-DEK
+record per tenant/purpose/version plus an active-version pointer, under a
+reserved `\0agentdb/keycatalog/` prefix so it is control state, never a tenant
+payload) and a `CatalogKeyProvider` implementing the M1 `KeyProvider`: it mints
+a random DEK on first use, wraps it under the KEK, stores it, and serves the
+unwrapped lease; later calls read and unwrap the active (or a specific)
+version, failing closed on a retired/revoked/missing version. This is the
+production key source that replaces the dev `LocalKeyProvider` (which derived
+keys deterministically): DEKs are now random and stored only wrapped. A test
+proves a catalog-backed keyring's ciphertext survives a process restart (the
+DEK is durably wrapped, not re-derived) and is unreadable under a different KEK
+— i.e. losing/rotating-away the KEK crypto-shreds the data.
+
+**Not yet done:** the server does not yet build a keyring from configuration, so
+this catalog/KEK path is reachable through the library + tests but not yet
+wired into server startup (that, plus the online rotation worker and admin
+API/CLI, is the next "operations" milestone). Agent/session/tenant records,
+searchable records, and skills are still plaintext (records are additionally
+entangled with the export ledger + search index). Event AAD binds tenant +
+session + kind (not yet the per-event seq). Two-phase revocation/crypto-shred
+beyond the catalog `status` field, and dedicated-domain placement enforcement,
+remain.
 
 The pre-existing seams remain as the integration points those stages build on:
 
