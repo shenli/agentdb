@@ -191,10 +191,26 @@ pre-loads a serving node's key cache; `get_active` / `get_version` / `set_status
 round out CRUD (the last for rotation/revocation). The DEK table is folded into
 the consolidated schema.
 
-**Not yet done:** the cluster runtime wiring on top of M9 + M10 — a
-meta-catalog-backed `KeyProvider` (pre-warm from `list_all`, provision at tenant
-creation, refresh followers), then lifting the replicated-layout fail-closed and
-a real multi-node test. The online DEK rotation worker (new DEK version + data
+**Milestone 11 (landed): the meta-catalog-backed key provider.**
+`agentdb_api::dek_provider::MetaCatalogKeyProvider` serves per-tenant DEKs from
+the shared M10 catalog under a KEK. Because the catalog is async but the
+seal/open hot path is sync, it **pre-warms** every wrapped DEK into an in-memory
+map at startup (`load`) and unwraps it under the KEK; the sync `KeyProvider`
+serve path then reads that map and never touches the database. Minting is
+explicit and async — `provision_tenant` (called at tenant creation on the
+leader) writes through the race-safe `provision_if_absent`, and `refresh`
+reloads the map so a follower picks up a newly-provisioned tenant's key. The
+serve path never mints, so it fails closed on an unprovisioned tenant. Tests
+prove: serve fails closed until provisioned then round-trips; **two providers
+over one shared catalog (two nodes) seal/open under the same DEK** after the
+follower refreshes; and a restarted provider re-warms from the catalog and opens
+prior ciphertext.
+
+**Not yet done:** the final cluster wiring — call `provision_tenant` from
+`create_tenant`, build the provider + keyring for the replicated layout in the
+server, lift the replicated-layout fail-closed, hook `refresh` to the metadata
+change-notifier, and add a real multi-node test. The online DEK rotation worker
+(new DEK version + data
 re-encryption walk) and the admin API/CLI to drive rewrap and rotation are not
 built; and the
 `LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
