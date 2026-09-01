@@ -35,12 +35,29 @@ workload — create session, append events, export the movement snapshot —
 and measures the full-state snapshot size and export time as the session
 grows. On one run (in-memory content, RocksDB KV, ~200-byte JSON events):
 
+Before the compact-encoding fix (finding 2 below), with `serde_json`:
+
 | events | snapshot_bytes | export_ms | bytes/event |
 |---:|---:|---:|---:|
 | 100 | 902,945 | 20.7 | 9,029 |
 | 500 | 4,463,990 | 101.2 | 8,928 |
 | 2,000 | 17,827,863 | 420.7 | 8,914 |
 | 8,000 | 71,308,571 | 1,668.6 | 8,914 |
+
+After the compact binary encoding (same run, same workload):
+
+| events | snapshot_bytes | export_ms | bytes/event |
+|---:|---:|---:|---:|
+| 100 | 263,385 | 0.5 | 2,634 |
+| 500 | 1,301,785 | 2.3 | 2,604 |
+| 2,000 | 5,198,785 | 9.5 | 2,599 |
+| 8,000 | 20,792,785 | 38.3 | 2,599 |
+
+The compact encoding cut the 8,000-event move from **71 MB → 20.8 MB
+(3.4×)** and its serialize time from **1.67 s → 38 ms (~44×)** — the
+JSON int-array form was both bloated and slow to produce. Movement cost is
+still O(total state), but the constant is now ~3.4× lower and the CPU cost
+is negligible.
 
 Two findings:
 
@@ -51,10 +68,18 @@ Two findings:
    sessions scales this up directly. This is exactly the cost a
    manifest+recent-tail attach would aim to cut to roughly the tail.
 2. **The per-event footprint is heavy** (~8.9 KB for a ~200-byte payload —
-   ~45×), because the snapshot carries the full state-machine encoding
-   (event rows, index structures, metadata). This is an independent,
-   cheaper optimization target (a more compact snapshot encoding) that does
-   **not** require the storage-engine change §7 contemplates.
+   ~45×), partly because the snapshot was `serde_json`-encoded, which
+   expands each `Vec<u8>` key/value into an array of decimal numbers
+   (`[104,101,...]`), a ~3-4× blowup of binary KV data. This is an
+   independent, cheaper optimization that does **not** require the
+   storage-engine change §7 contemplates.
+
+   **This is now done:** `TabletStateSnapshot::encode`/`decode`
+   (`crates/agentdb-core/src/tablet_state.rs`) use a compact length-prefixed
+   binary layout instead of JSON (with a magic+version header and a legacy-
+   JSON decode fallback so rolling upgrades stay safe). Every movement and
+   raft-snapshot transfer now ships the smaller encoding. See the
+   before/after in the movement benchmark.
 
 ## Feasibility against the current architecture
 
@@ -91,13 +116,13 @@ with session state (71 MB / 1.7 s at 8,000 events, linear). But
 manifest-based attachment is a storage-engine change with genuine read-path
 and correctness risk, so it should not be built speculatively.
 
-**Do, now (cheap, high-value):**
-- Land the movement-cost instrumentation (the scheduler now logs
-  `snapshot_bytes` + `export_ms` per movement) so real replacements and the
-  S9 smoke report this in production.
-- Pursue the **compact snapshot encoding** independently — the ~45×
-  payload-to-snapshot ratio is a large, low-risk win that shrinks every
-  move without touching the storage engine.
+**Done (cheap, high-value):**
+- Movement-cost instrumentation — the scheduler logs `snapshot_bytes` +
+  `export_ms` per movement, so real replacements and the S9 smoke report
+  this in production.
+- The **compact snapshot encoding** — a large, low-risk win with no
+  storage-engine change: 3.4× smaller snapshots and ~44× faster serialize
+  (see the before/after table above).
 
 **Gate for the storage-engine change:**
 - Prototype a manifest+lazy-block attach for **cold tablets only**, behind a
@@ -110,6 +135,6 @@ and correctness risk, so it should not be built speculatively.
   full-snapshot path. Generic point-put throughput is not sufficient
   evidence.
 
-Net: **no-go on building it now**; the evidence justifies the compact-encoding
-win first and keeps the lazy-attach prototype gated behind a demonstrated
-need.
+Net: **no-go on building the storage-engine change now**; the compact-encoding
+win (3.4× smaller, ~44× faster moves) is delivered, and the lazy-attach
+prototype stays gated behind a demonstrated need.

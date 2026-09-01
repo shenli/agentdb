@@ -127,7 +127,92 @@ impl TabletSnapshotShardFilter {
     }
 }
 
+/// Magic prefix identifying the compact binary snapshot encoding. Chosen so
+/// it can never collide with the legacy `serde_json` encoding, which always
+/// begins with `{`.
+const SNAPSHOT_MAGIC: &[u8; 4] = b"ADBS";
+const SNAPSHOT_ENCODING_VERSION: u8 = 1;
+
 impl TabletStateSnapshot {
+    /// Encode for transfer/persistence. Uses a compact length-prefixed
+    /// binary layout instead of `serde_json`: JSON serializes each
+    /// `Vec<u8>` key/value as an array of decimal numbers (`[104,101,...]`),
+    /// a ~3-4x expansion of binary KV data. The binary form keeps bytes as
+    /// bytes, which is the dominant cost in a movement snapshot.
+    ///
+    /// Layout: `ADBS` | version:u8 | tablet_id:i64 | applied_index:u64 |
+    /// entry_count:u64 | (key_len:u32 | key | value_len:u32 | value)*, all
+    /// integers big-endian.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            32 + self
+                .entries
+                .iter()
+                .map(|e| e.key.len() + e.value.len() + 8)
+                .sum::<usize>(),
+        );
+        out.extend_from_slice(SNAPSHOT_MAGIC);
+        out.push(SNAPSHOT_ENCODING_VERSION);
+        out.extend_from_slice(&self.tablet_id.to_be_bytes());
+        out.extend_from_slice(&self.applied_index.to_be_bytes());
+        out.extend_from_slice(&(self.entries.len() as u64).to_be_bytes());
+        for entry in &self.entries {
+            out.extend_from_slice(&(entry.key.len() as u32).to_be_bytes());
+            out.extend_from_slice(&entry.key);
+            out.extend_from_slice(&(entry.value.len() as u32).to_be_bytes());
+            out.extend_from_slice(&entry.value);
+        }
+        out
+    }
+
+    /// Decode a snapshot produced by `encode`, or a legacy `serde_json`
+    /// snapshot (detected by the absence of the magic prefix). Accepting
+    /// both keeps a rolling upgrade safe: a node may receive a snapshot from
+    /// a peer running either the old or the new build.
+    pub fn decode(bytes: &[u8]) -> StorageResult<Self> {
+        if bytes.len() < 4 || &bytes[..4] != SNAPSHOT_MAGIC {
+            return serde_json::from_slice(bytes).map_err(|err| {
+                agentdb_storage::Error::Other(format!("decode legacy tablet snapshot: {err}"))
+            });
+        }
+        let err =
+            |msg: &str| agentdb_storage::Error::Other(format!("decode tablet snapshot: {msg}"));
+        let mut pos = 4;
+        let take = |pos: &mut usize, n: usize| -> StorageResult<&[u8]> {
+            if *pos + n > bytes.len() {
+                return Err(agentdb_storage::Error::Other(
+                    "decode tablet snapshot: truncated".into(),
+                ));
+            }
+            let slice = &bytes[*pos..*pos + n];
+            *pos += n;
+            Ok(slice)
+        };
+        let version = take(&mut pos, 1)?[0];
+        if version != SNAPSHOT_ENCODING_VERSION {
+            return Err(err(&format!("unsupported encoding version {version}")));
+        }
+        let tablet_id = i64::from_be_bytes(take(&mut pos, 8)?.try_into().unwrap());
+        let applied_index = u64::from_be_bytes(take(&mut pos, 8)?.try_into().unwrap());
+        let entry_count = u64::from_be_bytes(take(&mut pos, 8)?.try_into().unwrap());
+        let mut entries = Vec::with_capacity(entry_count.min(1 << 20) as usize);
+        for _ in 0..entry_count {
+            let key_len = u32::from_be_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+            let key = take(&mut pos, key_len)?.to_vec();
+            let value_len = u32::from_be_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+            let value = take(&mut pos, value_len)?.to_vec();
+            entries.push(TabletSnapshotEntry { key, value });
+        }
+        if entries.len() as u64 != entry_count {
+            return Err(err("entry count mismatch"));
+        }
+        Ok(Self {
+            tablet_id,
+            applied_index,
+            entries,
+        })
+    }
+
     pub fn retarget(&self, target_tablet_id: i64) -> StorageResult<Self> {
         if target_tablet_id < 0 {
             return Err(agentdb_storage::Error::Other(
@@ -765,6 +850,68 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use agentdb_storage::RocksKvStore;
+
+    fn sample_snapshot() -> TabletStateSnapshot {
+        TabletStateSnapshot {
+            tablet_id: 7,
+            applied_index: 42,
+            entries: vec![
+                TabletSnapshotEntry {
+                    key: b"session/ten_1/ses_1".to_vec(),
+                    value: b"{\"seq\":3}".to_vec(),
+                },
+                TabletSnapshotEntry {
+                    key: vec![0, 1, 2, 255, 254],
+                    value: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn snapshot_encode_decode_round_trips() {
+        let snap = sample_snapshot();
+        let bytes = snap.encode();
+        assert_eq!(&bytes[..4], SNAPSHOT_MAGIC);
+        assert_eq!(TabletStateSnapshot::decode(&bytes).unwrap(), snap);
+    }
+
+    #[test]
+    fn snapshot_decode_accepts_legacy_json() {
+        // A node running the old build ships serde_json; decode must accept it.
+        let snap = sample_snapshot();
+        let json = serde_json::to_vec(&snap).unwrap();
+        assert_ne!(&json[..1], SNAPSHOT_MAGIC.get(..1).unwrap());
+        assert_eq!(TabletStateSnapshot::decode(&json).unwrap(), snap);
+    }
+
+    #[test]
+    fn snapshot_binary_is_far_smaller_than_json_for_binary_values() {
+        // The whole point: JSON blows up Vec<u8> into arrays of numbers.
+        let snap = TabletStateSnapshot {
+            tablet_id: 1,
+            applied_index: 1,
+            entries: (0..100)
+                .map(|i| TabletSnapshotEntry {
+                    key: format!("event/ten/ses/{i:08}").into_bytes(),
+                    value: vec![0xABu8; 200],
+                })
+                .collect(),
+        };
+        let binary = snap.encode().len();
+        let json = serde_json::to_vec(&snap).unwrap().len();
+        assert!(
+            binary * 2 < json,
+            "binary {binary} should be well under half of json {json}"
+        );
+    }
+
+    #[test]
+    fn snapshot_decode_rejects_truncated_binary() {
+        let bytes = sample_snapshot().encode();
+        let err = TabletStateSnapshot::decode(&bytes[..bytes.len() - 3]).unwrap_err();
+        assert!(err.to_string().contains("truncated"));
+    }
 
     #[test]
     fn commit_appends_and_applies_batch_to_tablet_store() {
