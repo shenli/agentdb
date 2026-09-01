@@ -64,6 +64,11 @@ const DEFAULT_RAFT_SNAPSHOT_PRUNE_INTERVAL_MS: u64 = 5 * 60_000;
 const DEFAULT_RAFT_SNAPSHOT_PRUNE_BATCH: i64 = 256;
 const DEFAULT_RAFT_SNAPSHOT_RESTORE_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
+/// Default byte ceiling on the pending object-store upload backlog before
+/// writes are throttled (hardening §5). 512 MiB — generous enough that a
+/// healthy mirror never trips it, tight enough that a stalled object store
+/// cannot grow node memory without bound. 0 disables.
+const DEFAULT_CONTENT_MIRROR_MAX_BACKLOG_BYTES: u64 = 512 * 1024 * 1024;
 
 type ContentBackendBundle = (
     Arc<dyn agentdb_storage::ContentBackend>,
@@ -632,16 +637,36 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 .await;
                 match exported {
                     Ok(Ok(bytes)) => {
-                        let header = agentdb_storage::read_recovery_manifest_header(&bytes).ok();
-                        match recovery_store.put_latest(&bytes, now_ms).await {
-                            Ok(_) => {
-                                let (entries, payload) = header
-                                    .map(|h| (h.entry_count, h.payload_bytes))
-                                    .unwrap_or((0, 0));
-                                status.record_success(now_ms, entries, payload);
+                        match agentdb_storage::read_recovery_manifest_header(&bytes) {
+                            Ok(header) => {
+                                // Reconcilable publish: an unchanged snapshot is
+                                // an idempotent no-op, and a stale retry cannot
+                                // clobber a newer manifest.
+                                match recovery_store.publish_latest(&bytes, &header).await {
+                                    Ok(outcome) => {
+                                        tracing::debug!(
+                                            outcome = outcome.as_str(),
+                                            change_id = %header.effective_change_id(),
+                                            watermark = header.effective_watermark(),
+                                            "recovery manifest publish"
+                                        );
+                                        status.record_publish(
+                                            now_ms,
+                                            header.entry_count,
+                                            header.payload_bytes,
+                                            header.effective_change_id(),
+                                            header.effective_watermark(),
+                                            outcome.as_str(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(?error, "recovery manifest upload failed");
+                                        status.record_failure(now_ms, error.to_string());
+                                    }
+                                }
                             }
                             Err(error) => {
-                                tracing::warn!(?error, "recovery manifest upload failed");
+                                tracing::warn!(?error, "recovery manifest header unreadable");
                                 status.record_failure(now_ms, error.to_string());
                             }
                         }
@@ -1853,18 +1878,40 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
                     .as_ref()
                     .expect("object-store content backend requires object store config"),
             )?;
-            let mirror: Arc<dyn agentdb_storage::ContentBackend> =
+            let mut mirror: Arc<dyn agentdb_storage::ContentBackend> =
                 Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
                     object_store,
                     OBJECT_STORE_CONTENT_PREFIX,
                 ));
+            // Test/measurement knob (hardening §5): delay every object-store
+            // op to demonstrate that the upload backlog stays bounded and
+            // writers are throttled rather than blocked.
+            let inject_latency_ms = env_u64("AGENTDB_CONTENT_MIRROR_INJECT_LATENCY_MS", 0);
+            if inject_latency_ms > 0 {
+                tracing::warn!(
+                    inject_latency_ms,
+                    "injecting artificial object-store latency (test/measurement mode)"
+                );
+                mirror = Arc::new(agentdb_storage::LatencyContentBackend::new(
+                    mirror,
+                    inject_latency_ms,
+                ));
+            }
             let queue_capacity = env_usize(
                 "AGENTDB_CONTENT_MIRROR_QUEUE_CAPACITY",
                 DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY,
             )
             .max(1);
+            // Byte ceiling on the pending upload backlog: beyond it, writes
+            // are throttled (429 + Retry-After) so a slow object store cannot
+            // grow the backlog — and node memory — without bound. 0 disables.
+            let max_backlog_bytes = env_u64(
+                "AGENTDB_CONTENT_MIRROR_MAX_BACKLOG_BYTES",
+                DEFAULT_CONTENT_MIRROR_MAX_BACKLOG_BYTES,
+            );
             let mut mirror_backend =
-                agentdb_storage::AsyncMirrorContentBackend::new(primary, mirror, queue_capacity);
+                agentdb_storage::AsyncMirrorContentBackend::new(primary, mirror, queue_capacity)
+                    .with_max_backlog_bytes(max_backlog_bytes);
             if let Some(ttl_ms) = config.content_local_cache_ttl_ms {
                 mirror_backend = mirror_backend.with_local_cache_ttl_ms(ttl_ms);
             }
@@ -1873,6 +1920,7 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
                 primary_path = %content_dir.display(),
                 mirror_prefix = %OBJECT_STORE_CONTENT_PREFIX,
                 queue_capacity,
+                max_backlog_bytes,
                 local_cache_ttl_ms = ?config.content_local_cache_ttl_ms,
                 "opened async mirrored artifact content backend"
             );
@@ -3516,6 +3564,13 @@ async fn run_raft_rs_snapshot_tick(
         if target_nodes.is_empty() {
             continue;
         }
+        // Baseline measurement for the manifest-based-attachment evaluation
+        // (hardening §7): today a replacement/placement copies the tablet's
+        // FULL runtime state as one snapshot payload. Record its size and the
+        // export time so S9 and real replacements quantify the movement cost
+        // that a manifest+lazy-block attach would aim to cut down to the
+        // recent tail. See docs/design/tablet-attachment-evaluation.md.
+        let export_started = std::time::Instant::now();
         let application_snapshot = match runtime.export_tablet_snapshot_payload(tablet_id) {
             Ok(payload) => payload,
             Err(error) => {
@@ -3527,6 +3582,12 @@ async fn run_raft_rs_snapshot_tick(
                 continue;
             }
         };
+        tracing::info!(
+            tablet_id,
+            snapshot_bytes = application_snapshot.len(),
+            export_ms = export_started.elapsed().as_millis() as u64,
+            "movement snapshot: full tablet state export (§7 baseline)"
+        );
         let mut compact_through = 0u64;
         for (to, node_id) in target_nodes {
             let transfer = group.build_snapshot_transfer(

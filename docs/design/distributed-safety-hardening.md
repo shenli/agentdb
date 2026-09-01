@@ -36,11 +36,11 @@ The hardening program should make these statements testable:
 | P0 | Define clustered read semantics and add a Raft read barrier | A partitioned or resumed former leader cannot successfully serve a linearizable read | **Done** — ReadIndex barrier (`RaftRsSharedGroup::read_barrier`) on session reads, classification in [`read-semantics.md`](read-semantics.md), plus `check_quorum` so an isolated leader steps down (and `pre_vote` keeps it down) instead of self-confirming stale reads; S22 verifies the isolated leader leaves the leader role and stays out while partitioned |
 | P0 | Add deterministic transport fault injection | Reproducible 2+1, asymmetric, delayed, and healed partition tests run from a fixed seed | **Done** — `agentdb_api::transport_faults` at the production send/recv boundary; S22 isolates a live leader and verifies quorum-loss + election + heal |
 | P0 | Add cluster root and durable store identity | Startup fails closed on cluster, node, store-incarnation, or generation mismatch | **Done** (bootstrap-generation aside) — `<data_dir>/IDENTITY.json` (cluster id, node id, store incarnation, integrity digest) verified before any store opens; startup fails closed on node/cluster mismatch, corruption, or unknown version. Cluster mode also admits each store's incarnation against a control-plane `store_incarnations` registry: a retired disk cannot rejoin and a second live incarnation cannot displace a running node. Replacement is an explicit `POST /api/admin/cluster/stores/{node}/retire`. A committed cluster-root descriptor with a `bootstrap_generation` counter is the remaining nicety |
-| P1 | Make manifest changes content-addressed and reconcilable | Duplicate requests and crash/retry sequences cannot under-count live object references |
-| P1 | Connect tenant admission to downstream storage debt | Slow storage throttles the responsible tenant before queues or retained logs become unbounded |
-| P1 | Adopt a concise testing-evidence contract | Filtered, concurrent, mutation, and acceptance tests carry explicit evidence |
-| P2 | Evaluate manifest-based tablet attachment | A cold/read-mostly tablet can move without copying its complete durable history |
-| P2 | Reduce control-plane metadata load in stages | Ephemeral state leaves SQL before durable metadata is moved or self-hosted |
+| P1 | Make manifest changes content-addressed and reconcilable | Duplicate requests and crash/retry sequences cannot under-count live object references | **Done** — recovery manifests carry a content-derived `change_id` + monotonic `watermark`; `publish_latest` returns Applied / AlreadyApplied / RejectedStale (idempotent retries, no stale clobber); `read_latest_summary` is the authoritative applied query. Session-tiering GC already re-derives the live reference set each startup, so it never under-counts references |
+| P1 | Connect tenant admission to downstream storage debt | Slow storage throttles the responsible tenant before queues or retained logs become unbounded | **Done** (first credit) — the object-store upload backlog is byte-bounded and per-tenant attributed; over the ceiling, artifact writes are throttled (429 + Retry-After) charged to the responsible tenant, and `GET /api/admin/content-mirror` exposes the debt. A latency-injection knob + measurement test demonstrate the bounded backlog. Extending admission to the other debt signals (memtable, compaction, index/export lag) is the next credit, per §5's "measure first" |
+| P1 | Adopt a concise testing-evidence contract | Filtered, concurrent, mutation, and acceptance tests carry explicit evidence | **Done** — [`docs/testing/testing-evidence-contract.md`](../testing/testing-evidence-contract.md); rule 1 (expected count) and rule 6 (unique gated acceptance markers) enforced by `ops/testing/*.sh`, the latter in CI |
+| P2 | Evaluate manifest-based tablet attachment | A cold/read-mostly tablet can move without copying its complete durable history | **Evaluated — no-go to build now** ([`tablet-attachment-evaluation.md`](tablet-attachment-evaluation.md)). Baseline benchmark shows the full-state move cost is real and linear (71 MB / 1.7 s to serialize an 8,000-event session), but lazy-block attach is a storage-engine change with read-path/recovery risk. Recommendation: instrument movement cost (done — scheduler logs `snapshot_bytes`/`export_ms`), pursue the cheaper compact-snapshot encoding first, and gate the prototype behind a demonstrated need |
+| P2 | Reduce control-plane metadata load in stages | Ephemeral state leaves SQL before durable metadata is moved or self-hosted | Largely done via the metadata self-hosting work (#294) |
 
 ## 1. Clustered Read Semantics
 
@@ -284,6 +284,11 @@ Operator-visible backpressure should include:
 - current usage and configured limit
 - retry-after guidance
 - time since the resource last drained
+
+The first credit (the object-store upload backlog) is implemented; the
+knobs, the `GET /api/admin/content-mirror` fields, and the measurement
+recipe are documented in
+[`../operations/storage-backpressure.md`](../operations/storage-backpressure.md).
 
 ## 6. Testing-Evidence Contract
 

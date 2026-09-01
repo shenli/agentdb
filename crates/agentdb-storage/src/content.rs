@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -118,12 +118,28 @@ pub trait ContentBackend: Send + Sync {
 
 // ----- AsyncMirrorContentBackend ---------------------------------------------
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AsyncMirrorStats {
     pub queued: u64,
     pub completed: u64,
     pub failed: u64,
+    /// Pending mirror jobs (count).
     pub backlog: u64,
+    /// Pending mirror payload (bytes) — the debt that grows when the mirror
+    /// (object store) drains slower than writes arrive. This is the signal
+    /// backpressure gates on.
+    pub backlog_bytes: u64,
+    /// Configured byte ceiling; `Some(0)`/`None` means unbounded.
+    pub max_backlog_bytes: Option<u64>,
+    /// Whether the backlog is currently over the ceiling (writes throttled).
+    pub over_limit: bool,
+    /// Tenant currently holding the most pending bytes, and how many — the
+    /// "responsible tenant" a throttle is attributed to.
+    pub top_tenant: Option<String>,
+    pub top_tenant_backlog_bytes: u64,
+    /// ms since a mirror job last completed; large + non-empty backlog means
+    /// the resource has stopped draining.
+    pub ms_since_last_drain: Option<i64>,
     pub evicted: u64,
 }
 
@@ -141,6 +157,9 @@ struct AsyncMirrorCounters {
     completed: AtomicU64,
     failed: AtomicU64,
     backlog: AtomicU64,
+    backlog_bytes: AtomicU64,
+    /// Wall-clock ms a mirror job last completed (drained). 0 = never.
+    last_drain_ms: AtomicI64,
     evicted: AtomicU64,
 }
 
@@ -157,6 +176,36 @@ enum MirrorJob {
     },
 }
 
+impl MirrorJob {
+    /// Pending payload this job represents. Deletes carry no payload; the
+    /// count backlog still bounds them.
+    fn byte_len(&self) -> u64 {
+        match self {
+            MirrorJob::Put { bytes, .. } => bytes.len() as u64,
+            MirrorJob::Delete { .. } => 0,
+        }
+    }
+
+    fn tenant_id(&self) -> &str {
+        match self {
+            MirrorJob::Put { tenant_id, .. } | MirrorJob::Delete { tenant_id, .. } => tenant_id,
+        }
+    }
+}
+
+fn now_ms_wall() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// Typed error the async mirror returns when its byte backlog is over the
+/// configured ceiling, so the write path can map it to a retryable throttle
+/// (HTTP 429 + Retry-After) rather than blocking the hot path on slow
+/// object storage. The API layer recognizes this marker.
+pub const MIRROR_BACKPRESSURE_MARKER: &str = "MIRROR_UPLOAD_BACKPRESSURE";
+
 /// Stages content in a primary backend and mirrors to another backend
 /// asynchronously.
 ///
@@ -169,6 +218,13 @@ pub struct AsyncMirrorContentBackend {
     mirror: Arc<dyn ContentBackend>,
     sender: mpsc::Sender<MirrorJob>,
     counters: Arc<AsyncMirrorCounters>,
+    /// Per-tenant pending mirror bytes, for attributing backpressure to the
+    /// tenant producing the debt.
+    per_tenant_backlog: Arc<Mutex<HashMap<String, u64>>>,
+    /// Byte ceiling on the pending backlog. When exceeded, `put`/`delete`
+    /// return `MIRROR_BACKPRESSURE_MARKER` instead of enqueuing, throttling
+    /// the writer. `None` = unbounded (blocking-on-full channel only).
+    max_backlog_bytes: Option<u64>,
     /// When set, the primary is a managed cache over the mirror: local
     /// copies older than this TTL whose mirror copy exists are evicted by
     /// the cache sweep, and local read hits refresh the object's age.
@@ -196,11 +252,32 @@ impl AsyncMirrorContentBackend {
         let counters = Arc::new(AsyncMirrorCounters::default());
         let worker_counters = counters.clone();
         let worker_mirror = mirror.clone();
+        let per_tenant_backlog: Arc<Mutex<HashMap<String, u64>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let worker_per_tenant = per_tenant_backlog.clone();
         tokio::spawn(async move {
             while let Some(job) = receiver.recv().await {
+                let job_bytes = job.byte_len();
+                let job_tenant = job.tenant_id().to_string();
                 let result =
                     execute_mirror_job_with_retry(worker_mirror.as_ref(), &job, max_attempts).await;
                 worker_counters.backlog.fetch_sub(1, Ordering::Relaxed);
+                worker_counters
+                    .backlog_bytes
+                    .fetch_sub(job_bytes, Ordering::Relaxed);
+                worker_counters
+                    .last_drain_ms
+                    .store(now_ms_wall(), Ordering::Relaxed);
+                if job_bytes > 0 {
+                    if let Ok(mut map) = worker_per_tenant.lock() {
+                        if let Some(v) = map.get_mut(&job_tenant) {
+                            *v = v.saturating_sub(job_bytes);
+                            if *v == 0 {
+                                map.remove(&job_tenant);
+                            }
+                        }
+                    }
+                }
                 match result {
                     Ok(()) => {
                         worker_counters.completed.fetch_add(1, Ordering::Relaxed);
@@ -217,8 +294,19 @@ impl AsyncMirrorContentBackend {
             mirror,
             sender,
             counters,
+            per_tenant_backlog,
+            max_backlog_bytes: None,
             local_cache_ttl_ms: None,
         }
+    }
+
+    /// Bound the pending mirror backlog to `max_bytes`. Beyond it, `put` and
+    /// `delete` throttle the writer (`MIRROR_BACKPRESSURE_MARKER`) instead of
+    /// enqueuing, so a slow object store cannot grow the backlog without
+    /// bound. `0` disables the ceiling.
+    pub fn with_max_backlog_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_backlog_bytes = (max_bytes > 0).then_some(max_bytes);
+        self
     }
 
     /// Turn the primary into a managed cache: local objects unread for
@@ -291,26 +379,144 @@ impl AsyncMirrorContentBackend {
     }
 
     pub fn stats(&self) -> AsyncMirrorStats {
+        let backlog = self.counters.backlog.load(Ordering::Relaxed);
+        let backlog_bytes = self.counters.backlog_bytes.load(Ordering::Relaxed);
+        let (top_tenant, top_tenant_backlog_bytes) = self
+            .per_tenant_backlog
+            .lock()
+            .ok()
+            .and_then(|map| {
+                map.iter()
+                    .max_by_key(|(_, bytes)| **bytes)
+                    .map(|(t, b)| (Some(t.clone()), *b))
+            })
+            .unwrap_or((None, 0));
+        let last_drain = self.counters.last_drain_ms.load(Ordering::Relaxed);
+        let ms_since_last_drain =
+            (backlog > 0 && last_drain > 0).then(|| now_ms_wall().saturating_sub(last_drain));
         AsyncMirrorStats {
             queued: self.counters.queued.load(Ordering::Relaxed),
             completed: self.counters.completed.load(Ordering::Relaxed),
             failed: self.counters.failed.load(Ordering::Relaxed),
-            backlog: self.counters.backlog.load(Ordering::Relaxed),
+            backlog,
+            backlog_bytes,
+            max_backlog_bytes: self.max_backlog_bytes,
+            over_limit: self
+                .max_backlog_bytes
+                .is_some_and(|limit| backlog_bytes >= limit),
+            top_tenant,
+            top_tenant_backlog_bytes,
+            ms_since_last_drain,
             evicted: self.counters.evicted.load(Ordering::Relaxed),
         }
     }
 
+    /// Whether a new upload of `incoming_bytes` would exceed the backlog
+    /// ceiling. When it would, the caller throttles instead of enqueuing.
+    fn over_backlog_limit(&self, incoming_bytes: u64) -> bool {
+        self.max_backlog_bytes.is_some_and(|limit| {
+            self.counters
+                .backlog_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(incoming_bytes)
+                > limit
+        })
+    }
+
+    fn backpressure_error(&self, tenant_id: &str) -> io::Error {
+        let stats = self.stats();
+        io::Error::other(format!(
+            "{MIRROR_BACKPRESSURE_MARKER}: object-store upload backlog {} bytes exceeds limit {} \
+             (top tenant {:?}); throttling writes for tenant {tenant_id}",
+            stats.backlog_bytes,
+            self.max_backlog_bytes.unwrap_or(0),
+            stats.top_tenant.as_deref().unwrap_or("-"),
+        ))
+    }
+
     async fn enqueue(&self, job: MirrorJob) -> io::Result<()> {
+        let bytes = job.byte_len();
+        let tenant = job.tenant_id().to_string();
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
         self.counters.backlog.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .backlog_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        if bytes > 0 {
+            if let Ok(mut map) = self.per_tenant_backlog.lock() {
+                *map.entry(tenant).or_insert(0) += bytes;
+            }
+        }
         if let Err(err) = self.sender.send(job).await {
             self.counters.backlog.fetch_sub(1, Ordering::Relaxed);
+            self.counters
+                .backlog_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
             self.counters.failed.fetch_add(1, Ordering::Relaxed);
             return Err(io::Error::other(format!(
                 "async content mirror queue closed: {err}"
             )));
         }
         Ok(())
+    }
+}
+
+/// Wraps a content backend and delays every operation by a fixed duration.
+/// Used to demonstrate pipeline backpressure ("inject 500ms object-store
+/// latency," hardening §5): put it in front of the mirror backend and the
+/// upload backlog grows until the ceiling throttles writers.
+pub struct LatencyContentBackend {
+    inner: Arc<dyn ContentBackend>,
+    delay: std::time::Duration,
+}
+
+impl LatencyContentBackend {
+    pub fn new(inner: Arc<dyn ContentBackend>, delay_ms: u64) -> Self {
+        Self {
+            inner,
+            delay: std::time::Duration::from_millis(delay_ms),
+        }
+    }
+
+    async fn sleep(&self) {
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+    }
+}
+
+#[async_trait]
+impl ContentBackend for LatencyContentBackend {
+    async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult> {
+        self.sleep().await;
+        self.inner.put(tenant_id, artifact_id, bytes).await
+    }
+
+    async fn get(&self, tenant_id: &str, artifact_id: &str) -> io::Result<Vec<u8>> {
+        self.sleep().await;
+        self.inner.get(tenant_id, artifact_id).await
+    }
+
+    async fn head(&self, tenant_id: &str, artifact_id: &str) -> io::Result<bool> {
+        self.sleep().await;
+        self.inner.head(tenant_id, artifact_id).await
+    }
+
+    async fn delete(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()> {
+        self.sleep().await;
+        self.inner.delete(tenant_id, artifact_id).await
+    }
+
+    async fn touch(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()> {
+        self.inner.touch(tenant_id, artifact_id).await
+    }
+
+    async fn sweep_temporary_objects(&self, limit: usize) -> io::Result<usize> {
+        self.inner.sweep_temporary_objects(limit).await
+    }
+
+    async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
+        self.inner.list_objects(limit).await
     }
 }
 
@@ -358,6 +564,13 @@ async fn execute_mirror_job(
 #[async_trait]
 impl ContentBackend for AsyncMirrorContentBackend {
     async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult> {
+        // Throttle BEFORE the primary write: a rejected write leaves no
+        // half-mirrored state, and the writer retries after the backlog
+        // drains. This is what keeps the mirror backlog bounded under slow
+        // object storage instead of blocking the hot path indefinitely.
+        if self.over_backlog_limit(bytes.len() as u64) {
+            return Err(self.backpressure_error(tenant_id));
+        }
         let result = self.primary.put(tenant_id, artifact_id, bytes).await?;
         self.enqueue(MirrorJob::Put {
             tenant_id: tenant_id.into(),

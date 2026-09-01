@@ -1047,8 +1047,45 @@ struct ContentMirrorStatusResponse {
     completed: u64,
     failed: u64,
     backlog: u64,
+    // Pipeline-aware backpressure signals (hardening §5): the object-store
+    // upload debt, its ceiling, whether writes are currently throttled, the
+    // responsible tenant, and how long the resource has stopped draining.
+    backlog_bytes: u64,
+    max_backlog_bytes: Option<u64>,
+    over_limit: bool,
+    top_tenant: Option<String>,
+    top_tenant_backlog_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_ms: Option<u64>,
+    ms_since_last_drain: Option<i64>,
     evicted: u64,
     local_cache_ttl_ms: Option<u64>,
+}
+
+impl ContentMirrorStatusResponse {
+    fn from_stats(
+        stats: &agentdb_storage::AsyncMirrorStats,
+        local_cache_ttl_ms: Option<u64>,
+    ) -> Self {
+        ContentMirrorStatusResponse {
+            enabled: true,
+            queued: stats.queued,
+            completed: stats.completed,
+            failed: stats.failed,
+            backlog: stats.backlog,
+            backlog_bytes: stats.backlog_bytes,
+            max_backlog_bytes: stats.max_backlog_bytes,
+            over_limit: stats.over_limit,
+            top_tenant: stats.top_tenant.clone(),
+            top_tenant_backlog_bytes: stats.top_tenant_backlog_bytes,
+            // Advise a retry only while throttled; a fixed hint the client
+            // backs off by (the drain rate is workload-dependent).
+            retry_after_ms: stats.over_limit.then_some(1_000),
+            ms_since_last_drain: stats.ms_since_last_drain,
+            evicted: stats.evicted,
+            local_cache_ttl_ms,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -4625,16 +4662,7 @@ async fn get_recovery_status(State(s): State<AppState>) -> Json<RecoveryStatusRe
         .and_then(|b| b.last_success_ms)
         .map(|success| (now_ms - success).max(0));
     let content_mirror = s.content_mirror.as_ref().map(|mirror| {
-        let stats = mirror.stats();
-        ContentMirrorStatusResponse {
-            enabled: true,
-            queued: stats.queued,
-            completed: stats.completed,
-            failed: stats.failed,
-            backlog: stats.backlog,
-            evicted: stats.evicted,
-            local_cache_ttl_ms: mirror.local_cache_ttl_ms(),
-        }
+        ContentMirrorStatusResponse::from_stats(&mirror.stats(), mirror.local_cache_ttl_ms())
     });
     Json(RecoveryStatusResponse {
         enabled: manifest_backup.is_some(),
@@ -4652,20 +4680,22 @@ async fn get_content_mirror_status(State(s): State<AppState>) -> Json<ContentMir
             completed: 0,
             failed: 0,
             backlog: 0,
+            backlog_bytes: 0,
+            max_backlog_bytes: None,
+            over_limit: false,
+            top_tenant: None,
+            top_tenant_backlog_bytes: 0,
+            retry_after_ms: None,
+            ms_since_last_drain: None,
             evicted: 0,
             local_cache_ttl_ms: None,
         });
     };
     let stats = mirror.stats();
-    Json(ContentMirrorStatusResponse {
-        enabled: true,
-        queued: stats.queued,
-        completed: stats.completed,
-        failed: stats.failed,
-        backlog: stats.backlog,
-        evicted: stats.evicted,
-        local_cache_ttl_ms: mirror.local_cache_ttl_ms(),
-    })
+    Json(ContentMirrorStatusResponse::from_stats(
+        &stats,
+        mirror.local_cache_ttl_ms(),
+    ))
 }
 
 async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusResponse>, ApiError> {

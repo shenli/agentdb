@@ -6673,6 +6673,25 @@ impl Runtime {
             .put(req.tenant_id.as_str(), artifact_id.as_str(), &stored_bytes)
             .await
         {
+            // The mirror throttles (rejecting before the primary write) when
+            // its object-store upload backlog is over the ceiling. Nothing
+            // was written, so there is nothing to clean up — surface it as a
+            // retryable rate limit (429 + Retry-After) rather than an
+            // internal error, so the writer backs off and the responsible
+            // tenant is slowed before the backlog grows unbounded (§5).
+            if error
+                .to_string()
+                .contains(agentdb_storage::MIRROR_BACKPRESSURE_MARKER)
+            {
+                return Err(Error::new(
+                    ErrorCode::RateLimited,
+                    "object-store upload backlog is saturated; retry after it drains",
+                )
+                .with_suggestion(
+                    "the node is throttling artifact writes to keep the upload backlog bounded; \
+                     retry with backoff, or inspect GET /api/admin/content-mirror",
+                ));
+            }
             if let Err(cleanup_error) = self
                 .content
                 .delete(req.tenant_id.as_str(), artifact_id.as_str())

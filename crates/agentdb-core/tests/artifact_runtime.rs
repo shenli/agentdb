@@ -23,6 +23,59 @@ async fn fresh_tenant(rt: &Runtime, key: &str) -> agentdb_core::tenant::Tenant {
 }
 
 #[tokio::test]
+async fn artifact_writes_are_rate_limited_when_upload_backlog_saturates() {
+    use agentdb_storage::{AsyncMirrorContentBackend, LatencyContentBackend};
+
+    // A slow object-store mirror (500ms/op) behind a tiny backlog ceiling:
+    // artifact writes must be throttled (RateLimited → 429) once the pending
+    // upload backlog fills, rather than blocking or growing unbounded. This
+    // is the end-to-end (runtime → content mirror → backpressure) view of
+    // hardening §5.
+    let primary: Arc<dyn ContentBackend> = Arc::new(InMemoryContentBackend::default());
+    let slow_mirror: Arc<dyn ContentBackend> = Arc::new(LatencyContentBackend::new(
+        Arc::new(InMemoryContentBackend::default()),
+        500,
+    ));
+    let content: Arc<dyn ContentBackend> = Arc::new(
+        AsyncMirrorContentBackend::new_with_retries(primary, slow_mirror, 64, 1)
+            .with_max_backlog_bytes(4 * 1024),
+    );
+    let rt = Runtime::with_kv(Arc::new(InMemoryKvStore::default()), content);
+    let t = fresh_tenant(&rt, "bp").await;
+    let blob = vec![b'x'; 1024];
+
+    let mut rate_limited = false;
+    for _ in 0..64 {
+        match rt
+            .create_artifact(
+                NewArtifact {
+                    tenant_id: t.tenant_id.clone(),
+                    content_type: Some("application/octet-stream".into()),
+                    expected_sha256: None,
+                },
+                blob.clone(),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(err) => {
+                assert_eq!(
+                    err.code,
+                    ErrorCode::RateLimited,
+                    "expected a rate-limit throttle, got {err:?}"
+                );
+                rate_limited = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        rate_limited,
+        "artifact writes should be throttled once the upload backlog saturates"
+    );
+}
+
+#[tokio::test]
 async fn create_artifact_round_trip() {
     let rt = Runtime::in_memory();
     let t = fresh_tenant(&rt, "t").await;

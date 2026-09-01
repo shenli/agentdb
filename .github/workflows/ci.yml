@@ -105,6 +105,11 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --tests -- -D warnings
 
+      # Testing-evidence contract (docs/testing/testing-evidence-contract.md)
+      # rule 6: every auto acceptance script has a unique gated PASS marker.
+      - name: acceptance markers unique
+        run: ops/testing/check-acceptance-markers.sh
+
       - name: cargo test
         run: cargo test --workspace --locked
 

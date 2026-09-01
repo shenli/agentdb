@@ -20,8 +20,8 @@ pub mod tablet_store;
 
 pub use content::{
     sha256_hex, AsyncMirrorContentBackend, AsyncMirrorStats, ContentBackend, ContentListing,
-    ContentObject, InMemoryContentBackend, LocalFsContentBackend, ObjectStoreContentBackend,
-    PutResult,
+    ContentObject, InMemoryContentBackend, LatencyContentBackend, LocalFsContentBackend,
+    ObjectStoreContentBackend, PutResult, MIRROR_BACKPRESSURE_MARKER,
 };
 pub use content_crypto::{
     ContentCryptoAdapter, ContentCryptoContext, IdentityContentCryptoAdapter,

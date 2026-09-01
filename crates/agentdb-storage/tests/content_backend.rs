@@ -252,6 +252,58 @@ async fn object_store_uses_artifact_content_layout() {
     assert_eq!(got, b"hi");
 }
 
+/// Hardening §5 measurement: with a slow mirror (500ms/op) and a byte
+/// ceiling on the backlog, writes are throttled (MIRROR_BACKPRESSURE_MARKER)
+/// once the pending upload bytes reach the ceiling — the backlog stays
+/// bounded instead of growing without limit, and the responsible tenant is
+/// attributed. This is the "slow storage throttles the responsible tenant
+/// before queues become unbounded" property.
+#[tokio::test]
+async fn async_mirror_throttles_writer_when_slow_storage_fills_backlog() {
+    use agentdb_storage::{LatencyContentBackend, MIRROR_BACKPRESSURE_MARKER};
+
+    let primary = in_memory();
+    // A 500ms-per-op mirror: uploads drain far slower than writes arrive.
+    let slow_mirror: Arc<dyn ContentBackend> =
+        Arc::new(LatencyContentBackend::new(in_memory(), 500));
+    // Ceiling at 4 KiB of pending bytes; each blob is 1 KiB.
+    let backend = AsyncMirrorContentBackend::new_with_retries(primary, slow_mirror, 64, 1)
+        .with_max_backlog_bytes(4 * 1024);
+    let blob = vec![b'x'; 1024];
+
+    // Write until we get throttled. With drains stalled at 500ms, the
+    // backlog fills after a handful of writes and further writes are
+    // rejected rather than queued or blocked.
+    let mut throttled = false;
+    let mut accepted = 0u64;
+    for i in 0..64 {
+        match backend.put("ten_heavy", &format!("art_{i}"), &blob).await {
+            Ok(_) => accepted += 1,
+            Err(err) => {
+                assert!(
+                    err.to_string().contains(MIRROR_BACKPRESSURE_MARKER),
+                    "unexpected error: {err}"
+                );
+                throttled = true;
+                break;
+            }
+        }
+    }
+
+    assert!(throttled, "expected backpressure once the backlog filled");
+    let stats = backend.stats();
+    assert!(stats.over_limit, "backlog should be over the ceiling");
+    // Bounded: pending bytes are near the ceiling, not the full 64-write set.
+    assert!(
+        stats.backlog_bytes <= 6 * 1024,
+        "backlog {} bytes should stay bounded near the 4 KiB ceiling",
+        stats.backlog_bytes
+    );
+    assert!(accepted < 64, "not every write should have been accepted");
+    assert_eq!(stats.top_tenant.as_deref(), Some("ten_heavy"));
+    assert!(stats.top_tenant_backlog_bytes > 0);
+}
+
 #[tokio::test]
 async fn async_mirror_put_returns_after_primary_and_uploads_in_background() {
     let primary = in_memory();
