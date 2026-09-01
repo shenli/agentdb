@@ -1399,6 +1399,18 @@ fn priority_rank(p: Priority) -> u8 {
     }
 }
 
+/// Provisions a tenant's data-encryption keys when the tenant is created.
+///
+/// In a cluster the key catalog is shared and the seal/open path is read-only,
+/// so a tenant's DEK must be minted by one coordinated caller — the runtime
+/// calls this on the (leader) node that creates the tenant, before the tenant's
+/// data can be written. Implemented by the cluster key provider; unset for
+/// deployments whose provider mints on demand (single-node).
+#[async_trait::async_trait]
+pub trait TenantKeyProvisioner: Send + Sync {
+    async fn provision_tenant(&self, tenant_id: &str) -> Result<()>;
+}
+
 pub struct Runtime {
     state: Mutex<State>,
     hydration_mode: HydrationMode,
@@ -1414,6 +1426,9 @@ pub struct Runtime {
     /// disabled (the default), content takes the legacy v1/identity path. Reads
     /// detect the frame version, so a disabled→enabled rollout stays readable.
     keyring: Arc<dyn EnvelopeCrypto>,
+    /// Optional: mints a tenant's DEKs at creation time (cluster key provider).
+    /// `None` when the keyring's provider mints on demand.
+    key_provisioner: Option<Arc<dyn TenantKeyProvisioner>>,
     kms: Arc<dyn KmsKeyResolver>,
     /// Per-(tenant, namespace) BM25 text index for V2.2 searchable
     /// records. Wrapped in a `std::sync::Mutex` because
@@ -3154,6 +3169,7 @@ impl Runtime {
             content: Arc::new(InMemoryContentBackend::default()),
             content_crypto: Arc::new(IdentityContentCryptoAdapter),
             keyring: Arc::new(DisabledEnvelopeCrypto),
+            key_provisioner: None,
             kms: Arc::new(AllowAllKmsKeyResolver),
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3173,6 +3189,7 @@ impl Runtime {
             content: Arc::new(InMemoryContentBackend::default()),
             content_crypto: Arc::new(IdentityContentCryptoAdapter),
             keyring: Arc::new(DisabledEnvelopeCrypto),
+            key_provisioner: None,
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3195,6 +3212,7 @@ impl Runtime {
             content: Arc::new(InMemoryContentBackend::default()),
             content_crypto,
             keyring: Arc::new(DisabledEnvelopeCrypto),
+            key_provisioner: None,
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3380,6 +3398,38 @@ impl Runtime {
             Arc::new(AllowAllKmsKeyResolver),
             Arc::new(IdentityContentCryptoAdapter),
             keyring,
+            None,
+            Some(tablet_router),
+            None,
+        )
+    }
+
+    /// Replicated runtime with an envelope keyring *and* a tenant key
+    /// provisioner — the cluster shape. The provisioner mints a tenant's DEKs at
+    /// creation time (the serve path is read-only and fails closed otherwise).
+    pub fn with_kv_content_keyring_provisioner_and_replicated_logs(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        keyring: Arc<dyn EnvelopeCrypto>,
+        key_provisioner: Arc<dyn TenantKeyProvisioner>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+    ) -> Arc<Self> {
+        let tablet_router = Arc::new(
+            RuntimeTabletRouterKvStore::new(kv, RUNTIME_PRIMARY_TABLET_ID, logs)
+                .expect("open runtime tablet router"),
+        );
+        let persist = Persist::with_metadata_crypto(
+            tablet_router.clone(),
+            Arc::new(IdentityMetadataCryptoAdapter),
+        )
+        .with_keyring(keyring.clone());
+        Self::from_persist_with_tablet_router_and_mode(
+            persist,
+            content,
+            Arc::new(AllowAllKmsKeyResolver),
+            Arc::new(IdentityContentCryptoAdapter),
+            keyring,
+            Some(key_provisioner),
             Some(tablet_router),
             None,
         )
@@ -3514,6 +3564,7 @@ impl Runtime {
             kms,
             content_crypto,
             Arc::new(DisabledEnvelopeCrypto),
+            None,
             tablet_router,
             None,
         )
@@ -3540,6 +3591,7 @@ impl Runtime {
             Arc::new(AllowAllKmsKeyResolver),
             Arc::new(IdentityContentCryptoAdapter),
             Arc::new(DisabledEnvelopeCrypto),
+            None,
             None,
             Some(mode),
         )
@@ -3570,15 +3622,18 @@ impl Runtime {
             keyring,
             None,
             None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_persist_with_tablet_router_and_mode(
         mut persist: Persist,
         content: Arc<dyn ContentBackend>,
         kms: Arc<dyn KmsKeyResolver>,
         content_crypto: Arc<dyn ContentCryptoAdapter>,
         keyring: Arc<dyn EnvelopeCrypto>,
+        key_provisioner: Option<Arc<dyn TenantKeyProvisioner>>,
         tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
         hydration_override: Option<HydrationMode>,
     ) -> Arc<Self> {
@@ -3613,6 +3668,7 @@ impl Runtime {
             content,
             content_crypto,
             keyring,
+            key_provisioner,
             kms,
             text_index: StdMutex::new(hydration.text_index),
             vector_index: StdMutex::new(hydration.vector_index),
@@ -5685,6 +5741,11 @@ impl Runtime {
         };
         if let Some(p) = &self.persist {
             p.put_tenant(&t).map_err(internal)?;
+        }
+        // Mint the tenant's data-encryption keys before any of its data can be
+        // written (cluster deployments; a no-op when unset).
+        if let Some(provisioner) = &self.key_provisioner {
+            provisioner.provision_tenant(t.tenant_id.as_str()).await?;
         }
         Ok(t)
     }

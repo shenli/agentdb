@@ -6,7 +6,7 @@
 //! provider **pre-warms** every wrapped DEK into an in-memory map at startup
 //! (`load`) and unwraps them under the KEK; the sync [`KeyProvider`] serve path
 //! then reads that map and never touches the database. Minting is **explicit
-//! and async** — [`provision_tenant`] is called on tenant creation (the leader),
+//! and async** — [`provision_all`] is called on tenant creation (the leader),
 //! writing through the race-safe `provision_if_absent` so every node converges
 //! on one DEK per tenant. The serve path never mints, so it fails closed on an
 //! unprovisioned tenant rather than risk two nodes minting different keys.
@@ -78,7 +78,7 @@ impl MetaCatalogKeyProvider {
 
     /// Ensure a tenant's DEKs exist (leader-coordinated, at tenant creation),
     /// then add them to this node's map. Idempotent and race-safe across nodes.
-    pub async fn provision_tenant(&self, tenant_id: &str) -> Result<(), CryptoError> {
+    pub async fn provision_all(&self, tenant_id: &str) -> Result<(), CryptoError> {
         for purpose in PROVISIONED_PURPOSES {
             self.provision(tenant_id, purpose).await?;
         }
@@ -152,6 +152,20 @@ impl MetaCatalogKeyProvider {
                 policy_epoch: 0,
             },
         )))
+    }
+}
+
+/// Lets the runtime call the provider at tenant creation (the cluster
+/// provisioning hook), mapping the crypto error into a runtime error.
+#[async_trait::async_trait]
+impl agentdb_core::TenantKeyProvisioner for MetaCatalogKeyProvider {
+    async fn provision_tenant(&self, tenant_id: &str) -> Result<(), agentdb_core::errors::Error> {
+        self.provision_all(tenant_id).await.map_err(|e| {
+            agentdb_core::errors::Error::new(
+                agentdb_core::errors::ErrorCode::Internal,
+                format!("tenant key provisioning failed: {e}"),
+            )
+        })
     }
 }
 
@@ -231,7 +245,7 @@ mod tests {
         // Serve path never mints.
         assert!(provider.active_dek("ten_a", KeyPurpose::Content).is_err());
 
-        provider.provision_tenant("ten_a").await.unwrap();
+        provider.provision_all("ten_a").await.unwrap();
 
         let keyring = AeadTenantKeyring::new(
             provider.clone(),
@@ -263,7 +277,7 @@ mod tests {
             object_id: "o1",
         };
 
-        node_a.provision_tenant("ten_a").await.unwrap();
+        node_a.provision_all("ten_a").await.unwrap();
         let sealed = AeadTenantKeyring::new(node_a.clone(), Suite::XChaCha20Poly1305, DekCacheConfig::default())
             .seal(&ctx, b"payload")
             .unwrap();
@@ -288,7 +302,7 @@ mod tests {
             object_id: "o1",
         };
         let first = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
-        first.provision_tenant("ten_a").await.unwrap();
+        first.provision_all("ten_a").await.unwrap();
         let sealed = AeadTenantKeyring::new(first, Suite::XChaCha20Poly1305, DekCacheConfig::default())
             .seal(&ctx, b"payload")
             .unwrap();
