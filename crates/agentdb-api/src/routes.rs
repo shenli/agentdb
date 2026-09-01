@@ -132,6 +132,14 @@ pub fn routes() -> Router<AppState> {
             "/api/admin/nodes/:node_id/maintenance",
             post(set_admin_node_maintenance),
         )
+        .route(
+            "/api/admin/cluster/stores/:node_id",
+            get(get_admin_store_incarnations),
+        )
+        .route(
+            "/api/admin/cluster/stores/:node_id/retire",
+            post(retire_admin_store_incarnation),
+        )
         .route("/api/admin/tablets", get(get_admin_tablets))
         .route("/api/admin/tablets/create", post(create_admin_tablet))
         .route("/api/admin/tablet-ranges", get(get_admin_tablet_ranges))
@@ -2361,6 +2369,62 @@ async fn delete_admin_node(
     // anyway; this just avoids a stale row lingering for the cutoff window).
     let _ = agentdb_meta::node_operational::delete(meta.pool(), &node_id).await;
     Ok(Json(DeleteAdminNodeResponse { node_id, removed }))
+}
+
+/// List every store incarnation ever recorded for a node id (newest
+/// admission first), so an operator can see which physical store currently
+/// holds the node and its replacement history.
+async fn get_admin_store_incarnations(
+    State(s): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let meta = meta_required(&s)?;
+    let incarnations = agentdb_meta::store_admission::list_for_node(meta.pool(), &node_id)
+        .await
+        .map_err(|err| {
+            ApiError(agentdb_core::Error::new(
+                ErrorCode::Internal,
+                err.to_string(),
+            ))
+        })?;
+    let rows: Vec<serde_json::Value> = incarnations
+        .into_iter()
+        .map(|inc| {
+            serde_json::json!({
+                "node_id": inc.node_id,
+                "store_incarnation": inc.store_incarnation,
+                "state": inc.state,
+                "admitted_at_ms": inc.admitted_at_ms,
+                "retired_at_ms": inc.retired_at_ms,
+            })
+        })
+        .collect();
+    Ok(Json(
+        serde_json::json!({ "node_id": node_id, "incarnations": rows }),
+    ))
+}
+
+/// Retire the currently-active store incarnation for a node id so a
+/// deliberately-replaced disk can be admitted on its next boot. Idempotent
+/// (retiring when nothing is active is a no-op). The retired incarnation
+/// then fails closed if it ever tries to rejoin.
+async fn retire_admin_store_incarnation(
+    State(s): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let meta = meta_required(&s)?;
+    let retired = agentdb_meta::store_admission::retire_active(meta.pool(), &node_id, now_ms_i64())
+        .await
+        .map_err(|err| {
+            ApiError(agentdb_core::Error::new(
+                ErrorCode::Internal,
+                err.to_string(),
+            ))
+        })?;
+    Ok(Json(serde_json::json!({
+        "node_id": node_id,
+        "retired_incarnation": retired,
+    })))
 }
 
 async fn set_admin_node_maintenance(

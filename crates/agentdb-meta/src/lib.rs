@@ -27,6 +27,7 @@ pub mod placement_scopes;
 pub mod routing;
 pub mod scheduler;
 pub mod shards;
+pub mod store_admission;
 pub mod tablet_movements;
 pub mod tablet_ranges;
 pub mod tablet_rebalance;
