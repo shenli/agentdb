@@ -72,11 +72,16 @@ import urllib.request
 
 base, work_dir = sys.argv[1], sys.argv[2]
 
+bearer = None
+
 def call(path, body=None):
+    headers = {"content-type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
     req = urllib.request.Request(
         base + path,
         data=json.dumps(body).encode() if body is not None else None,
-        headers={"content-type": "application/json"},
+        headers=headers,
         method="POST" if body is not None else "GET",
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
@@ -96,6 +101,16 @@ for n in range(50):
         f"/api/tenants/{tid}/sessions/{sid}/events",
         {"agent_id": agent["agent_id"], "kind": "message", "payload": {"n": n}},
     )
+
+# S16-M (metadata-restore): mint a bearer token BEFORE the covered point.
+# Tokens are system-tenant records now — they must ride the same recovery
+# manifests as data and verify after a bucket-only restore.
+minted = call("/api/admin/tokens", {"description": "s16-drill", "scope": "admin"})
+with open(os.path.join(work_dir, "token.json"), "w") as f:
+    json.dump({"token": minted["token"], "token_id": minted["token_id"]}, f)
+# Minting the first token closes the instance; the rest of the drill
+# authenticates with it (which also exercises verify-under-traffic).
+bearer = minted["token"]
 
 # Wait for a manifest backup covering phase 1.
 deadline = time.time() + 15
@@ -149,12 +164,18 @@ base, work_dir = sys.argv[1], sys.argv[2]
 with open(f"{work_dir}/drill.json") as f:
     drill = json.load(f)
 tid, sid = drill["tenant_id"], drill["session_id"]
+# The token record survived the restore, so the instance is closed:
+# authenticate with the pre-loss bearer (itself part of what the drill
+# proves).
+with open(f"{work_dir}/token.json") as f:
+    bearer = json.load(f)["token"]
 
 present = set()
 from_seq = 0
 while True:
     url = f"{base}/api/tenants/{tid}/sessions/{sid}/events?from_seq={from_seq}&limit=1000"
-    with urllib.request.urlopen(url, timeout=5) as resp:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {bearer}"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
         payload = json.loads(resp.read())
     events = payload if isinstance(payload, list) else payload.get("events", payload)
     if not events:
@@ -182,7 +203,39 @@ print(
 )
 PY
 
+# S16-M: the pre-loss token must verify against the restored node (the
+# instance is closed post-restore because the token record survived, so an
+# unauthenticated probe must get 401 and the token must get 200).
+python3 - "${BASE}" "${WORK_DIR}" <<'PY'
+import json, os, sys, urllib.request
+
+base, work_dir = sys.argv[1], sys.argv[2]
+with open(os.path.join(work_dir, "token.json")) as f:
+    token = json.load(f)["token"]
+
+def status_of(path, bearer=None):
+    req = urllib.request.Request(base + path)
+    if bearer:
+        req.add_header("Authorization", f"Bearer {bearer}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+unauth = status_of("/api/tenants")
+if unauth != 401:
+    print(f"restored node should be closed (token exists) but got {unauth}", file=sys.stderr)
+    sys.exit(1)
+authed = status_of("/api/tenants", bearer=token)
+if authed != 200:
+    print(f"pre-loss token failed to verify after restore: {authed}", file=sys.stderr)
+    sys.exit(1)
+print("S16-M: pre-loss bearer token survived the bucket-only restore")
+PY
+
 kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
+
 
 echo "PASS: restore-from-bucket rebuilt the node with manifest-bounded RPO"

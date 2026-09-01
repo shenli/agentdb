@@ -49,9 +49,20 @@ collect_diagnostics() {
 }
 
 wait_for_postgres() {
-  for _ in $(seq 1 60); do
-    if compose exec -T postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
-      return 0
+  # Probe over TCP, not the default unix socket: the postgres image's
+  # first-boot initdb runs a temporary socket-only server, so a socket
+  # probe reports ready before TCP listens (and the temp server's restart
+  # resets any connection that slips in). Require consecutive successes
+  # to ride out that restart window.
+  local ok=0
+  for _ in $(seq 1 90); do
+    if compose exec -T postgres pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+      ok=$((ok + 1))
+      if [[ $ok -ge 3 ]]; then
+        return 0
+      fi
+    else
+      ok=0
     fi
     sleep 1
   done

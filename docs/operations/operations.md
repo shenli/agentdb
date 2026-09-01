@@ -118,9 +118,11 @@ discover its workspace from the credential alone. Verification results are
 memoized in memory for `AGENTDB_AUTH_CACHE_TTL_MS` (default 60000; 0 disables
 caching); mint and revoke invalidate the local node's cache immediately, so on
 a multi-node deployment a revoked token can remain valid on other nodes for up
-to the TTL. Token hashes live in `<data_dir>/auth-meta.sqlite` on a persistent
-standalone node, which must be included in volume-level backups. Cluster nodes
-reuse the shared metadata store.
+to the TTL. Token hashes live as records under a reserved system tenant inside
+AgentDB's own data directory (metadata self-hosting): they are covered by
+the same durability, replication, and recovery-manifest machinery as user
+data — `agentdb restore-from-bucket` restores them with everything else,
+and no separate metadata backup is needed for them.
 
 The dashboard keeps a bearer token in page memory only. It deletes legacy
 stored tokens, never accepts a token from URL parameters, and strips `token`

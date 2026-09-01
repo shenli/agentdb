@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use agentdb_meta::admin_tokens::{self, AdminScope};
+use crate::sysmeta::{self, AdminScope};
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -23,8 +23,6 @@ use axum::{
 };
 use serde::Serialize;
 use subtle::ConstantTimeEq;
-
-use agentdb_meta::MetaStore;
 
 use crate::state::AppState;
 
@@ -136,14 +134,26 @@ pub async fn authorize_external_api(
         return next.run(request).await;
     }
 
+    // The system tenant (self-hosted metadata) is not reachable through the
+    // public API under ANY principal; only in-process code touches it.
+    if path
+        .strip_prefix("/api/tenants/")
+        .is_some_and(|rest| rest.split('/').next() == Some(agentdb_core::SYSTEM_TENANT_ID))
+    {
+        return auth_error(
+            StatusCode::FORBIDDEN,
+            "the system tenant is reserved for internal metadata",
+        );
+    }
+
     let presented = bearer_token(request.headers()).map(str::to_string);
     if static_token_matches(&state, presented.as_deref()) {
         request.extensions_mut().insert(ApiPrincipal::Root);
         return next.run(request).await;
     }
 
-    if let (Some(meta), Some(presented)) = (state.auth_meta.as_ref(), presented.as_deref()) {
-        let resolved = match resolve_token_cached(&state, meta, presented).await {
+    if let Some(presented) = presented.as_deref() {
+        let resolved = match resolve_token_cached(&state, presented).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 tracing::error!(?error, "failed to verify API bearer token");
@@ -175,12 +185,7 @@ pub async fn authorize_external_api(
         );
     }
 
-    let Some(meta) = state.auth_meta.as_ref() else {
-        request.extensions_mut().insert(ApiPrincipal::Root);
-        return next.run(request).await;
-    };
-
-    let any_tokens = match any_tokens_cached(&state, meta).await {
+    let any_tokens = match any_tokens_cached(&state).await {
         Ok(any) => any,
         Err(error) => {
             tracing::error!(?error, "failed to read authentication state");
@@ -250,14 +255,13 @@ fn tenant_path_matches(path: &str, tenant_id: &str) -> bool {
 
 async fn resolve_token_cached(
     state: &AppState,
-    meta: &MetaStore,
     presented: &str,
-) -> Result<Option<ResolvedToken>, agentdb_meta::error::MetaError> {
-    let key = admin_tokens::fingerprint(presented);
+) -> Result<Option<ResolvedToken>, agentdb_core::Error> {
+    let key = sysmeta::fingerprint(presented);
     if let Some(cached) = state.auth_cache.get(&key) {
         return Ok(cached);
     }
-    let resolved = admin_tokens::verify(meta.pool(), presented)
+    let resolved = sysmeta::verify_token(&state.runtime, presented)
         .await?
         .map(|verified| ResolvedToken {
             token_id: verified.token_id,
@@ -268,14 +272,11 @@ async fn resolve_token_cached(
     Ok(resolved)
 }
 
-async fn any_tokens_cached(
-    state: &AppState,
-    meta: &MetaStore,
-) -> Result<bool, agentdb_meta::error::MetaError> {
+async fn any_tokens_cached(state: &AppState) -> Result<bool, agentdb_core::Error> {
     if let Some(cached) = state.auth_cache.get_any_tokens() {
         return Ok(cached);
     }
-    let any = admin_tokens::count_all(meta.pool()).await? > 0;
+    let any = sysmeta::count_all_tokens(&state.runtime).await? > 0;
     state.auth_cache.put_any_tokens(any);
     Ok(any)
 }

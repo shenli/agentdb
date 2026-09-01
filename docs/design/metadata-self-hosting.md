@@ -70,6 +70,38 @@ non-replicated mode simply a reserved key namespace in the one store).
 
 ## 3. Stage 1 — evict ephemeral state from SQL
 
+> **Implementation refinements** (2026-08-31, discovered during the build;
+> they supersede details below where they differ):
+>
+> 1. **`tablet_replicas` was two things in one table.** It held placement
+>    INTENT (tablet → node → role, written on placement decisions — Layer 1
+>    by this design's own definition) *and* observed progress/health. The
+>    implementation keeps a lean intent table (`tablet_id, node_id, role,
+>    state('active'|'draining'), updated_at_ms`) and evicts only the
+>    observed columns. Decision code that needs both reads a **merged
+>    view** (intent joined with fresh observations; intent authoritative
+>    for role and the draining lifecycle, observations for health and
+>    progress, health defaulting to `unknown`).
+> 2. **The node heartbeat IS a SQL row, so the summary is too.** There is
+>    no node→scheduler RPC to piggyback on: the heartbeat is each node
+>    upserting its own `nodes` row. The per-node summary therefore lands in
+>    a `node_operational` row (one JSON summary per node, replaced at
+>    heartbeat cadence) rather than an in-memory fleet view on the
+>    scheduler. This still achieves the goals: write rate O(nodes) per
+>    heartbeat interval instead of O(tablets × messages), zero SQL on raft
+>    send/receive/apply paths, and staleness handled by `reported_at_ms`
+>    cutoffs exactly like node liveness. When stage 2's system tenant
+>    lands, this row is a natural early migrant.
+> 3. **The message-receive path had its own SQL** (progress + health
+>    UPDATEs and a peer-validation SELECT per received raft message —
+>    the mirror of the send-side issue #291 fixed). Receive-side writes now
+>    go to the in-process registry; peer validation runs against a 5s
+>    in-process cache of the intent-derived peer set with a
+>    refresh-once-before-reject rule.
+> 4. **raft-id → node-id resolution is memoized** in the registry (stable
+>    per node), so outbox health reporting does at most one SQL lookup per
+>    unknown peer, ever — not per message or per batch.
+
 ### 3.1 What is deleted
 
 Tables `tablet_replicas`, `tablet_stats` (and its write-rate/compaction
@@ -150,6 +182,59 @@ low frequency — and it is the **only** periodic control-plane write left.
 ---
 
 ## 4. Stage 2 — the system tenant
+
+> **Implementation record** (2026-09-01; scope decisions that supersede
+> details below):
+>
+> 1. **All three stages landed in one change**, so the `MetadataStore`
+>    trait + dual-implementation migration window was unnecessary: there is
+>    a single implementation (`agentdb_api::sysmeta`, free functions over
+>    the in-process runtime handle), and no `SqlMetadataStore` ever
+>    shipped. No data migration either — pre-users, migration 028 simply
+>    drops the old tables.
+> 2. **The system tenant rides the primary tablet** rather than a dedicated
+>    `SYSTEM_TABLET_ID = 0`. All load-bearing properties hold (raft
+>    replication, recovery manifests, KV-authoritative caching); the
+>    dedicated-tablet placement rules (pin to durable nodes, move last) are
+>    cluster-scale polish deferred until the scheduler grows placement
+>    classes.
+> 3. **The consumer inventory shrank stage 2 dramatically.**
+>    `session_overrides`, `tenant_quotas`, `admin_audit`, and `users` had
+>    ZERO consumers — deleted outright, not migrated. `tenant_placement
+>    policies` is read by the scheduler for placement decisions, which must
+>    work while the system tablet is down — reclassified **Layer 1** by
+>    this design's own circularity rule. The migrated surface is exactly:
+>    bearer tokens, session locators, and the cluster tenant registry.
+> 4. **Token records key on the hash**: `external_id = sha256(plaintext)`,
+>    so verification is one point lookup through the record external-id
+>    map (in-memory hit, KV fallback) — no scan, no SQL.
+> 5. **Bootstrap snapshot starts locator-less**: routing's first snapshot
+>    loads before the runtime exists and uses the documented tenant-hash
+>    fallback until the first refresh (locators are re-read from records
+>    every refresh interval; the SQL LISTEN/NOTIFY locator channel is
+>    gone — watch-based invalidation is the noted follow-up).
+> 6. The locator `tenant_internal_id` field is retired (always 0);
+>    `tenant_external_id` is the identity, as migration 012 intended.
+> 7. **The S8 statement budget caught real defects on its first run**
+>    (1.26M statements vs a ~150k healthy baseline): heartbeat/lease
+>    touches fired the LISTEN/NOTIFY triggers on every row touch, so every
+>    refresher on every node re-pulled the full routing set per heartbeat;
+>    and failover evaluation polled three full-table loads at raft-tick
+>    cadence. Fixed by migration 029 (triggers ignore liveness-only
+>    updates), notify debouncing in the three refresher loops, and a
+>    second-scale failover-evaluation cadence. The budget is calibrated
+>    ~2.5x above the healthy baseline for the smoke's 500ms refresh
+>    config.
+> 8. **Removing the storm exposed a latent convergence latch** it had been
+>    masking: raft message sends had no HTTP timeout (one stalled peer
+>    head-of-line blocked every node's sequential outbox flush), and the
+>    replicated append's commit wait blocked tokio workers outright
+>    (starving the accept loop and ingress that commit depends on). Fixed
+>    with bounded per-request send timeouts (3s messages / 120s
+>    transfers / 2s connect) and `block_in_place` around the commit
+>    wait — both items from `distributed-safety-hardening.md` landed
+>    early. Outbox send failures now warn once per flush (they logged
+>    only at debug, which made a fleet-wide delivery outage invisible).
 
 ### 4.1 Identity and placement
 

@@ -21,6 +21,9 @@ public docs path.
 - [design/cluster-storage-topology.md](design/cluster-storage-topology.md)
   - next-step design for cells, AZ-aware placement, tenant blast radius, and
   distributed storage validation
+- [design/distributed-safety-hardening.md](design/distributed-safety-hardening.md)
+  - prioritized plan for read consistency, partition testing, cluster/store
+  identity, manifest safety, and bounded tenant backpressure
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
   - product positioning and value-prop messaging framework
 - [design/codemate-product-note.md](design/codemate-product-note.md)

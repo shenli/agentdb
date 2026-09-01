@@ -955,6 +955,44 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
   delta replay incl. purge scrub, corruption fallback, min-advance gate),
   which runs in the quick profile in both hydration modes.
 
+### Metadata self-hosting stage 1 (2026-08-31)
+
+- Migration 027: `tablet_replicas` becomes placement intent (role +
+  active/draining state); observed progress/health and all tablet stats
+  ride per-node `node_operational` JSON summaries at heartbeat cadence.
+- Raft hot paths (send, receive, apply, snapshot, movement observers) are
+  SQL-free: observations land in an in-process registry; the heartbeat
+  serializes it. Ingress peer validation uses a 5s in-process cache of the
+  intent-derived peer set with refresh-once-before-reject.
+- Merged-view semantics pinned by unit tests: intent DEFINES the replica
+  set, observations enrich (health `unknown` until the first fresh report;
+  progress max-merged across observers; any observer's `unreachable`
+  degrades); observation-only echoes of retired replicas are not replicas.
+- Validation: meta/server/api suites rewritten to the intent/observation
+  split (seed helpers mirror the old one-call shape); S8 + S9 real-cluster
+  smokes re-run against the new plumbing.
+
+### Metadata self-hosting stages 2-3 (2026-09-01)
+
+- Bearer tokens, session locators, and the cluster tenant registry are
+  system-tenant records (`agentdb_api::sysmeta`); the SQL tables are
+  dropped by migration 028 (no data migration: pre-users).
+- In-process suite `api_sysmeta.rs`: token mint/verify/revoke/count
+  round-trip through records; insert-if-absent locator semantics with
+  per-tenant cascade delete; idempotent tenant registry; the system
+  tenant is hidden from listings, uncreatable, and every HTTP request
+  targeting it is refused with 403 before routing.
+- S16-M (inside S16): a bearer token minted before the covered point must
+  authenticate against the node rebuilt by `restore-from-bucket`, and the
+  restored instance must be CLOSED to unauthenticated traffic (the token
+  record survived) — metadata rides the same recovery manifests as data.
+- S8 statement budget: all nodes run with `sqlx::query=debug`; the
+  harness sums logged statements across the run and fails above a fleet
+  budget calibrated ~2.5x over the healthy baseline — the standing
+  tripwire for the "hot loop one await away from SQL" defect class. Its
+  first run caught two live instances (notify triggers firing per
+  heartbeat touch; failover evaluation polling at raft-tick cadence).
+
 ## 7b. Coverage adequacy argument
 
 | Claim | Threat model (how it could fail) | Scenarios that exercise the threats | Why these are sufficient |

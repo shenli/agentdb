@@ -46,13 +46,14 @@ pub use policy::{
 };
 pub use record::{IndexingMode, IndexingPolicy, NewRecord, RecordStatus, SearchableRecord};
 pub use runtime::{
-    BackpressureReport, BackpressureSignal, ChangefeedItem, ContextInclude, ContextRequest,
-    ContextResponse, FleetStorageSummary, ForkEdge, ForkSessionRequest, GcSweepReport,
-    LifecycleCounts, LifecycleSweepReport, MetadataFilter, MetadataFilterCondition,
+    is_system_tenant, BackpressureReport, BackpressureSignal, ChangefeedItem, ContextInclude,
+    ContextRequest, ContextResponse, FleetStorageSummary, ForkEdge, ForkSessionRequest,
+    GcSweepReport, LifecycleCounts, LifecycleSweepReport, MetadataFilter, MetadataFilterCondition,
     MetadataFilterOp, NewRecordEdge, NewSnapshotRef, PolicyWorkerReport, RecordEdge,
     RecordEdgeType, RecordIndexStats, RecordSearchMatch, RecordSearchScoreComponents, RecordUpdate,
     ReplayResponse, Runtime, SessionStorageSummary, SnapshotResolution, TenantMetaEntry,
     TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope, RUNTIME_PRIMARY_TABLET_ID,
+    SYSTEM_TENANT_EXTERNAL_KEY, SYSTEM_TENANT_ID,
 };
 pub use segment::{
     ReplayPrefixFile, ReplayPrefixManifest, SessionArchiveFile, SessionArchiveManifest,

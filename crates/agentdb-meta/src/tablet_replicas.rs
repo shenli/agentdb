@@ -1,105 +1,82 @@
-//! Tablet replica placement and health metadata.
+//! Tablet replica placement INTENT.
 //!
-//! This is control-plane state only. The future Raft implementation owns the
-//! actual log replication; these rows let routing, placement, and operators see
-//! where each tablet is expected to have voters/learners and how far they have
-//! caught up.
+//! Rows say where each tablet is *supposed* to have replicas and in what
+//! role/lifecycle state; they change only on placement decisions (scheduler,
+//! movements, node removal). Observed progress and health — which used to be
+//! columns here, written from raft hot paths — now ride the per-node
+//! [`crate::node_operational`] summaries at heartbeat cadence; use
+//! [`crate::node_operational::merged_replica_view_all`] (or `_by_tablet`)
+//! when a decision needs intent joined with observations.
 
 use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 
-type TabletReplicaRow = (i64, String, String, String, i64, i64, i64);
+/// Placement intent row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaIntent {
+    pub tablet_id: i64,
+    pub node_id: String,
+    pub role: String,
+    /// Lifecycle intent: `active` or `draining` (being replaced/removed).
+    pub state: String,
+    pub updated_at_ms: i64,
+}
 
+/// Merged intent + observation view. Shape-compatible with the pre-stage-1
+/// `tablet_replicas` row so decision code keeps its vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabletReplica {
     pub tablet_id: i64,
     pub node_id: String,
     pub role: String,
+    /// Observed health (`unknown` when no fresh report covers the replica),
+    /// or the intent state `draining` when the replica is being drained.
     pub health: String,
     pub applied_index: i64,
     pub match_index: i64,
     pub updated_at_ms: i64,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn upsert(
+pub async fn upsert_intent(
     pool: &AnyPool,
     tablet_id: i64,
     node_id: &str,
     role: &str,
-    health: &str,
-    applied_index: i64,
-    match_index: i64,
     now_ms: i64,
 ) -> MetaResult<()> {
     validate_role(role)?;
-    validate_health(health)?;
-    validate_index(applied_index, "applied_index")?;
-    validate_index(match_index, "match_index")?;
     sqlx::query(
-        "INSERT INTO tablet_replicas
-            (tablet_id, node_id, role, health, applied_index, match_index, updated_at_ms)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "INSERT INTO tablet_replicas (tablet_id, node_id, role, state, updated_at_ms)
+         VALUES ($1, $2, $3, 'active', $4)
          ON CONFLICT (tablet_id, node_id) DO UPDATE SET
             role = excluded.role,
-            health = excluded.health,
-            applied_index = excluded.applied_index,
-            match_index = excluded.match_index,
+            state = 'active',
             updated_at_ms = excluded.updated_at_ms",
     )
     .bind(tablet_id)
     .bind(node_id)
     .bind(role)
-    .bind(health)
-    .bind(applied_index)
-    .bind(match_index)
     .bind(now_ms)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn set_progress(
+/// Mark a replica's lifecycle intent (`active` or `draining`).
+pub async fn set_state(
     pool: &AnyPool,
     tablet_id: i64,
     node_id: &str,
-    applied_index: i64,
-    match_index: i64,
+    state: &str,
     now_ms: i64,
 ) -> MetaResult<bool> {
-    validate_index(applied_index, "applied_index")?;
-    validate_index(match_index, "match_index")?;
+    validate_state(state)?;
     let rows = sqlx::query(
-        "UPDATE tablet_replicas
-            SET applied_index = $1, match_index = $2, updated_at_ms = $3
-          WHERE tablet_id = $4 AND node_id = $5",
-    )
-    .bind(applied_index)
-    .bind(match_index)
-    .bind(now_ms)
-    .bind(tablet_id)
-    .bind(node_id)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    Ok(rows > 0)
-}
-
-pub async fn set_health(
-    pool: &AnyPool,
-    tablet_id: i64,
-    node_id: &str,
-    health: &str,
-    now_ms: i64,
-) -> MetaResult<bool> {
-    validate_health(health)?;
-    let rows = sqlx::query(
-        "UPDATE tablet_replicas
-            SET health = $1, updated_at_ms = $2
+        "UPDATE tablet_replicas SET state = $1, updated_at_ms = $2
           WHERE tablet_id = $3 AND node_id = $4",
     )
-    .bind(health)
+    .bind(state)
     .bind(now_ms)
     .bind(tablet_id)
     .bind(node_id)
@@ -109,9 +86,12 @@ pub async fn set_health(
     Ok(rows > 0)
 }
 
-pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<TabletReplica>> {
-    let rows: Vec<TabletReplicaRow> = sqlx::query_as(
-        "SELECT tablet_id, node_id, role, health, applied_index, match_index, updated_at_ms
+pub async fn list_intent_by_tablet(
+    pool: &AnyPool,
+    tablet_id: i64,
+) -> MetaResult<Vec<ReplicaIntent>> {
+    let rows: Vec<(i64, String, String, String, i64)> = sqlx::query_as(
+        "SELECT tablet_id, node_id, role, state, updated_at_ms
            FROM tablet_replicas
           WHERE tablet_id = $1
           ORDER BY node_id",
@@ -119,18 +99,18 @@ pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<Ta
     .bind(tablet_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(into_replica).collect())
+    Ok(rows.into_iter().map(into_intent).collect())
 }
 
-pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<TabletReplica>> {
-    let rows: Vec<TabletReplicaRow> = sqlx::query_as(
-        "SELECT tablet_id, node_id, role, health, applied_index, match_index, updated_at_ms
+pub async fn list_intent_all(pool: &AnyPool) -> MetaResult<Vec<ReplicaIntent>> {
+    let rows: Vec<(i64, String, String, String, i64)> = sqlx::query_as(
+        "SELECT tablet_id, node_id, role, state, updated_at_ms
            FROM tablet_replicas
           ORDER BY tablet_id, node_id",
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(into_replica).collect())
+    Ok(rows.into_iter().map(into_intent).collect())
 }
 
 pub async fn delete(pool: &AnyPool, tablet_id: i64, node_id: &str) -> MetaResult<bool> {
@@ -161,34 +141,23 @@ fn validate_role(role: &str) -> MetaResult<()> {
     }
 }
 
-fn validate_health(health: &str) -> MetaResult<()> {
-    match health {
-        "unknown" | "healthy" | "lagging" | "unreachable" | "draining" => Ok(()),
+fn validate_state(state: &str) -> MetaResult<()> {
+    match state {
+        "active" | "draining" => Ok(()),
         other => Err(MetaError::InvalidInput(format!(
-            "invalid tablet replica health `{other}`"
+            "invalid tablet replica state `{other}`"
         ))),
     }
 }
 
-fn validate_index(index: i64, name: &str) -> MetaResult<()> {
-    if index < 0 {
-        return Err(MetaError::InvalidInput(format!(
-            "{name} must be non-negative"
-        )));
-    }
-    Ok(())
-}
-
-fn into_replica(
-    (tablet_id, node_id, role, health, applied_index, match_index, updated_at_ms): TabletReplicaRow,
-) -> TabletReplica {
-    TabletReplica {
+fn into_intent(
+    (tablet_id, node_id, role, state, updated_at_ms): (i64, String, String, String, i64),
+) -> ReplicaIntent {
+    ReplicaIntent {
         tablet_id,
         node_id,
         role,
-        health,
-        applied_index,
-        match_index,
+        state,
         updated_at_ms,
     }
 }
@@ -202,96 +171,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_and_list_replicas() {
+    async fn intent_roundtrip_and_state() {
         let p = pool().await;
-        upsert(&p, 7, "node-b", "learner", "lagging", 3, 5, 100)
+        upsert_intent(&p, 7, "node-a", "voter", 100).await.unwrap();
+        upsert_intent(&p, 7, "node-b", "learner", 100)
             .await
             .unwrap();
-        upsert(&p, 7, "node-a", "voter", "healthy", 10, 10, 100)
-            .await
-            .unwrap();
+        let rows = list_intent_by_tablet(&p, 7).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.state == "active"));
 
-        let replicas = list_by_tablet(&p, 7).await.unwrap();
-        assert_eq!(replicas.len(), 2);
-        assert_eq!(replicas[0].node_id, "node-a");
-        assert_eq!(replicas[0].role, "voter");
-        assert_eq!(replicas[1].node_id, "node-b");
+        assert!(set_state(&p, 7, "node-a", "draining", 200).await.unwrap());
+        let rows = list_intent_by_tablet(&p, 7).await.unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.node_id == "node-a").unwrap().state,
+            "draining"
+        );
+        // Re-upserting reactivates.
+        upsert_intent(&p, 7, "node-a", "voter", 300).await.unwrap();
+        let rows = list_intent_by_tablet(&p, 7).await.unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.node_id == "node-a").unwrap().state,
+            "active"
+        );
     }
 
     #[tokio::test]
-    async fn upsert_replaces_existing_replica() {
+    async fn invalid_role_and_state_rejected() {
         let p = pool().await;
-        upsert(&p, 7, "node-a", "learner", "lagging", 1, 2, 100)
-            .await
-            .unwrap();
-        upsert(&p, 7, "node-a", "voter", "healthy", 5, 6, 200)
-            .await
-            .unwrap();
-
-        let replica = list_by_tablet(&p, 7).await.unwrap().remove(0);
-        assert_eq!(replica.role, "voter");
-        assert_eq!(replica.health, "healthy");
-        assert_eq!(replica.applied_index, 5);
-        assert_eq!(replica.match_index, 6);
-        assert_eq!(replica.updated_at_ms, 200);
+        assert!(upsert_intent(&p, 7, "node-a", "boss", 100).await.is_err());
+        upsert_intent(&p, 7, "node-a", "voter", 100).await.unwrap();
+        assert!(set_state(&p, 7, "node-a", "sleepy", 100).await.is_err());
     }
 
     #[tokio::test]
-    async fn set_progress_and_health_update_existing_row() {
+    async fn delete_paths() {
         let p = pool().await;
-        upsert(&p, 7, "node-a", "learner", "lagging", 1, 2, 100)
-            .await
-            .unwrap();
-
-        assert!(set_progress(&p, 7, "node-a", 7, 8, 200).await.unwrap());
-        assert!(set_health(&p, 7, "node-a", "healthy", 300).await.unwrap());
-
-        let replica = list_by_tablet(&p, 7).await.unwrap().remove(0);
-        assert_eq!(replica.applied_index, 7);
-        assert_eq!(replica.match_index, 8);
-        assert_eq!(replica.health, "healthy");
-        assert_eq!(replica.updated_at_ms, 300);
-    }
-
-    #[tokio::test]
-    async fn validation_rejects_unknown_values() {
-        let p = pool().await;
-        let err = upsert(&p, 7, "node-a", "primary", "healthy", 1, 1, 100)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, MetaError::InvalidInput(_)));
-
-        let err = upsert(&p, 7, "node-a", "voter", "bad", 1, 1, 100)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, MetaError::InvalidInput(_)));
-    }
-
-    #[tokio::test]
-    async fn delete_is_idempotent() {
-        let p = pool().await;
-        upsert(&p, 7, "node-a", "voter", "healthy", 1, 1, 100)
-            .await
-            .unwrap();
+        upsert_intent(&p, 7, "node-a", "voter", 100).await.unwrap();
+        upsert_intent(&p, 7, "node-b", "voter", 100).await.unwrap();
         assert!(delete(&p, 7, "node-a").await.unwrap());
         assert!(!delete(&p, 7, "node-a").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn delete_by_tablet_removes_all_replicas_for_tablet() {
-        let p = pool().await;
-        upsert(&p, 7, "node-a", "voter", "healthy", 1, 1, 100)
-            .await
-            .unwrap();
-        upsert(&p, 7, "node-b", "learner", "lagging", 0, 0, 100)
-            .await
-            .unwrap();
-        upsert(&p, 8, "node-a", "voter", "healthy", 1, 1, 100)
-            .await
-            .unwrap();
-
-        assert_eq!(delete_by_tablet(&p, 7).await.unwrap(), 2);
-        assert!(list_by_tablet(&p, 7).await.unwrap().is_empty());
-        assert_eq!(list_by_tablet(&p, 8).await.unwrap().len(), 1);
+        assert_eq!(delete_by_tablet(&p, 7).await.unwrap(), 1);
     }
 }

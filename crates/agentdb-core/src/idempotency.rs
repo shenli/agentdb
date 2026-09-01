@@ -57,7 +57,7 @@ impl IdempotencyStore {
         let puts = self
             .puts_since_eviction
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if puts != 0 && puts % EVICTION_EVERY_N_PUTS == 0 {
+        if puts != 0 && puts.is_multiple_of(EVICTION_EVERY_N_PUTS) {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

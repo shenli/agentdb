@@ -14,6 +14,19 @@ use crate::raft_ingress::RaftRsGroupRegistry;
 
 const INTERNAL_AUTH_HEADER: &str = "X-AgentDB-Internal-Token";
 
+/// Bound on connection establishment to a peer.
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound on a single raft message POST. Raft messages are small and
+/// latency-critical; a peer that cannot answer quickly must surface as a
+/// typed send failure so the outbox can restore + retry. An unbounded send
+/// to a stalled peer head-of-line blocks the sequential outbox flush for
+/// every peer and every group — the whole cluster then hangs on one sick
+/// node.
+const MESSAGE_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+/// Snapshot and movement transfers carry bulk payloads; they get a wide
+/// bound rather than none.
+const TRANSFER_SEND_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct RaftRsHttpClient {
     client: reqwest::Client,
@@ -22,8 +35,12 @@ pub struct RaftRsHttpClient {
 
 impl RaftRsHttpClient {
     pub fn new(token: impl Into<Arc<str>>) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(PEER_CONNECT_TIMEOUT)
+            .build()
+            .expect("raft-rs HTTP client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             token: token.into(),
         }
     }
@@ -46,8 +63,13 @@ impl RaftRsHttpClient {
             to: message.to,
             payload_base64: encode_payload(&message.payload),
         };
-        self.post(base_url, "/api/internal/raft/messages", &body)
-            .await
+        self.post(
+            base_url,
+            "/api/internal/raft/messages",
+            &body,
+            MESSAGE_SEND_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn send_snapshot(
@@ -63,8 +85,13 @@ impl RaftRsHttpClient {
             term: snapshot.term,
             payload_base64: encode_payload(&snapshot.payload),
         };
-        self.post(base_url, "/api/internal/raft/snapshots", &body)
-            .await
+        self.post(
+            base_url,
+            "/api/internal/raft/snapshots",
+            &body,
+            TRANSFER_SEND_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn export_tablet_movement_snapshot(
@@ -76,6 +103,7 @@ impl RaftRsHttpClient {
             base_url,
             "/api/internal/tablet-movements/snapshot/export",
             request,
+            TRANSFER_SEND_TIMEOUT,
         )
         .await
     }
@@ -85,11 +113,13 @@ impl RaftRsHttpClient {
         base_url: &str,
         path: &str,
         body: &T,
+        timeout: Duration,
     ) -> Result<(), RaftRsHttpError> {
         let url = format!("{}{}", base_url.trim_end_matches('/'), path);
         let response = self
             .client
             .post(url)
+            .timeout(timeout)
             .header(INTERNAL_AUTH_HEADER, self.token.as_ref())
             .json(body)
             .send()
@@ -109,11 +139,13 @@ impl RaftRsHttpClient {
         base_url: &str,
         path: &str,
         body: &T,
+        timeout: Duration,
     ) -> Result<R, RaftRsHttpError> {
         let url = format!("{}{}", base_url.trim_end_matches('/'), path);
         let response = self
             .client
             .post(url)
+            .timeout(timeout)
             .header(INTERNAL_AUTH_HEADER, self.token.as_ref())
             .json(body)
             .send()

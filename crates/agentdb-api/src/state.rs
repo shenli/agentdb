@@ -307,6 +307,7 @@ pub struct AppState {
     pub proxy_policy: ProxyPolicy,
     pub api_json_response_profile: Option<Arc<ApiJsonResponseProfile>>,
     pub auth_cache: Arc<crate::auth::AuthTokenCache>,
+    pub operational: Arc<crate::operational::OperationalRegistry>,
 }
 
 impl AppState {
@@ -331,6 +332,7 @@ impl AppState {
             proxy_policy: ProxyPolicy::default(),
             api_json_response_profile: ApiJsonResponseProfile::from_env().map(Arc::new),
             auth_cache: Arc::new(crate::auth::AuthTokenCache::from_env()),
+            operational: Arc::new(crate::operational::OperationalRegistry::default()),
         }
     }
 

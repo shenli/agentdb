@@ -60,6 +60,18 @@ use crate::tablet_state::{
 use crate::tenant::{NewTenant, Tenant};
 
 pub const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
+
+/// Reserved tenant that hosts self-managed metadata (stage 2 of
+/// docs/design/metadata-self-hosting.md): admin/tenant tokens, session
+/// locators, and the cluster tenant registry live as records under it.
+/// It is invisible to and unwritable through the public API.
+pub const SYSTEM_TENANT_ID: &str = "ten_00000000-0000-0000-0000-000000000001";
+/// Reserved external key for the system tenant.
+pub const SYSTEM_TENANT_EXTERNAL_KEY: &str = "__agentdb_system";
+
+pub fn is_system_tenant(tenant_id: &str) -> bool {
+    tenant_id == SYSTEM_TENANT_ID
+}
 const DEFAULT_PERSISTED_HOT_EVENT_CACHE_PER_SESSION: u64 = 2_048;
 static PERSISTED_HOT_EVENT_CACHE_PER_SESSION: OnceLock<u64> = OnceLock::new();
 
@@ -2063,11 +2075,7 @@ fn enforce_startup_hydration_limits(
     let mut total_rows = 0_usize;
     let mut total_bytes = 0_u64;
     for (label, prefix, max_rows) in startup_hydration_categories() {
-        if mode == HydrationMode::Lazy
-            && LAZY_HYDRATION_SKIPPED_PREFIXES
-                .iter()
-                .any(|skipped| *skipped == prefix)
-        {
+        if mode == HydrationMode::Lazy && LAZY_HYDRATION_SKIPPED_PREFIXES.contains(&prefix) {
             continue;
         }
         let remaining_bytes = max_bytes.saturating_sub(total_bytes);
@@ -3885,8 +3893,6 @@ impl Runtime {
             .map_err(kms_error)
     }
 
-    /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
-    /// match a live (non-soft-deleted) tenant.
     // ----- Cache-miss fallback (Stage 1 of KV-authoritative state) --------
     //
     // The in-memory `State` maps are a cache over the durable KV rows, not
@@ -4677,7 +4683,7 @@ impl Runtime {
 
     pub async fn list_tenants(&self) -> Vec<Tenant> {
         let mut tenants = self.authoritative_all_tenants().await.unwrap_or_default();
-        tenants.retain(|t| t.deleted_at_ms.is_none());
+        tenants.retain(|t| t.deleted_at_ms.is_none() && !is_system_tenant(t.tenant_id.as_str()));
         tenants
     }
 
@@ -5309,6 +5315,52 @@ impl Runtime {
     }
 
     pub async fn create_tenant_with_id(&self, tenant_id: Id, req: NewTenant) -> Result<Tenant> {
+        if is_system_tenant(tenant_id.as_str()) || req.external_key == SYSTEM_TENANT_EXTERNAL_KEY {
+            return Err(Error::new(
+                ErrorCode::PolicyDenied,
+                "the system tenant is reserved and cannot be created through the public API",
+            ));
+        }
+        self.create_tenant_with_id_unchecked(tenant_id, req).await
+    }
+
+    /// Idempotently create the reserved system tenant. Internal only: the
+    /// public create path rejects the reserved id/key.
+    pub async fn ensure_system_tenant(&self) -> Result<Tenant> {
+        let system_id = Id::parse_kind(SYSTEM_TENANT_ID, IdKind::Tenant)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("system tenant id: {e:?}")))?;
+        if let Ok(existing) = self.get_tenant(&system_id).await {
+            return Ok(existing);
+        }
+        match self
+            .create_tenant_with_id_unchecked(
+                system_id.clone(),
+                NewTenant {
+                    external_key: SYSTEM_TENANT_EXTERNAL_KEY.to_string(),
+                    policy: serde_json::json!({}),
+                },
+            )
+            .await
+        {
+            Ok(tenant) => Ok(tenant),
+            // Concurrent bootstrap on another node won the race.
+            Err(e)
+                if matches!(
+                    e.code,
+                    ErrorCode::IdempotencyConflict | ErrorCode::AliasConflict
+                ) =>
+            {
+                self.get_tenant(&system_id).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn create_tenant_with_id_unchecked(
+        &self,
+        tenant_id: Id,
+        req: NewTenant,
+    ) -> Result<Tenant> {
         self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(&tenant_id).await?;
         self.ensure_tenant_alias_cached(&req.external_key).await?;
@@ -10824,6 +10876,39 @@ impl Runtime {
         Ok(true)
     }
 
+    /// Point-read a record by its caller-stable external id. Resolves
+    /// through the external-id map (with the usual KV fallback via the
+    /// upsert dedupe machinery's source of truth: the record row itself).
+    pub async fn get_record_by_external_id(
+        &self,
+        tenant_id: &Id,
+        external_id: &str,
+    ) -> Result<Option<SearchableRecord>> {
+        self.ensure_tenant_cached(tenant_id).await?;
+        let mapped = {
+            let s = self.state.lock().await;
+            s.record_external_ids
+                .get(&record_external_key(tenant_id, external_id))
+                .cloned()
+        };
+        let Some(record_id_str) = mapped else {
+            return Ok(None);
+        };
+        let Ok(record_id) = Id::parse_kind(&record_id_str, crate::id::IdKind::Record) else {
+            return Ok(None);
+        };
+        self.ensure_record_cached(tenant_id, &record_id).await?;
+        let s = self.state.lock().await;
+        Ok(s.records
+            .get(record_id.as_str())
+            .filter(|r| {
+                r.tenant_id.as_str() == tenant_id.as_str()
+                    && r.deleted_at_ms.is_none()
+                    && !r.is_expired()
+            })
+            .cloned())
+    }
+
     pub async fn upsert_record_with_commit(&self, req: NewRecord) -> Result<WriteRecordResult> {
         self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(&req.tenant_id).await?;
@@ -11304,8 +11389,22 @@ impl Runtime {
         let (drained, pending): (Vec<_>, Vec<_>) = mutations
             .into_iter()
             .partition(|mutation| mutation.commit_seq <= floor);
-        p.delete_record_index_mutations(&drained)
-            .map_err(internal)?;
+        // Trimming is a KV WRITE: on a replicated runtime it must go through
+        // the raft leader. Followers skip it silently — the leader trims the
+        // same rows and the deletions replicate down. Any other trim failure
+        // is logged but never blocks the drain (trim is an optimization; the
+        // watermark floor already makes re-scanned rows cheap no-ops).
+        if let Err(error) = p.delete_record_index_mutations(&drained) {
+            let detail = format!("{error:?}");
+            if detail.contains("not leader") {
+                tracing::trace!(
+                    drained = drained.len(),
+                    "skipping record index outbox trim on non-leader"
+                );
+            } else {
+                tracing::warn!(?error, "record index outbox trim failed");
+            }
+        }
 
         let mut applied = 0usize;
         for mutation in pending {
@@ -11501,10 +11600,10 @@ impl Runtime {
                     tracing::warn!(?error, "record index snapshot write failed");
                 }
                 ticks += 1;
-                if ticks % sweep_every == 0 {
+                if ticks.is_multiple_of(sweep_every) {
                     self.sweep_idempotency_retention();
                 }
-                if ticks % cache_sweep_every == 0 {
+                if ticks.is_multiple_of(cache_sweep_every) {
                     self.sweep_metadata_cache().await;
                 }
                 tokio::time::sleep(interval).await;

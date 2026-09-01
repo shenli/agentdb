@@ -175,6 +175,24 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/026_admin_token_tenant_scope.sql"),
         include_str!("../migrations/026_admin_token_tenant_scope.pg.sql"),
     ),
+    (
+        27,
+        "node operational summaries; tablet_replicas becomes placement intent",
+        include_str!("../migrations/027_node_operational.sql"),
+        include_str!("../migrations/027_node_operational.pg.sql"),
+    ),
+    (
+        28,
+        "metadata self-hosting: tokens/locators/tenant registry move to the system tenant",
+        include_str!("../migrations/028_metadata_self_hosting.sql"),
+        include_str!("../migrations/028_metadata_self_hosting.pg.sql"),
+    ),
+    (
+        29,
+        "notify triggers ignore heartbeat/lease-only touches",
+        include_str!("../migrations/029_notify_ignores_heartbeat_touches.sql"),
+        include_str!("../migrations/029_notify_ignores_heartbeat_touches.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
@@ -346,17 +364,10 @@ mod tests {
             "config",
             "nodes",
             "schema_migrations",
-            "session_locators",
             "scheduler_leader",
-            "session_overrides",
             "shards",
             "tablet_movements",
             "tablets",
-            "tenants",
-            "users",
-            "admin_tokens",
-            "admin_audit",
-            "tenant_quotas",
         ] {
             assert!(
                 names.contains(&expected),
