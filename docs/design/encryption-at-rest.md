@@ -178,10 +178,25 @@ leader provisioned. The remaining cluster wiring — provisioning at tenant
 creation, the catalog on the replicated store, and follower cache consistency —
 is the next step.
 
-**Not yet done:** cluster (multi-node) envelope encryption needs the runtime
-wiring above on top of the M9 primitive; the online DEK rotation worker (new DEK
-version + data re-encryption walk) and the admin API/CLI to drive rewrap and
-rotation are not built; and the
+**Milestone 10 (landed): the cluster-shared key catalog in control metadata.**
+`agentdb_meta::dek_catalog` is the durable, cross-node table of wrapped DEK
+records (one row per tenant/purpose/version; ciphertext only, never plaintext
+keys) — the design's "wrapped DEK records in control metadata," and the shared
+home a cluster needs (it sidesteps the node-local KV catalog and its
+tablet-scoping). Provisioning is race-safe *across nodes*: `provision_if_absent`
+uses `INSERT … ON CONFLICT DO NOTHING` and returns whichever row won, so two
+nodes minting a DEK for the same tenant converge on one (the loser's key is
+never used) — stronger than the in-process lock of the KV catalog. `list_all`
+pre-loads a serving node's key cache; `get_active` / `get_version` / `set_status`
+round out CRUD (the last for rotation/revocation). The DEK table is folded into
+the consolidated schema.
+
+**Not yet done:** the cluster runtime wiring on top of M9 + M10 — a
+meta-catalog-backed `KeyProvider` (pre-warm from `list_all`, provision at tenant
+creation, refresh followers), then lifting the replicated-layout fail-closed and
+a real multi-node test. The online DEK rotation worker (new DEK version + data
+re-encryption walk) and the admin API/CLI to drive rewrap and rotation are not
+built; and the
 `LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
 Agent/session/tenant records, searchable records, and skills are still plaintext
 (records are additionally entangled with the export ledger + search index).
