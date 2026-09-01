@@ -154,8 +154,22 @@ DEK per node, so cluster envelope encryption needs a shared/replicated catalog
 (a dedicated follow-up). So encryption is now flippable end-to-end for a
 single-node persistent deployment.
 
-**Not yet done:** cluster (multi-node) envelope encryption needs a shared key
-catalog; the online DEK rotation worker and admin API/CLI are not built; and the
+**Milestone 9 (landed, first cluster step): read-only provider + coordinated
+provisioning.** `CatalogKeyProvider::new_read_only` makes the serve (seal/open)
+path never mint a DEK — it fails closed on an unprovisioned key — while
+`provision(tenant, purpose)` is the single coordinated entry point that mints,
+wraps, and stores a DEK. This is the pre-provisioning model the cluster design
+picked: a leader provisions a tenant's DEK once (e.g. at tenant creation) into
+the shared/replicated catalog, and every node's read-only path then serves the
+same key with no cross-node minting race. A test with two providers over one
+shared catalog (two simulated nodes) shows a follower serving the exact DEK the
+leader provisioned. The remaining cluster wiring — provisioning at tenant
+creation, the catalog on the replicated store, and follower cache consistency —
+is the next step.
+
+**Not yet done:** cluster (multi-node) envelope encryption needs the runtime
+wiring above on top of the M9 primitive; the online DEK rotation worker and
+admin API/CLI are not built; and the
 `LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
 Agent/session/tenant records, searchable records, and skills
 searchable records, and skills are still plaintext (records are additionally
