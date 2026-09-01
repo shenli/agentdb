@@ -48,28 +48,48 @@ than on every read and write.
 
 ## Current Implementation Status
 
-AgentDB currently has integration seams, not production encryption:
+**Milestone 1 (landed): the crypto core exists but is not yet wired to any
+durable path.** `agentdb-storage/src/crypto/` provides the cohesive keyring the
+"Proposed Code Changes" §1–3 call for:
+
+- `EnvelopeCrypto` (seal/open) over per-tenant, per-purpose DEKs, with a
+  production `AeadTenantKeyring` (AES-256-GCM and XChaCha20-Poly1305) and an
+  explicit `DisabledEnvelopeCrypto` that fails closed.
+- The self-describing `AGDB-ENVELOPE-v2` frame (bounded parser, golden vector,
+  fuzz test) — distinct from v1, which stays legacy framed plaintext.
+- Canonical AAD binding tenant, object kind, object id, purpose, key id, key
+  version, and suite, so ciphertext cannot move between tenants/objects/purposes
+  or be downgraded.
+- A `KeyProvider` seam with a `LocalKeyProvider` (HKDF-SHA256, dev/single-key
+  source; the KMS-backed wrapped-DEK catalog is a later milestone) and a bounded
+  plaintext-DEK cache.
+- Explicit `CryptoConfig` (`disabled | envelope`, suite, cache bounds).
+
+**Not yet done:** no durable tenant-payload path calls the keyring, so nothing
+is encrypted on disk yet. The remaining stages wire content, then events and
+metadata, then records/skills/indexes/exports/Raft/snapshots/backups; add the
+KMS provider and wrapped-DEK catalog, rotation worker, and revocation; and add
+raw-storage marker tests and the benchmark matrix.
+
+The pre-existing seams remain as the integration points those stages build on:
 
 - `agentdb-storage/src/kms.rs` resolves a tenant key identifier and availability
   state. It does not return or manage cryptographic key material.
-- `agentdb-storage/src/content_crypto.rs` defines an artifact-content adapter and
-  a keyed envelope framing format. The default adapter copies plaintext.
-- `agentdb-storage/src/metadata_crypto.rs` defines an adapter for artifact and
-  event metadata. The default adapter copies plaintext.
+- `agentdb-storage/src/content_crypto.rs` / `metadata_crypto.rs` define the
+  content and metadata adapters; the default adapters copy plaintext.
 - `agentdb-core/src/persist.rs` invokes the metadata adapter at selected
-  persistence boundaries.
-- `agentdb-core/src/runtime.rs` wires the allow-all resolver and identity
+  persistence boundaries; `runtime.rs` wires the allow-all resolver and identity
   adapters in default constructors.
 
-The current `AGDB-ENVELOPE-v1` frame records a key identifier and optional
-version around adapter output. With the identity adapters, the framed payload
-is still plaintext. It must not be described or detected as encrypted merely
-because it has an envelope header.
+The `AGDB-ENVELOPE-v1` frame records a key identifier and optional version
+around adapter output; with the identity adapters the framed payload is still
+plaintext and must not be described or detected as encrypted merely because it
+has an envelope header.
 
-Production encryption therefore remains incomplete until a real authenticated
-encryption provider exists, every durable tenant-payload path is inventoried
-and covered, and rotation, revocation, backup, restore, and observability
-contracts are implemented.
+Production encryption therefore remains incomplete until the durable paths are
+wired to the keyring, a KMS-backed provider and key catalog exist, every durable
+tenant-payload path is inventoried and covered, and rotation, revocation,
+backup, restore, and observability contracts are implemented.
 
 ## Threat Model
 

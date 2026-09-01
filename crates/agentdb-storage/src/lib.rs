@@ -6,6 +6,7 @@
 
 pub mod content;
 pub mod content_crypto;
+pub mod crypto;
 pub mod error;
 pub mod keys;
 pub mod kms;
@@ -25,6 +26,11 @@ pub use content::{
 };
 pub use content_crypto::{
     ContentCryptoAdapter, ContentCryptoContext, IdentityContentCryptoAdapter,
+};
+pub use crypto::{
+    is_envelope_v2, AeadTenantKeyring, CryptoConfig, CryptoContext, CryptoError, CryptoMode, Dek,
+    DekCacheConfig, DekLease, DisabledEnvelopeCrypto, EnvelopeCrypto, EnvelopeParts, KeyMetadata,
+    KeyProvider, KeyPurpose, LocalKeyProvider, Suite,
 };
 pub use error::{Error, Result};
 pub use kms::{
