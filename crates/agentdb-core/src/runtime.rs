@@ -3528,8 +3528,8 @@ impl Runtime {
             RuntimeTabletKvStore::single_node(kv, RUNTIME_PRIMARY_TABLET_ID)
                 .expect("open runtime tablet state"),
         );
-        let persist =
-            Persist::with_metadata_crypto(runtime_kv, Arc::new(IdentityMetadataCryptoAdapter));
+        let persist = Persist::with_metadata_crypto(runtime_kv, Arc::new(IdentityMetadataCryptoAdapter))
+            .with_keyring(keyring.clone());
         Self::from_persist_with_tablet_router_and_mode(
             persist,
             content,

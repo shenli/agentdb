@@ -4,8 +4,10 @@
 
 use std::sync::Arc;
 
+use agentdb_core::agent::NewAgent;
 use agentdb_core::artifact::NewArtifact;
-use agentdb_core::runtime::Runtime;
+use agentdb_core::runtime::{AppendRequest, FetchRequest, Runtime};
+use agentdb_core::session::NewSession;
 use agentdb_core::tenant::{NewTenant, Tenant};
 use agentdb_storage::{
     is_envelope_v2, AeadTenantKeyring, ContentBackend, DekCacheConfig, DisabledEnvelopeCrypto,
@@ -128,6 +130,140 @@ async fn identical_content_for_two_tenants_is_independent_ciphertext() {
         .await
         .unwrap();
     assert_ne!(raw_a, raw_b, "identical plaintext must not share ciphertext");
+}
+
+/// Every raw value in the KV store, so a test can prove a plaintext marker is
+/// absent from what actually lands on disk.
+fn raw_kv_values(kv: &Arc<dyn KvStore + Send + Sync>) -> Vec<Vec<u8>> {
+    kv.scan_prefix(b"")
+        .unwrap()
+        .map(|r| r.unwrap().1)
+        .collect()
+}
+
+fn marker_present(values: &[Vec<u8>], marker: &[u8]) -> bool {
+    values
+        .iter()
+        .any(|v| v.windows(marker.len()).any(|w| w == marker))
+}
+
+/// M3: event values (and artifact metadata rows) are sealed before the KV
+/// write, so the plaintext marker never appears in a raw KV value, and events
+/// round-trip back through the runtime.
+#[tokio::test]
+async fn event_and_metadata_values_are_encrypted_on_disk() {
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+    let content: Arc<dyn ContentBackend> = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv_content_and_keyring(kv.clone(), content, envelope_keyring());
+
+    let t = fresh_tenant(&rt, "evt").await;
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: Some("agent".into()),
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let s = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: Some("session".into()),
+        })
+        .await
+        .unwrap();
+
+    const MARKER: &str = "SECRET-EVENT-MARKER-a1b2c3d4";
+    rt.append(AppendRequest::simple(
+        &t,
+        &a,
+        &s,
+        "message",
+        serde_json::json!({ "text": MARKER }),
+    ))
+    .await
+    .unwrap();
+
+    // The marker is nowhere in the raw KV bytes (event value is sealed).
+    let values = raw_kv_values(&kv);
+    assert!(
+        !marker_present(&values, MARKER.as_bytes()),
+        "plaintext event marker leaked into a raw KV value"
+    );
+
+    // The event round-trips back through the runtime with its payload intact.
+    let events = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: t.tenant_id.clone(),
+            session_id: s.session_id.clone(),
+            from_seq: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload["text"], MARKER);
+}
+
+/// M3 mixed reader: an envelope-enabled runtime reads legacy plaintext event
+/// values written earlier by a disabled runtime, and can then append new
+/// (encrypted) events alongside them.
+#[tokio::test]
+async fn envelope_runtime_reads_legacy_plaintext_events() {
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+
+    let disabled = Runtime::with_kv_content_and_keyring(
+        kv.clone(),
+        Arc::new(InMemoryContentBackend::default()) as Arc<dyn ContentBackend>,
+        Arc::new(DisabledEnvelopeCrypto),
+    );
+    let t = fresh_tenant(&disabled, "mixevt").await;
+    let a = disabled
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let s = disabled
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+    disabled
+        .append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "message",
+            serde_json::json!({ "text": "legacy" }),
+        ))
+        .await
+        .unwrap();
+
+    // A fresh envelope-enabled runtime hydrates from the same KV and reads the
+    // legacy plaintext event.
+    let enveloped = Runtime::with_kv_content_and_keyring(
+        kv,
+        Arc::new(InMemoryContentBackend::default()) as Arc<dyn ContentBackend>,
+        envelope_keyring(),
+    );
+    let events = enveloped
+        .fetch_from_seq(FetchRequest {
+            tenant_id: t.tenant_id.clone(),
+            session_id: s.session_id.clone(),
+            from_seq: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload["text"], "legacy");
 }
 
 /// A disabled→enabled rollout stays readable: an envelope-enabled runtime reads

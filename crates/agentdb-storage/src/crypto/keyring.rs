@@ -220,6 +220,11 @@ struct CachedDek {
 
 struct DekCache {
     entries: HashMap<CacheKey, CachedDek>,
+    /// The *active* (write) DEK per (tenant, purpose). Kept separate because the
+    /// seal path does not know the active version up front — this lets a seal
+    /// hit the cache instead of calling the provider (and re-deriving the key)
+    /// on every write.
+    active: HashMap<(String, KeyPurpose), CachedDek>,
     ttl: Duration,
     max_entries: usize,
 }
@@ -228,6 +233,7 @@ impl DekCache {
     fn new(cfg: DekCacheConfig) -> Self {
         Self {
             entries: HashMap::new(),
+            active: HashMap::new(),
             ttl: Duration::from_millis(cfg.ttl_ms),
             max_entries: cfg.max_entries.max(1),
         }
@@ -240,6 +246,17 @@ impl DekCache {
             }
         }
         self.entries.remove(key);
+        None
+    }
+
+    fn get_active(&mut self, tenant_id: &str, purpose: KeyPurpose) -> Option<DekLease> {
+        let key = (tenant_id.to_string(), purpose);
+        if let Some(entry) = self.active.get(&key) {
+            if entry.inserted.elapsed() <= self.ttl {
+                return Some(entry.lease.clone());
+            }
+        }
+        self.active.remove(&key);
         None
     }
 
@@ -265,8 +282,19 @@ impl DekCache {
         );
     }
 
+    fn insert_active(&mut self, tenant_id: &str, purpose: KeyPurpose, lease: DekLease) {
+        self.active.insert(
+            (tenant_id.to_string(), purpose),
+            CachedDek {
+                lease,
+                inserted: Instant::now(),
+            },
+        );
+    }
+
     fn invalidate_tenant(&mut self, tenant_id: &str) {
         self.entries.retain(|(tenant, _, _), _| tenant != tenant_id);
+        self.active.retain(|(tenant, _), _| tenant != tenant_id);
     }
 }
 
@@ -292,12 +320,23 @@ impl AeadTenantKeyring {
         tenant_id: &str,
         purpose: KeyPurpose,
     ) -> Result<DekLease, CryptoError> {
-        let lease = self.provider.active_dek(tenant_id, purpose)?;
-        let key = (tenant_id.to_string(), purpose, lease.meta.version);
-        self.cache
+        if let Some(lease) = self
+            .cache
             .lock()
             .expect("dek cache poisoned")
-            .insert(key, lease.clone());
+            .get_active(tenant_id, purpose)
+        {
+            return Ok(lease);
+        }
+        // Cache miss: derive/unwrap from the provider once, then cache it under
+        // both the active slot and its explicit version.
+        let lease = self.provider.active_dek(tenant_id, purpose)?;
+        let mut cache = self.cache.lock().expect("dek cache poisoned");
+        cache.insert_active(tenant_id, purpose, lease.clone());
+        cache.insert(
+            (tenant_id.to_string(), purpose, lease.meta.version),
+            lease.clone(),
+        );
         Ok(lease)
     }
 
