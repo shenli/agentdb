@@ -461,6 +461,14 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         print_dev_bootstrap(&runtime, &config, bootstrap).await?;
     }
 
+    // Metadata self-hosting: bootstrap the reserved system tenant (holds
+    // bearer tokens, session locators, and the tenant registry as records).
+    // Best-effort here — a replicated follower creates it lazily once a
+    // leader exists; every sysmeta write path ensures it too.
+    if let Err(error) = runtime.ensure_system_tenant().await {
+        tracing::warn!(?error, "system tenant bootstrap deferred");
+    }
+
     let mut state = agentdb_api::AppState::new(runtime.clone())
         .with_auth_meta(auth_meta)
         .with_proxy_policy(agentdb_api::state::ProxyPolicy {
@@ -584,6 +592,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     if let Some(startup) = route_startup {
         spawn_route_snapshot_refresher(
             startup.meta.clone(),
+            runtime.clone(),
             startup.routing.clone(),
             config.route_shard_count,
             route_location.clone(),
@@ -2467,11 +2476,13 @@ fn init_config(opts: InitConfigOpts) -> anyhow::Result<()> {
 
 async fn load_route_snapshot(
     meta: &agentdb_meta::MetaStore,
+    runtime: Option<&Arc<agentdb_core::Runtime>>,
     shard_count: i64,
     route_location: Option<String>,
 ) -> agentdb_meta::MetaResult<agentdb_api::routing_http::RouteSnapshot> {
     agentdb_api::routing_http::RouteSnapshot::load_from_meta(
         meta,
+        runtime,
         shard_count,
         route_location,
         agentdb_meta::routing::ResidencyPolicy::default(),
@@ -2504,7 +2515,8 @@ async fn prepare_route_startup(
     };
     let meta = agentdb_meta::MetaStore::open_from_env().await?;
     let scheduler_status = agentdb_api::state::SchedulerStatus::new();
-    let snapshot = load_route_snapshot(&meta, config.route_shard_count, route_location).await?;
+    let snapshot =
+        load_route_snapshot(&meta, None, config.route_shard_count, route_location).await?;
     let routing = agentdb_api::routing_http::RouteRuntime::snapshot(node_id, snapshot);
     let raft_bootstrap = if let Some(registry) = raft_registry {
         let raft_engine_root = config.data_dir.join("raft-engine");
@@ -2678,6 +2690,25 @@ async fn refresh_raft_rs_peer_urls(
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
 ) -> anyhow::Result<()> {
     let peer_urls = load_raft_rs_peer_urls(meta, registry.tablet_ids()).await?;
+    // A shrinking or empty peer map on a node with registered groups means
+    // the outbox is about to strand every outbound message — surface it.
+    static LAST_PEER_URL_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let previous = LAST_PEER_URL_COUNT.swap(peer_urls.len(), std::sync::atomic::Ordering::Relaxed);
+    if previous != peer_urls.len() {
+        if peer_urls.is_empty() && !registry.tablet_ids().is_empty() {
+            tracing::warn!(
+                tablets = registry.tablet_ids().len(),
+                "raft-rs peer URL map is empty with registered tablet groups"
+            );
+        } else {
+            tracing::info!(
+                peers = peer_urls.len(),
+                previous = if previous == usize::MAX { 0 } else { previous },
+                "raft-rs peer URL map updated"
+            );
+        }
+    }
     outbox.replace_peer_urls(peer_urls);
     Ok(())
 }
@@ -2698,17 +2729,26 @@ fn spawn_raft_rs_peer_url_refresher(
     );
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(refresh_interval_ms));
+        // See spawn_raft_rs_registry_refresher: debounce notification
+        // bursts; the periodic tick guarantees eventual convergence.
+        let debounce = Duration::from_millis((refresh_interval_ms / 4).clamp(100, 1_000));
+        let mut last_refresh = tokio::time::Instant::now() - debounce;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    last_refresh = tokio::time::Instant::now();
                     if let Err(error) = refresh_raft_rs_peer_urls(&meta, &registry, &outbox).await {
                         tracing::warn!(?error, "failed to refresh raft-rs peer URLs");
                     }
                 }
                 change = changes.recv() => {
                     match change {
+                        Some(change) if last_refresh.elapsed() < debounce => {
+                            tracing::trace!(channel = ?change.channel, "raft-rs peer metadata change debounced");
+                        }
                         Some(change) => {
                             tracing::debug!(channel = ?change.channel, payload = %change.payload, "raft-rs peer metadata change received");
+                            last_refresh = tokio::time::Instant::now();
                             if let Err(error) = refresh_raft_rs_peer_urls(&meta, &registry, &outbox).await {
                                 tracing::warn!(?error, "failed to refresh raft-rs peer URLs");
                             }
@@ -2768,8 +2808,13 @@ fn spawn_raft_rs_tick_worker(
     // Task B: failover evaluation. This one is legitimately SQL-driven
     // (owner/leader liveness comes from the control plane); a slow metadata
     // database now only delays failover detection, never the raft clock.
+    // It runs on its own second-scale cadence, NOT the raft tick: liveness
+    // thresholds are multi-second, and polling three full-table loads at
+    // tick cadence is the "control-plane query amplified to hot-loop
+    // cadence" defect the S8 statement budget guards against.
+    let failover_interval = interval.max(Duration::from_secs(1));
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        let mut ticker = tokio::time::interval(failover_interval);
         loop {
             ticker.tick().await;
             let tablets_by_id = match agentdb_meta::tablets::list_all(meta.pool()).await {
@@ -3177,6 +3222,7 @@ async fn flush_raft_rs_group_messages_with_health(
     }
     let mut sent = 0usize;
     let mut failed = Vec::new();
+    let mut first_send_error: Option<String> = None;
     // Latest observed health per peer this tick. The send loop itself must
     // stay free of SQL: two round trips per raft message turned retransmit
     // bursts into a self-amplifying control-plane storm (slow DB -> stalled
@@ -3197,11 +3243,26 @@ async fn flush_raft_rs_group_messages_with_health(
                     ?error,
                     "deferred raft-rs message to unreachable peer"
                 );
+                if first_send_error.is_none() {
+                    first_send_error = Some(format!("{error:?}"));
+                }
                 failed.push(messages[index].clone());
             }
         }
     }
     if !failed.is_empty() {
+        // Aggregate to one warn per flush: per-message failures log at
+        // debug, which made a fleet-wide delivery outage invisible at the
+        // default level.
+        let targets: BTreeSet<u64> = failed.iter().map(|message| message.to).collect();
+        tracing::warn!(
+            tablet_id,
+            failed = failed.len(),
+            sent,
+            ?targets,
+            first_error = first_send_error.as_deref().unwrap_or("unknown"),
+            "raft-rs message delivery failed this flush; messages restored to outbox"
+        );
         group.restore_wire_messages(failed)?;
     }
     // Health reporting is advisory (it feeds failover candidate selection);
@@ -3686,17 +3747,28 @@ fn spawn_raft_rs_registry_refresher(
     );
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(refresh_interval_ms));
+        // Notifications only shrink reaction latency below the periodic
+        // interval; a burst must not multiply full reloads. Skip
+        // change-triggered syncs inside the debounce window — the
+        // periodic tick guarantees eventual convergence.
+        let debounce = Duration::from_millis((refresh_interval_ms / 4).clamp(100, 1_000));
+        let mut last_sync = tokio::time::Instant::now() - debounce;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    last_sync = tokio::time::Instant::now();
                     if let Err(error) = sync_raft_rs_registry_and_runtime(&meta, &local_node_id, &raft_engine_root, registry.clone(), runtime.clone()).await {
                         tracing::warn!(?error, "failed to sync raft-rs registry");
                     }
                 }
                 change = changes.recv() => {
                     match change {
+                        Some(change) if last_sync.elapsed() < debounce => {
+                            tracing::trace!(channel = ?change.channel, "raft-rs replica metadata change debounced");
+                        }
                         Some(change) => {
                             tracing::debug!(channel = ?change.channel, payload = %change.payload, "raft-rs replica metadata change received");
+                            last_sync = tokio::time::Instant::now();
                             if let Err(error) = sync_raft_rs_registry_and_runtime(&meta, &local_node_id, &raft_engine_root, registry.clone(), runtime.clone()).await {
                                 tracing::warn!(?error, "failed to sync raft-rs registry");
                             }
@@ -3717,6 +3789,7 @@ fn spawn_raft_rs_registry_refresher(
 
 fn spawn_route_snapshot_refresher(
     meta: agentdb_meta::MetaStore,
+    runtime: Arc<agentdb_core::Runtime>,
     routing: agentdb_api::routing_http::RouteRuntime,
     shard_count: i64,
     route_location: Option<String>,
@@ -3729,22 +3802,32 @@ fn spawn_route_snapshot_refresher(
             agentdb_meta::change_notifier::Channel::Shards,
             agentdb_meta::change_notifier::Channel::Nodes,
             agentdb_meta::change_notifier::Channel::Tablets,
-            agentdb_meta::change_notifier::Channel::SessionLocators,
         ],
     );
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_millis(refresh_interval_ms));
+        // See spawn_raft_rs_registry_refresher: change notifications are a
+        // latency hint, not a reload-per-event contract. Debounce bursts;
+        // the periodic tick guarantees eventual convergence.
+        let debounce =
+            std::time::Duration::from_millis((refresh_interval_ms / 4).clamp(100, 1_000));
+        let mut last_refresh = tokio::time::Instant::now() - debounce;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    refresh_route_snapshot(&meta, &routing, shard_count, route_location.clone()).await;
+                    last_refresh = tokio::time::Instant::now();
+                    refresh_route_snapshot(&meta, &runtime, &routing, shard_count, route_location.clone()).await;
                 }
                 change = changes.recv() => {
                     match change {
+                        Some(change) if last_refresh.elapsed() < debounce => {
+                            tracing::trace!(channel = ?change.channel, "route metadata change debounced");
+                        }
                         Some(change) => {
                             tracing::debug!(channel = ?change.channel, payload = %change.payload, "route metadata change received");
-                            refresh_route_snapshot(&meta, &routing, shard_count, route_location.clone()).await;
+                            last_refresh = tokio::time::Instant::now();
+                            refresh_route_snapshot(&meta, &runtime, &routing, shard_count, route_location.clone()).await;
                         }
                         None => {
                             tracing::warn!("route metadata change stream closed; continuing with periodic refresh");
@@ -3754,7 +3837,6 @@ fn spawn_route_snapshot_refresher(
                                     agentdb_meta::change_notifier::Channel::Shards,
                                     agentdb_meta::change_notifier::Channel::Nodes,
                                     agentdb_meta::change_notifier::Channel::Tablets,
-                                    agentdb_meta::change_notifier::Channel::SessionLocators,
                                 ],
                             );
                         }
@@ -5790,11 +5872,12 @@ async fn tablet_movement_destination_ready(
 
 async fn refresh_route_snapshot(
     meta: &agentdb_meta::MetaStore,
+    runtime: &Arc<agentdb_core::Runtime>,
     routing: &agentdb_api::routing_http::RouteRuntime,
     shard_count: i64,
     route_location: Option<String>,
 ) {
-    match load_route_snapshot(meta, shard_count, route_location).await {
+    match load_route_snapshot(meta, Some(runtime), shard_count, route_location).await {
         Ok(snapshot) => {
             routing.refresh_snapshot(snapshot);
             tracing::debug!("refreshed route snapshot");
@@ -5841,8 +5924,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 mod tests {
     use super::*;
     use agentdb_meta::{
-        node_operational, nodes, tablet_movements, tablet_ranges,
-        tablets, MetaStore,
+        node_operational, nodes, tablet_movements, tablet_ranges, tablets, MetaStore,
     };
     use agentdb_storage::ReplicatedLog;
 

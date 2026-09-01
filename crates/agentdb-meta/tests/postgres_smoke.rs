@@ -16,9 +16,7 @@
 use std::time::Duration;
 
 use agentdb_meta::change_notifier::{subscribe, Channel};
-use agentdb_meta::{
-    admin_tokens, node_operational, nodes, session_locators, tenants, MetaStore,
-};
+use agentdb_meta::{node_operational, nodes, MetaStore};
 
 fn pg_url() -> Option<String> {
     std::env::var("AGENTDB_TEST_PG_URL").ok()
@@ -84,11 +82,9 @@ async fn pg_migrations_apply_cleanly() {
     let names: Vec<String> = rows.into_iter().map(|(n,)| n).collect();
     for expected in [
         "admin_audit",
-        "admin_tokens",
         "config",
         "nodes",
         "schema_migrations",
-        "session_locators",
         "scheduler_leader",
         "session_overrides",
         "shards",
@@ -128,29 +124,6 @@ async fn pg_reopen_is_idempotent() {
 }
 
 #[tokio::test]
-async fn pg_admin_token_roundtrip() {
-    let Some(url) = pg_url() else {
-        return;
-    };
-    cleanup_schema(&url).await;
-    let store = MetaStore::open_postgres(&url).await.unwrap();
-    let minted = admin_tokens::mint(store.pool(), "alice", admin_tokens::AdminScope::Admin, 1000)
-        .await
-        .unwrap();
-    let v = admin_tokens::verify(store.pool(), &minted.plaintext)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(v.token_id, minted.token_id);
-    assert_eq!(v.scope, admin_tokens::AdminScope::Admin);
-
-    let active = admin_tokens::list_active(store.pool()).await.unwrap();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].description, "alice");
-    cleanup_schema(&url).await;
-}
-
-#[tokio::test]
 async fn pg_listen_notify_delivers_a_node_change() {
     let Some(url) = pg_url() else {
         return;
@@ -181,41 +154,6 @@ async fn pg_listen_notify_delivers_a_node_change() {
         .expect("sender closed");
     assert_eq!(evt.channel, Channel::Nodes);
     assert_eq!(evt.payload, "pg-notify-test");
-
-    cleanup_schema(&url).await;
-}
-
-#[tokio::test]
-async fn pg_listen_notify_delivers_a_session_locator_change() {
-    let Some(url) = pg_url() else {
-        return;
-    };
-    cleanup_schema(&url).await;
-    let store = MetaStore::open_postgres(&url).await.unwrap();
-    let tenant = tenants::get_or_create(store.pool(), "ten_1", 10)
-        .await
-        .unwrap();
-    let mut rx = subscribe(&store, &[Channel::SessionLocators]);
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    session_locators::upsert(
-        store.pool(),
-        "pg-session-notify-test",
-        tenant.internal_id,
-        "ten_1",
-        Some(7),
-        0,
-        10,
-    )
-    .await
-    .unwrap();
-
-    let evt = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-        .await
-        .expect("no NOTIFY delivered within 3s")
-        .expect("sender closed");
-    assert_eq!(evt.channel, Channel::SessionLocators);
-    assert_eq!(evt.payload, "pg-session-notify-test");
 
     cleanup_schema(&url).await;
 }

@@ -460,37 +460,51 @@ impl RaftRsSharedGroup {
                 )));
             }
         }
-        let started_at = Instant::now();
-        let mut proposed_after = None;
-        loop {
-            let maybe_commit = {
-                let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
-                group.validate_append_target(node_id, tablet_id)?;
-                let previous_applied_index = match proposed_after {
-                    Some(index) => index,
-                    None => {
-                        let previous_applied_index = group.node(node_id)?.last_applied_index;
-                        group
-                            .node_mut(node_id)?
-                            .raw
-                            .propose(Vec::new(), command.clone())
-                            .map_err(map_raft_error)?;
-                        proposed_after = Some(previous_applied_index);
-                        previous_applied_index
-                    }
+        // The commit wait below blocks the calling thread for up to
+        // APPEND_WAIT_TIMEOUT. When that thread is a tokio worker, tell the
+        // runtime so it can shift queued tasks (ingress handlers, the
+        // message outbox, the accept loop) to other workers — a handful of
+        // concurrent replicated writes must not freeze the async runtime
+        // that raft message delivery itself depends on.
+        let wait_for_commit = || -> Result<LogCommit> {
+            let started_at = Instant::now();
+            let mut proposed_after = None;
+            loop {
+                let maybe_commit = {
+                    let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
+                    group.validate_append_target(node_id, tablet_id)?;
+                    let previous_applied_index = match proposed_after {
+                        Some(index) => index,
+                        None => {
+                            let previous_applied_index = group.node(node_id)?.last_applied_index;
+                            group
+                                .node_mut(node_id)?
+                                .raw
+                                .propose(Vec::new(), command.clone())
+                                .map_err(map_raft_error)?;
+                            proposed_after = Some(previous_applied_index);
+                            previous_applied_index
+                        }
+                    };
+                    group.drive_until_idle()?;
+                    group.find_committed_after(node_id, tablet_id, previous_applied_index)?
                 };
-                group.drive_until_idle()?;
-                group.find_committed_after(node_id, tablet_id, previous_applied_index)?
-            };
-            if let Some(commit) = maybe_commit {
-                return Ok(commit);
+                if let Some(commit) = maybe_commit {
+                    return Ok(commit);
+                }
+                if started_at.elapsed() >= APPEND_WAIT_TIMEOUT {
+                    return Err(Error::Other(format!(
+                        "raft-rs command did not commit for tablet {tablet_id} before timeout"
+                    )));
+                }
+                thread::sleep(APPEND_WAIT_POLL);
             }
-            if started_at.elapsed() >= APPEND_WAIT_TIMEOUT {
-                return Err(Error::Other(format!(
-                    "raft-rs command did not commit for tablet {tablet_id} before timeout"
-                )));
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(wait_for_commit)
             }
-            thread::sleep(APPEND_WAIT_POLL);
+            _ => wait_for_commit(),
         }
     }
 

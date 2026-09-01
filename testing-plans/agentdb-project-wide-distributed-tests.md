@@ -972,6 +972,27 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
   split (seed helpers mirror the old one-call shape); S8 + S9 real-cluster
   smokes re-run against the new plumbing.
 
+### Metadata self-hosting stages 2-3 (2026-09-01)
+
+- Bearer tokens, session locators, and the cluster tenant registry are
+  system-tenant records (`agentdb_api::sysmeta`); the SQL tables are
+  dropped by migration 028 (no data migration: pre-users).
+- In-process suite `api_sysmeta.rs`: token mint/verify/revoke/count
+  round-trip through records; insert-if-absent locator semantics with
+  per-tenant cascade delete; idempotent tenant registry; the system
+  tenant is hidden from listings, uncreatable, and every HTTP request
+  targeting it is refused with 403 before routing.
+- S16-M (inside S16): a bearer token minted before the covered point must
+  authenticate against the node rebuilt by `restore-from-bucket`, and the
+  restored instance must be CLOSED to unauthenticated traffic (the token
+  record survived) — metadata rides the same recovery manifests as data.
+- S8 statement budget: all nodes run with `sqlx::query=debug`; the
+  harness sums logged statements across the run and fails above a fleet
+  budget calibrated ~2.5x over the healthy baseline — the standing
+  tripwire for the "hot loop one await away from SQL" defect class. Its
+  first run caught two live instances (notify triggers firing per
+  heartbeat touch; failover evaluation polling at raft-tick cadence).
+
 ## 7b. Coverage adequacy argument
 
 | Claim | Threat model (how it could fail) | Scenarios that exercise the threats | Why these are sufficient |

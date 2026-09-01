@@ -40,9 +40,8 @@ use agentdb_core::{
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
 use agentdb_meta::{
-    admin_tokens, cells, nodes, placement_scopes, session_locators, tablet_movements,
-    tablet_ranges, tablet_rebalance, tablet_replicas, tablet_snapshots, tablet_stats, tablets,
-    tenant_policies, tenants,
+    cells, nodes, placement_scopes, tablet_movements, tablet_ranges, tablet_rebalance,
+    tablet_replicas, tablet_snapshots, tablet_stats, tablets, tenant_policies,
 };
 
 use crate::dto::{
@@ -408,7 +407,7 @@ async fn health_ready(State(s): State<AppState>) -> StatusCode {
 struct MintAdminTokenBody {
     description: String,
     #[serde(default)]
-    scope: admin_tokens::AdminScope,
+    scope: crate::sysmeta::AdminScope,
     #[serde(default)]
     tenant_id: Option<String>,
 }
@@ -419,7 +418,7 @@ struct MintAdminTokenResponse {
     token: String,
     description: String,
     created_at_ms: i64,
-    scope: admin_tokens::AdminScope,
+    scope: crate::sysmeta::AdminScope,
     #[serde(skip_serializing_if = "Option::is_none")]
     tenant_id: Option<String>,
 }
@@ -434,9 +433,8 @@ async fn mint_admin_token(
             "admin token description must contain 1 to 256 characters",
         ));
     }
-    let meta = auth_meta_required(&s)?;
     let tenant_id = match (body.scope, body.tenant_id.as_deref()) {
-        (admin_tokens::AdminScope::Tenant, Some(tenant_id)) => {
+        (crate::sysmeta::AdminScope::Tenant, Some(tenant_id)) => {
             let tenant_id = tenant_id.trim();
             if tenant_id.is_empty() || tenant_id.len() > 128 {
                 return Err(invalid_admin_request("tenant_id is malformed"));
@@ -451,7 +449,7 @@ async fn mint_admin_token(
             s.runtime.get_tenant(&tid).await?;
             Some(tenant_id.to_string())
         }
-        (admin_tokens::AdminScope::Tenant, None) => {
+        (crate::sysmeta::AdminScope::Tenant, None) => {
             return Err(invalid_admin_request(
                 "tenant-scoped tokens require a tenant_id",
             ));
@@ -464,15 +462,14 @@ async fn mint_admin_token(
         (_, None) => None,
     };
     let now_ms = i64::try_from(current_ms()).unwrap_or(i64::MAX);
-    let minted = admin_tokens::mint_scoped(
-        meta.pool(),
+    let minted = crate::sysmeta::mint_token(
+        &s.runtime,
         description,
         body.scope,
         tenant_id.as_deref(),
         now_ms,
     )
-    .await
-    .map_err(internal_error)?;
+    .await?;
     s.auth_cache.invalidate();
     Ok((
         StatusCode::CREATED,
@@ -513,13 +510,8 @@ async fn get_me(
 
 async fn list_admin_tokens(
     State(s): State<AppState>,
-) -> Result<Json<Vec<admin_tokens::TokenSummary>>, ApiError> {
-    let meta = auth_meta_required(&s)?;
-    Ok(Json(
-        admin_tokens::list_active(meta.pool())
-            .await
-            .map_err(internal_error)?,
-    ))
+) -> Result<Json<Vec<crate::sysmeta::TokenSummary>>, ApiError> {
+    Ok(Json(crate::sysmeta::list_active_tokens(&s.runtime).await?))
 }
 
 async fn revoke_admin_token(
@@ -529,11 +521,8 @@ async fn revoke_admin_token(
     if token_id.trim().is_empty() || token_id.len() > 64 {
         return Err(invalid_admin_request("admin token_id is malformed"));
     }
-    let meta = auth_meta_required(&s)?;
     let now_ms = i64::try_from(current_ms()).unwrap_or(i64::MAX);
-    let revoked = admin_tokens::revoke(meta.pool(), &token_id, now_ms)
-        .await
-        .map_err(internal_error)?;
+    let revoked = crate::sysmeta::revoke_token(&s.runtime, &token_id, now_ms).await?;
     s.auth_cache.invalidate();
     Ok(Json(serde_json::json!({
         "token_id": token_id,
@@ -2218,15 +2207,6 @@ fn meta_required(s: &AppState) -> Result<&agentdb_meta::MetaStore, ApiError> {
         ApiError(agentdb_core::Error::new(
             ErrorCode::KeyUnavailable,
             "metadata-backed cluster admin is not configured on this node",
-        ))
-    })
-}
-
-fn auth_meta_required(s: &AppState) -> Result<&agentdb_meta::MetaStore, ApiError> {
-    s.auth_meta.as_ref().ok_or_else(|| {
-        ApiError(agentdb_core::Error::new(
-            ErrorCode::KeyUnavailable,
-            "admin token metadata is not configured on this node",
         ))
     })
 }
@@ -7299,49 +7279,46 @@ async fn record_session_locator(
     session_id: &Id,
     route_headers: &HeaderMap,
 ) -> Result<(), ApiError> {
-    let Some(meta) = state.meta.as_ref() else {
+    if state.meta.is_none() {
         return Ok(());
-    };
+    }
     let (Some(tablet_id), Some(shard_id)) = (
         route_tablet_id(route_headers),
         route_shard_id(route_headers),
     ) else {
         return Ok(());
     };
-    let tenant = tenants::get_or_create(meta.pool(), tenant_id.as_str(), now_ms_i64())
-        .await
-        .map_err(internal_error)?;
-    session_locators::upsert(
-        meta.pool(),
+    let _ = crate::sysmeta::get_or_create_registered_tenant(
+        &state.runtime,
+        tenant_id.as_str(),
+        now_ms_i64(),
+    )
+    .await?;
+    crate::sysmeta::upsert_locator(
+        &state.runtime,
         session_id.as_str(),
-        tenant.internal_id,
         tenant_id.as_str(),
         Some(tablet_id),
         shard_id,
         now_ms_i64(),
     )
-    .await
-    .map_err(internal_error)?;
+    .await?;
     Ok(())
 }
 
 async fn delete_session_locator(state: &AppState, session_id: &Id) -> Result<(), ApiError> {
-    let Some(meta) = state.meta.as_ref() else {
+    if state.meta.is_none() {
         return Ok(());
-    };
-    session_locators::delete(meta.pool(), session_id.as_str())
-        .await
-        .map_err(internal_error)?;
+    }
+    crate::sysmeta::delete_locator(&state.runtime, session_id.as_str()).await?;
     Ok(())
 }
 
 async fn delete_tenant_session_locators(state: &AppState, tenant_id: &Id) -> Result<(), ApiError> {
-    let Some(meta) = state.meta.as_ref() else {
+    if state.meta.is_none() {
         return Ok(());
-    };
-    session_locators::delete_by_tenant_external(meta.pool(), tenant_id.as_str())
-        .await
-        .map_err(internal_error)?;
+    }
+    crate::sysmeta::delete_locators_by_tenant_external(&state.runtime, tenant_id.as_str()).await?;
     Ok(())
 }
 

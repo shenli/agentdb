@@ -16,8 +16,6 @@
 //! `VACUUM INTO`, `pg_dump`) branch on the [`MetaBackend`]
 //! discriminant.
 
-pub mod admin_tokens;
-pub mod audit;
 pub mod cells;
 pub mod change_notifier;
 pub mod config;
@@ -28,8 +26,6 @@ pub mod nodes;
 pub mod placement_scopes;
 pub mod routing;
 pub mod scheduler;
-pub mod session_locators;
-pub mod session_overrides;
 pub mod shards;
 pub mod tablet_movements;
 pub mod tablet_ranges;
@@ -39,8 +35,6 @@ pub mod tablet_snapshots;
 pub mod tablet_stats;
 pub mod tablets;
 pub mod tenant_policies;
-pub mod tenant_quotas;
-pub mod tenants;
 
 pub use error::{MetaError, MetaResult};
 
@@ -319,9 +313,18 @@ mod tests {
     #[tokio::test]
     async fn backup_produces_readable_standalone_file() {
         let (dir, src) = fresh_file_store().await;
-        admin_tokens::mint(src.pool(), "alice", admin_tokens::AdminScope::Admin, 1000)
-            .await
-            .unwrap();
+        nodes::upsert(
+            src.pool(),
+            "backup-node",
+            "addr",
+            None,
+            "alive",
+            1000,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let dest = dir.path().join("backup.sqlite");
         src.backup(&dest).await.unwrap();
@@ -330,9 +333,8 @@ mod tests {
         let restored = MetaStore::open_sqlite(&dest.to_string_lossy())
             .await
             .unwrap();
-        let active = admin_tokens::list_active(restored.pool()).await.unwrap();
-        assert_eq!(active.len(), 1, "restored store missing seeded token");
-        assert_eq!(active[0].description, "alice");
+        let node = nodes::get(restored.pool(), "backup-node").await.unwrap();
+        assert!(node.is_some(), "restored store missing seeded node");
 
         // Migrations already applied once; reopening must not
         // re-run them. We expect exactly MIGRATIONS.len() rows.

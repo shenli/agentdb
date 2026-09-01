@@ -11,7 +11,30 @@ use std::collections::BTreeMap;
 use crate::cells::DEFAULT_CELL_ID;
 use crate::nodes::Node;
 use crate::placement_scopes::{PlacementScope, DEFAULT_PLACEMENT_SCOPE_ID};
-use crate::session_locators::SessionLocator;
+// SessionLocator is canonical here (stage 2 of metadata self-hosting):
+// locator ROWS live as system-tenant records, but routing still plans over
+// this shape.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionLocator {
+    pub session_id: String,
+    /// **Informational only as of migration 012.** This is the
+    /// per-process `TenantRegistry`'s local id and not
+    /// guaranteed to be globally meaningful. Use
+    /// `tenant_external_id` for routing and auth.
+    pub tenant_internal_id: i64,
+    /// Globally-unique external tenant identity. Added by
+    /// migration 012 (M26 Phase 1b) and populated on mint
+    /// going forward; older rows have `None` and callers
+    /// should fall back to body-supplied `tenant_id` for those.
+    pub tenant_external_id: Option<String>,
+    /// `None` when the session is registered before its
+    /// hosting tablet is recorded (rare; typically only during
+    /// migration). Routing must fall back to tenant-hash when
+    /// absent rather than refuse the request.
+    pub tablet_id: Option<i64>,
+    pub shard_id: i32,
+    pub created_at_ms: i64,
+}
 use crate::shards::ShardRow;
 use crate::tablet_ranges::{range_override, TabletRange};
 use crate::tablets::Tablet;

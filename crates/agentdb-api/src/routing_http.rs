@@ -21,8 +21,8 @@ use agentdb_meta::{
     cells::{self, Cell},
     nodes::{self, Node},
     placement_scopes::{self, PlacementScope},
+    routing::SessionLocator,
     routing::{plan_route, ResidencyPolicy, RouteAction, RouteDecision, RouteReason, RouteRequest},
-    session_locators::{self, SessionLocator},
     shards::{self, ShardRow},
     tablet_ranges::{self, TabletRange},
     tablets::{self, Tablet},
@@ -583,11 +583,22 @@ impl RouteSnapshot {
 
     pub async fn load_from_meta(
         store: &MetaStore,
+        runtime: Option<&std::sync::Arc<agentdb_core::Runtime>>,
         shard_count: i64,
         request_location: Option<String>,
         policy: ResidencyPolicy,
     ) -> agentdb_meta::MetaResult<Self> {
         let pool = store.pool();
+        // Session locators are stage-2 self-hosted metadata: system-tenant
+        // records read through the in-process runtime, not SQL. The
+        // bootstrap snapshot (no runtime yet) starts locator-less; routing
+        // falls back to tenant-hash until the first refresh, by design.
+        let session_locators = match runtime {
+            Some(runtime) => crate::sysmeta::list_all_locators(runtime)
+                .await
+                .map_err(|e| agentdb_meta::MetaError::InvalidInput(format!("locators: {e:?}")))?,
+            None => Vec::new(),
+        };
         Ok(Self {
             shard_count,
             request_location,
@@ -598,7 +609,7 @@ impl RouteSnapshot {
             nodes: Arc::from(nodes::list_all(pool).await?),
             cells: Arc::from(cells::list_all(pool).await?),
             placement_scopes: Arc::from(placement_scopes::list_all(pool).await?),
-            session_locators: Arc::from(session_locators::list_all(pool).await?),
+            session_locators: Arc::from(session_locators),
             tenant_policies: Arc::from(tenant_policies::list_all(pool).await?),
         })
     }
@@ -1502,7 +1513,8 @@ mod tests {
         agentdb_meta::tablets::assume_ownership(pool, 7, 0, "node-a", i64::MAX)
             .await
             .unwrap();
-        agentdb_meta::session_locators::upsert(pool, "ses_1", 1, "ten_1", Some(7), 0, 100)
+        let runtime = agentdb_core::Runtime::in_memory();
+        crate::sysmeta::upsert_locator(&runtime, "ses_1", "ten_1", Some(7), 0, 100)
             .await
             .unwrap();
         agentdb_meta::tenant_policies::upsert(
@@ -1519,10 +1531,15 @@ mod tests {
         .await
         .unwrap();
 
-        let snapshot =
-            RouteSnapshot::load_from_meta(&store, 1, Some("us-west-2".into()), Default::default())
-                .await
-                .unwrap();
+        let snapshot = RouteSnapshot::load_from_meta(
+            &store,
+            Some(&runtime),
+            1,
+            Some("us-west-2".into()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(snapshot.shards.len(), 1);
         assert_eq!(snapshot.tablets.len(), 1);

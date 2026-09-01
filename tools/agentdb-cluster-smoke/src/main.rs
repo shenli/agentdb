@@ -356,7 +356,6 @@ async fn reset_cluster_meta(meta: &MetaStore) -> Result<()> {
         "tablet_movements",
         "tablet_replicas",
         "tablet_ranges",
-        "session_overrides",
         "shards",
         "tablets",
         "nodes",
@@ -531,6 +530,20 @@ async fn seed_tablet_meta(
 }
 
 fn spawn_nodes(args: &Args, nodes: &[NodeSpec]) -> Result<Vec<Child>> {
+    // Preflight: every node port must be bindable BEFORE any child starts.
+    // A stale node from an earlier run answers health checks convincingly
+    // while pointing at torn-down dependencies — the run then debugs like a
+    // raft bug instead of a dirty environment.
+    for node in nodes {
+        let addr = format!("127.0.0.1:{}", node.port);
+        std::net::TcpListener::bind(&addr).with_context(|| {
+            format!(
+                "node port {addr} is already in use; a stale agentdb process \
+                 from a previous run is likely still alive (fix: pkill -f \
+                 'agentdb serve'; pkill -f agentdb-cluster-smoke)"
+            )
+        })?;
+    }
     let mut children = Vec::new();
     for node in nodes {
         children.push(spawn_node(args, node)?);
@@ -3660,6 +3673,16 @@ async fn delete_record_retry(
         );
         match delete_record(client, &owner.url, tenant_id, record_id).await {
             Ok(()) => return Ok(()),
+            // A delete retried after a commit-timeout may find the record
+            // already gone: the first attempt committed after its ack was
+            // lost. Idempotent convergence — the record IS deleted.
+            Err(error) if attempt > 0 && format!("{error:?}").contains("RECORD_NOT_FOUND") => {
+                eprintln!(
+                    "record-index: delete converged on retry {} (record already gone)",
+                    attempt + 1
+                );
+                return Ok(());
+            }
             Err(error)
                 if is_retryable_cluster_convergence_error(&error)
                     && attempt + 1 < APPEND_RECOVERY_ATTEMPTS =>

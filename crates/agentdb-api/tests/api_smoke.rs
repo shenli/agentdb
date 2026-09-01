@@ -35,8 +35,8 @@ use agentdb_core::{
     RUNTIME_PRIMARY_TABLET_ID,
 };
 use agentdb_meta::{
-    cells, node_operational, nodes::Node, placement_scopes, session_locators,
-    tablet_snapshots, tablets, tablets::Tablet, MetaStore,
+    cells, node_operational, nodes::Node, placement_scopes, tablet_snapshots, tablets,
+    tablets::Tablet, MetaStore,
 };
 use agentdb_storage::{
     AsyncMirrorContentBackend, ContentBackend, GroupedRocksDbTabletStore, InMemoryContentBackend,
@@ -717,7 +717,7 @@ async fn create_session_routes_to_owner_and_records_session_locator() {
     let session: serde_json::Value = response.json().await.unwrap();
     let sid = session["session_id"].as_str().unwrap();
 
-    let locator = session_locators::get(meta.pool(), sid)
+    let locator = agentdb_api::sysmeta::get_locator(&local.runtime, sid)
         .await
         .unwrap()
         .expect("session locator");
@@ -782,7 +782,7 @@ async fn session_locator_lifecycle_tracks_fork_delete_and_tenant_delete() {
         .await
         .unwrap();
     let sid = s["session_id"].as_str().unwrap().to_string();
-    assert!(session_locators::get(meta.pool(), &sid)
+    assert!(agentdb_api::sysmeta::get_locator(&app.runtime, &sid)
         .await
         .unwrap()
         .is_some());
@@ -820,7 +820,7 @@ async fn session_locator_lifecycle_tracks_fork_delete_and_tenant_delete() {
         .await
         .unwrap();
     let child_sid = child["session_id"].as_str().unwrap().to_string();
-    let child_locator = session_locators::get(meta.pool(), &child_sid)
+    let child_locator = agentdb_api::sysmeta::get_locator(&app.runtime, &child_sid)
         .await
         .unwrap()
         .expect("forked session locator");
@@ -837,11 +837,11 @@ async fn session_locator_lifecycle_tracks_fork_delete_and_tenant_delete() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    assert!(session_locators::get(meta.pool(), &sid)
+    assert!(agentdb_api::sysmeta::get_locator(&app.runtime, &sid)
         .await
         .unwrap()
         .is_none());
-    assert!(session_locators::get(meta.pool(), &child_sid)
+    assert!(agentdb_api::sysmeta::get_locator(&app.runtime, &child_sid)
         .await
         .unwrap()
         .is_some());
@@ -853,7 +853,7 @@ async fn session_locator_lifecycle_tracks_fork_delete_and_tenant_delete() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    assert!(session_locators::get(meta.pool(), &child_sid)
+    assert!(agentdb_api::sysmeta::get_locator(&app.runtime, &child_sid)
         .await
         .unwrap()
         .is_none());
