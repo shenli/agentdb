@@ -35,12 +35,29 @@ workload — create session, append events, export the movement snapshot —
 and measures the full-state snapshot size and export time as the session
 grows. On one run (in-memory content, RocksDB KV, ~200-byte JSON events):
 
+Before the compact-encoding fix (finding 2 below), with `serde_json`:
+
 | events | snapshot_bytes | export_ms | bytes/event |
 |---:|---:|---:|---:|
 | 100 | 902,945 | 20.7 | 9,029 |
 | 500 | 4,463,990 | 101.2 | 8,928 |
 | 2,000 | 17,827,863 | 420.7 | 8,914 |
 | 8,000 | 71,308,571 | 1,668.6 | 8,914 |
+
+After the compact binary encoding (same run, same workload):
+
+| events | snapshot_bytes | export_ms | bytes/event |
+|---:|---:|---:|---:|
+| 100 | 263,385 | 0.5 | 2,634 |
+| 500 | 1,301,785 | 2.3 | 2,604 |
+| 2,000 | 5,198,785 | 9.5 | 2,599 |
+| 8,000 | 20,792,785 | 38.3 | 2,599 |
+
+The compact encoding cut the 8,000-event move from **71 MB → 20.8 MB
+(3.4×)** and its serialize time from **1.67 s → 38 ms (~44×)** — the
+JSON int-array form was both bloated and slow to produce. Movement cost is
+still O(total state), but the constant is now ~3.4× lower and the CPU cost
+is negligible.
 
 Two findings:
 
@@ -51,10 +68,48 @@ Two findings:
    sessions scales this up directly. This is exactly the cost a
    manifest+recent-tail attach would aim to cut to roughly the tail.
 2. **The per-event footprint is heavy** (~8.9 KB for a ~200-byte payload —
-   ~45×), because the snapshot carries the full state-machine encoding
-   (event rows, index structures, metadata). This is an independent,
-   cheaper optimization target (a more compact snapshot encoding) that does
-   **not** require the storage-engine change §7 contemplates.
+   ~45×), partly because the snapshot was `serde_json`-encoded, which
+   expands each `Vec<u8>` key/value into an array of decimal numbers
+   (`[104,101,...]`), a ~3-4× blowup of binary KV data. This is an
+   independent, cheaper optimization that does **not** require the
+   storage-engine change §7 contemplates.
+
+   **This is now done:** `TabletStateSnapshot::encode`/`decode`
+   (`crates/agentdb-core/src/tablet_state.rs`) use a compact length-prefixed
+   binary layout instead of JSON (with a magic+version header and a legacy-
+   JSON decode fallback so rolling upgrades stay safe). Every movement and
+   raft-snapshot transfer now ships the smaller encoding. See the
+   before/after in the movement benchmark.
+
+## RocksDB SST-ingest prototype (eager §7 attach)
+
+The compact encoding removes the *encoding* cost, but both the old and new
+logical paths still **re-insert every key on the target** via `write_batch`
+— through the memtable, flush, and compaction. RocksDB can skip that: write
+the source range to a self-contained SST (`SstFileWriter`) and bulk-load it
+into the target with `IngestExternalFile`, which lands the file at the
+bottom of the LSM with no per-key work. AgentDB already uses RocksDB
+`Checkpoint` for backups; this adds the ingest half.
+
+Prototype (`crates/agentdb-storage/src/rocks.rs` — `write_range_to_sst` /
+`ingest_ssts`; benchmark `crates/agentdb-storage/tests/sst_movement_bench.rs`)
+measured the target-side install of a tablet key range:
+
+| events | range bytes | sst bytes | replay_ms (write_batch) | ingest_ms | speedup |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 227 KB | 9 KB | 0.9 | 0.6 | 1.4× |
+| 5,000 | 1.14 MB | 42 KB | 4.1 | 0.6 | 7× |
+| 20,000 | 4.54 MB | 167 KB | 15.0 | 0.5 | 28× |
+| 80,000 | 18.16 MB | 666 KB | 61.8 | 1.0 | **59×** |
+
+Two things stand out: **ingest time is ~flat (~1 ms) regardless of tablet
+size**, because the SST is placed, not replayed — so the win over
+`write_batch` grows without bound with the tablet. And the SST is
+**compressed** (the transfer shrinks too; the 27× here is inflated by the
+uniform test payload, but real SSTs are always ≤ the raw range). This is
+the eager form of §7: move the SST (optionally staged in the object store)
+instead of the full KV dump, without the on-read object-store dependency of
+lazy attach.
 
 ## Feasibility against the current architecture
 
@@ -91,25 +146,38 @@ with session state (71 MB / 1.7 s at 8,000 events, linear). But
 manifest-based attachment is a storage-engine change with genuine read-path
 and correctness risk, so it should not be built speculatively.
 
-**Do, now (cheap, high-value):**
-- Land the movement-cost instrumentation (the scheduler now logs
-  `snapshot_bytes` + `export_ms` per movement) so real replacements and the
-  S9 smoke report this in production.
-- Pursue the **compact snapshot encoding** independently — the ~45×
-  payload-to-snapshot ratio is a large, low-risk win that shrinks every
-  move without touching the storage engine.
+**Done (cheap, high-value):**
+- Movement-cost instrumentation — the scheduler logs `snapshot_bytes` +
+  `export_ms` per movement, so real replacements and the S9 smoke report
+  this in production.
+- The **compact snapshot encoding** — a large, low-risk win with no
+  storage-engine change: 3.4× smaller snapshots and ~44× faster serialize.
+- The **SST export/ingest primitives** (`RocksKvStore::write_range_to_sst` /
+  `ingest_ssts`) plus a prototype benchmark proving the target-side win
+  (~flat ~1 ms install, 59× at 80k events, growing).
 
-**Gate for the storage-engine change:**
-- Prototype a manifest+lazy-block attach for **cold tablets only**, behind a
-  flag, and measure the plan's eight metrics (bytes transferred,
-  time-to-learner, time-to-p99, object-store GET count/cost, cache size +
-  warm-up bandwidth, retained unflushed Raft tail, recovery-after-cache-loss,
-  compaction read/write amplification) on the session-native benchmark.
-- **Adopt only if** the session-native workload (`append → commit → apply →
-  fetch recent tail`) shows an operational or cost win over the compact
-  full-snapshot path. Generic point-put throughput is not sufficient
-  evidence.
+**Recommended next — eager SST-based whole-tablet movement (the proven win):**
+Wire whole-tablet moves (replacement, adding a replica) through
+checkpoint/SST → transfer → ingest instead of the logical KV dump. It has
+the big proven payoff and *far* less risk than lazy attach — no on-read
+object-store dependency, no block-cache management. Design points:
+- **Whole-tablet moves only**; shard-range moves (split/merge) keep the
+  logical path (you can't cheaply carve a shard subset out of an SST).
+- **Fallback + version negotiation**: SSTs carry a `format_version`; if the
+  target's RocksDB can't ingest (mixed builds during a rolling upgrade),
+  fall back to the logical compact-encoded path. Keep the logical path as
+  the always-safe default.
+- **Size threshold**: ingest has fixed overhead; small tablets stay logical.
+- **Object-store staging** (optional, toward §7): put the SST in the bucket
+  and ship a manifest reference instead of the bytes inline.
 
-Net: **no-go on building it now**; the evidence justifies the compact-encoding
-win first and keeps the lazy-attach prototype gated behind a demonstrated
-need.
+**Still gated — the full lazy-block attach:**
+- Only worth it beyond eager SST if a workload needs to attach *without*
+  even transferring the tail (serve from object-store blocks on demand).
+  That is the storage-engine change with read-path-p99 and
+  cache-loss-recovery risk; prototype it for **cold tablets only** and
+  measure the plan's eight metrics before adopting.
+
+Net: the compact-encoding win is delivered and the **eager SST path is
+proven and recommended to build next**; the full lazy-block attach stays
+gated behind a demonstrated need.

@@ -1688,12 +1688,7 @@ impl RuntimeTabletRouterKvStore {
 
     fn export_snapshot_payload(&self, tablet_id: i64) -> agentdb_storage::Result<Vec<u8>> {
         self.with_handle(tablet_id, |handle| {
-            let snapshot = handle.state_machine.export_snapshot()?;
-            serde_json::to_vec(&snapshot).map_err(|err| {
-                agentdb_storage::Error::Other(format!(
-                    "encode tablet {tablet_id} runtime snapshot: {err}"
-                ))
-            })
+            Ok(handle.state_machine.export_snapshot()?.encode())
         })
     }
 
@@ -1703,14 +1698,10 @@ impl RuntimeTabletRouterKvStore {
         filter: TabletSnapshotShardFilter,
     ) -> agentdb_storage::Result<Vec<u8>> {
         self.with_handle(source_tablet_id, |handle| {
-            let snapshot = handle
+            Ok(handle
                 .state_machine
-                .export_snapshot_for_shard_range(filter)?;
-            serde_json::to_vec(&snapshot).map_err(|err| {
-                agentdb_storage::Error::Other(format!(
-                    "encode tablet {source_tablet_id} filtered runtime snapshot: {err}"
-                ))
-            })
+                .export_snapshot_for_shard_range(filter)?
+                .encode())
         })
     }
 
@@ -1719,7 +1710,7 @@ impl RuntimeTabletRouterKvStore {
         tablet_id: i64,
         payload: &[u8],
     ) -> agentdb_storage::Result<()> {
-        let snapshot: TabletStateSnapshot = serde_json::from_slice(payload).map_err(|err| {
+        let snapshot = TabletStateSnapshot::decode(payload).map_err(|err| {
             agentdb_storage::Error::Other(format!(
                 "decode tablet {tablet_id} runtime snapshot: {err}"
             ))
@@ -1734,7 +1725,7 @@ impl RuntimeTabletRouterKvStore {
         tablet_id: i64,
         payload: &[u8],
     ) -> agentdb_storage::Result<()> {
-        let snapshot: TabletStateSnapshot = serde_json::from_slice(payload).map_err(|err| {
+        let snapshot = TabletStateSnapshot::decode(payload).map_err(|err| {
             agentdb_storage::Error::Other(format!(
                 "decode tablet {tablet_id} runtime snapshot: {err}"
             ))
@@ -3478,7 +3469,7 @@ impl Runtime {
         let Some(persist) = self.persist.as_ref() else {
             return Ok(());
         };
-        let snapshot: TabletStateSnapshot = serde_json::from_slice(payload).map_err(|error| {
+        let snapshot = TabletStateSnapshot::decode(payload).map_err(|error| {
             Error::new(
                 ErrorCode::Internal,
                 format!("decode tablet {tablet_id} runtime snapshot: {error}"),

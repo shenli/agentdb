@@ -135,6 +135,60 @@ fn default_rocks_options(config: &RocksKvStoreConfig) -> Options {
     opts
 }
 
+impl RocksKvStore {
+    /// Write every KV pair under `prefix` to a single self-contained SST
+    /// file at `sst_path` (RocksDB `SstFileWriter`). The file can be
+    /// bulk-loaded into another `RocksKvStore` via `ingest_ssts`, bypassing
+    /// the memtable / WAL / compaction on the target — the fast path for
+    /// moving a whole tablet's key range. Returns the SST size in bytes, or
+    /// `Ok(0)` when the range is empty (no SST is produced).
+    ///
+    /// `SstFileWriter` requires keys in ascending order; the prefix scan
+    /// yields RocksDB bytewise order, matching the default comparator the
+    /// SST and the target DB share.
+    pub fn write_range_to_sst(&self, prefix: &[u8], sst_path: &Path) -> Result<u64> {
+        let mut opts = Options::default();
+        opts.set_compression_type(DBCompressionType::Lz4);
+        let mut writer = rocksdb::SstFileWriter::create(&opts);
+        writer
+            .open(sst_path)
+            .map_err(|e| Error::Other(format!("sst open: {e}")))?;
+        let mut count = 0u64;
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix, Direction::Forward));
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::Other(format!("sst scan: {e}")))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            writer
+                .put(&key, &value)
+                .map_err(|e| Error::Other(format!("sst put: {e}")))?;
+            count += 1;
+        }
+        if count == 0 {
+            // SstFileWriter::finish errors on an empty file; produce none.
+            let _ = std::fs::remove_file(sst_path);
+            return Ok(0);
+        }
+        writer
+            .finish()
+            .map_err(|e| Error::Other(format!("sst finish: {e}")))?;
+        Ok(std::fs::metadata(sst_path).map(|m| m.len()).unwrap_or(0))
+    }
+
+    /// Bulk-load external SST files (produced by `write_range_to_sst`) into
+    /// this store via RocksDB `IngestExternalFile`. The ingested key ranges
+    /// must not overlap existing keys — a movement target holds a fresh
+    /// tablet range — so the SSTs land at the LSM bottom without a rewrite.
+    pub fn ingest_ssts(&self, paths: &[std::path::PathBuf]) -> Result<()> {
+        self.db
+            .ingest_external_file(paths.to_vec())
+            .map_err(|e| Error::Other(format!("rocksdb ingest_external_file: {e}")))
+    }
+}
+
 impl KvStore for RocksKvStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.db.get(key)?)
@@ -431,6 +485,41 @@ mod owned_snapshot_tests {
         store.put(b"k2", b"v2").unwrap();
         // Snapshot doesn't see the new key.
         assert!(snap.get(b"k2").unwrap().is_none());
+    }
+
+    #[test]
+    fn sst_export_then_ingest_moves_a_prefix_range() {
+        let src_dir = TempDir::new().unwrap();
+        let src = RocksKvStore::open(src_dir.path()).unwrap();
+        // Two tablets' ranges; we move only tablet/1/.
+        src.put(b"tablet/1/a", b"1a").unwrap();
+        src.put(b"tablet/1/b", b"1b").unwrap();
+        src.put(b"tablet/2/a", b"2a").unwrap();
+
+        let sst_dir = TempDir::new().unwrap();
+        let sst = sst_dir.path().join("t1.sst");
+        let bytes = src.write_range_to_sst(b"tablet/1/", &sst).unwrap();
+        assert!(bytes > 0);
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = RocksKvStore::open(dst_dir.path()).unwrap();
+        dst.ingest_ssts(&[sst]).unwrap();
+
+        // The moved range is present; the other tablet's range is not.
+        assert_eq!(dst.get(b"tablet/1/a").unwrap().as_deref(), Some(&b"1a"[..]));
+        assert_eq!(dst.get(b"tablet/1/b").unwrap().as_deref(), Some(&b"1b"[..]));
+        assert!(dst.get(b"tablet/2/a").unwrap().is_none());
+    }
+
+    #[test]
+    fn sst_export_of_empty_range_produces_no_file() {
+        let dir = TempDir::new().unwrap();
+        let store = RocksKvStore::open(dir.path()).unwrap();
+        store.put(b"other/x", b"v").unwrap();
+        let sst_dir = TempDir::new().unwrap();
+        let sst = sst_dir.path().join("empty.sst");
+        assert_eq!(store.write_range_to_sst(b"tablet/1/", &sst).unwrap(), 0);
+        assert!(!sst.exists());
     }
 
     #[test]
