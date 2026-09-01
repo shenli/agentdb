@@ -296,14 +296,18 @@ async fn main() -> anyhow::Result<()> {
 async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let dev_bootstrap = opts.dev_bootstrap.clone();
     let config = ResolvedServeConfig::from_serve_opts(opts)?;
-    if !config.in_memory {
+    // Fail closed on a data directory that belongs to another node or
+    // cluster, or whose identity marker is corrupt. This runs before any
+    // store opens and long before the listener binds, so a
+    // misconfiguration surfaces as a clean startup error rather than
+    // silent cross-node corruption. See
+    // docs/design/distributed-safety-hardening.md §3. The returned
+    // identity feeds the control-plane admission check below (cluster
+    // mode), which additionally catches a retired or displaced disk.
+    let store_identity = if config.in_memory {
+        None
+    } else {
         std::fs::create_dir_all(&config.data_dir)?;
-        // Fail closed on a data directory that belongs to another node or
-        // cluster, or whose identity marker is corrupt. This runs before
-        // any store opens and long before the listener binds, so a
-        // misconfiguration surfaces as a clean startup error rather than
-        // silent cross-node corruption. See
-        // docs/design/distributed-safety-hardening.md §3.
         let expected = agentdb_storage::store_identity::ExpectedIdentity {
             node_id: config
                 .route_node_id
@@ -324,7 +328,8 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             store_incarnation = %identity.store_incarnation,
             "verified store identity"
         );
-    }
+        Some(identity)
+    };
     let route_location = config
         .route_region
         .clone()
@@ -335,6 +340,28 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .map(|_| agentdb_api::raft_ingress::RaftRsGroupRegistry::shared());
     let route_startup =
         prepare_route_startup(&config, route_location.clone(), raft_registry.clone()).await?;
+    // Cluster mode: register this store's incarnation with the control
+    // plane before the node participates. Fails closed if the disk was
+    // retired (a replaced store must not rejoin) or if another live
+    // incarnation already holds this node id. Single-node mode has no
+    // shared control plane, so the local IDENTITY.json check above is
+    // sufficient.
+    if let (Some(startup), Some(identity)) = (route_startup.as_ref(), store_identity.as_ref()) {
+        let admission = agentdb_meta::store_admission::admit(
+            startup.meta.pool(),
+            &identity.node_id,
+            &identity.store_incarnation,
+            now_ms_i64(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("store incarnation admission failed: {error}"))?;
+        tracing::info!(
+            node_id = %identity.node_id,
+            store_incarnation = %identity.store_incarnation,
+            ?admission,
+            "store incarnation admitted by control plane"
+        );
+    }
     let auth_meta = if let Some(startup) = route_startup.as_ref() {
         startup.meta.clone()
     } else if config.in_memory {

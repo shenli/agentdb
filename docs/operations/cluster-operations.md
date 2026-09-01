@@ -329,6 +329,29 @@ Adding nodes should be the preferred path when:
 - a few nodes are consistently overloaded
 - handoff/recovery windows are too long
 
+## Replacing a Node's Store
+
+Each node's data directory carries a durable identity (`IDENTITY.json`)
+whose `store_incarnation` is minted once, when the directory is first
+created. In cluster mode this incarnation is admitted against a
+control-plane registry at startup, which fails closed if a **retired**
+disk tries to rejoin, or if a **second live** incarnation tries to take a
+node id that a running store already holds. This prevents a swapped-in or
+copied disk from silently corrupting the cluster.
+
+To deliberately replace a node's storage (new disk, rebuilt host):
+
+1. Stop the node.
+2. Retire its current incarnation:
+   `POST /api/admin/cluster/stores/{node_id}/retire`.
+3. Provision the fresh data directory (a new incarnation is minted on
+   first boot) and start the node — it is admitted as the replacement.
+
+Inspect the incarnation history at any time with
+`GET /api/admin/cluster/stores/{node_id}`. Retiring is idempotent; a node
+whose incarnation was retired will refuse to boot until its data directory
+is re-provisioned.
+
 ## Failure Handling Expectations
 
 ### Node Lost
