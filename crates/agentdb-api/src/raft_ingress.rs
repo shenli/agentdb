@@ -73,6 +73,20 @@ impl RaftRsGroupRegistry {
         Ok(self.group_for(tablet_id)?.status())
     }
 
+    /// Run a linearizable read barrier (ReadIndex) on the local replica of
+    /// `tablet_id`. Returns the confirmed read index, or a typed error if
+    /// this node is not the leader or cannot confirm leadership within the
+    /// timeout. Never falls back to a local read.
+    pub fn read_barrier(
+        &self,
+        tablet_id: i64,
+        local_raft_node_id: u64,
+        timeout: std::time::Duration,
+    ) -> Result<u64> {
+        self.group_for(tablet_id)?
+            .read_barrier(local_raft_node_id, timeout)
+    }
+
     pub fn promote_to_voter(&self, tablet_id: i64, leader_id: u64, node_id: u64) -> Result<()> {
         self.group_for(tablet_id)?
             .promote_to_voter(leader_id, node_id)

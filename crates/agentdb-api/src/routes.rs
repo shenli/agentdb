@@ -5816,6 +5816,9 @@ async fn get_session(
             Ok(headers) => headers,
             Err(response) => return Ok(response),
         };
+    if let Err(response) = enforce_read_barrier(&s, &route_headers).await {
+        return Ok(response);
+    }
     let runtime = s.runtime.clone();
     let session = with_route_tablet_context(runtime.clone(), &route_headers, async move {
         runtime.get_session(&tid, &sid).await
@@ -6203,6 +6206,9 @@ async fn fetch_events(
             Ok(headers) => headers,
             Err(response) => return Ok(response),
         };
+    if let Err(response) = enforce_read_barrier(&s, &route_headers).await {
+        return Ok(response);
+    }
     let runtime = s.runtime.clone();
     let events = with_route_tablet_context(runtime.clone(), &route_headers, async move {
         if q.latest {
@@ -7562,6 +7568,51 @@ where
             Err(execute_forward(state, forward, method, body.map(|build| build())).await)
         }
         RouteGuardOutcome::Reject(rejection) => Err(route_rejection_response(&rejection)),
+    }
+}
+
+/// Enforce a linearizable read barrier before serving a routed read
+/// locally. No-op unless the runtime is replicated (a raft registry is
+/// present), the barrier is enabled, and the route resolved to a local
+/// tablet. Returns a typed retryable error if the local replica cannot
+/// confirm current Raft leadership — it never falls back to a local read.
+/// See docs/design/read-semantics.md.
+async fn enforce_read_barrier(state: &AppState, route_headers: &HeaderMap) -> Result<(), Response> {
+    let Some(timeout) = state.read_barrier_timeout else {
+        tracing::debug!("read barrier skipped: disabled");
+        return Ok(());
+    };
+    let Some(registry) = state.raft_registry.clone() else {
+        tracing::debug!("read barrier skipped: no raft registry (single-node)");
+        return Ok(());
+    };
+    let Some(tablet_id) = route_tablet_id(route_headers) else {
+        // No tablet context: nothing routed, nothing to confirm.
+        return Ok(());
+    };
+    let local_raft_node_id = match agentdb_storage::stable_raft_node_id(state.drain.node_id()) {
+        Ok(id) => id,
+        Err(error) => {
+            return Err(internal_raft_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "READ_BARRIER_NODE_ID",
+                format!("could not derive local raft node id: {error}"),
+            ));
+        }
+    };
+    // read_barrier internally hands off with block_in_place, so call it
+    // directly from this async context. Do NOT wrap in spawn_blocking:
+    // block_in_place must run on a runtime worker, not a blocking thread.
+    match registry.read_barrier(tablet_id, local_raft_node_id, timeout) {
+        Ok(read_index) => {
+            tracing::debug!(tablet_id, read_index, "read barrier confirmed");
+            Ok(())
+        }
+        Err(error) => Err(internal_raft_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "READ_BARRIER_UNCONFIRMED",
+            format!("linearizable read could not confirm raft leadership: {error}"),
+        )),
     }
 }
 

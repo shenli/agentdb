@@ -3735,13 +3735,25 @@ async fn run_fault_injection(
         }
     }
 
+    // NOTE on linearizable reads: the read barrier's correctness — a leader
+    // that cannot confirm quorum, or a follower, refuses a local read — is
+    // pinned deterministically by the storage unit test
+    // `read_barrier_confirms_on_healthy_leader_and_times_out_when_isolated`.
+    // We do NOT assert it here against the isolated leader: on a real
+    // cluster the owner-campaign worker keeps re-electing an isolated SQL
+    // owner as raft leader, and raft-rs Safe ReadIndex on a
+    // repeatedly-re-elected leader can intermittently self-confirm — a
+    // documented limitation (docs/design/read-semantics.md) whose fix
+    // (decoupling raft authority from the SQL owner lease) is separate
+    // hardening. Asserting the read here would test that unresolved
+    // interaction, not the barrier. The write-cannot-commit check above is
+    // the solid real-cluster quorum-loss signal.
+
     // 4. Heal and reconverge.
     fault_clear(client, &view.leader.url, token).await?;
     eprintln!("fault-injection: cleared isolation rules; waiting for reconvergence");
     wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
-    eprintln!(
-        "fault-injection: PASS — partition mechanism, quorum-loss, election, and heal all held"
-    );
+    eprintln!("fault-injection: PASS — mechanism, quorum-loss, election, and heal all held");
     Ok(())
 }
 

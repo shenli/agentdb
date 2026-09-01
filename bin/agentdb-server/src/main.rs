@@ -488,6 +488,20 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         })
         .with_tablet_store_status(tablet_store_status(&config));
     state.transport_faults = transport_faults.clone();
+    // Linearizable read barrier: on by default, disabled by
+    // AGENTDB_READ_BARRIER=off. It only engages on replicated tablets
+    // (a raft registry must be present), so single-node runs never pay it
+    // regardless of this setting.
+    state.read_barrier_timeout = if std::env::var("AGENTDB_READ_BARRIER").as_deref() == Ok("off") {
+        tracing::warn!(
+            "linearizable read barrier DISABLED (AGENTDB_READ_BARRIER=off); routed reads may serve stale data"
+        );
+        None
+    } else {
+        Some(Duration::from_millis(
+            env_u64("AGENTDB_READ_BARRIER_TIMEOUT_MS", 5_000).max(1),
+        ))
+    };
     if let Some(token) = config.api_auth_token.clone() {
         state = state.with_api_auth_token(token);
     }
