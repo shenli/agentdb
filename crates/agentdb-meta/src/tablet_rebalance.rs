@@ -12,6 +12,7 @@ use sqlx::AnyPool;
 
 use crate::{
     cells::{self, Cell, DEFAULT_CELL_ID},
+    node_operational,
     nodes::{self, Node},
     placement_scopes::{self, PlacementScope},
     tablet_replicas::{self, TabletReplica},
@@ -197,6 +198,7 @@ pub async fn run(
             &counts_after,
             &fresh_alive_node_refs,
             &placement,
+            now_ms,
         )
         .await?
         else {
@@ -218,27 +220,8 @@ pub async fn run(
                 tablets::assign_to_with_lease(pool, tablet.tablet_id, &target, lease_expires_at_ms)
                     .await?;
             if assigned {
-                let target_replica = tablet_replicas::list_by_tablet(pool, tablet.tablet_id)
-                    .await?
-                    .into_iter()
-                    .find(|replica| replica.node_id == target);
-                tablet_replicas::upsert(
-                    pool,
-                    tablet.tablet_id,
-                    &target,
-                    "voter",
-                    "healthy",
-                    target_replica
-                        .as_ref()
-                        .map(|replica| replica.applied_index)
-                        .unwrap_or(0),
-                    target_replica
-                        .as_ref()
-                        .map(|replica| replica.match_index)
-                        .unwrap_or(0),
-                    now_ms,
-                )
-                .await?;
+                tablet_replicas::upsert_intent(pool, tablet.tablet_id, &target, "voter", now_ms)
+                    .await?;
             }
             assigned
         };
@@ -273,6 +256,7 @@ pub async fn run(
             &counts_after,
             &fresh_alive_node_refs,
             &placement,
+            now_ms,
         )
         .await?
         else {
@@ -327,6 +311,7 @@ pub async fn run(
             &counts_after,
             &fresh_alive_node_refs,
             &placement,
+            now_ms,
         )
         .await?
         else {
@@ -424,7 +409,9 @@ async fn complete_ready_replacement_intent(
             ownership_move: None,
         });
     };
-    let replicas = tablet_replicas::list_by_tablet(pool, tablet.tablet_id).await?;
+    let replicas =
+        node_operational::merged_replica_view_by_tablet(pool, tablet.tablet_id, cutoff_ms(now_ms))
+            .await?;
     let source_replica = replicas
         .iter()
         .find(|replica| replica.node_id == *source_node_id);
@@ -479,17 +466,8 @@ async fn complete_ready_replacement_intent(
     let changed = if dry_run {
         true
     } else {
-        tablet_replicas::upsert(
-            pool,
-            tablet.tablet_id,
-            target_node_id,
-            "voter",
-            &target_replica.health,
-            target_replica.applied_index,
-            target_replica.match_index,
-            now_ms,
-        )
-        .await?;
+        tablet_replicas::upsert_intent(pool, tablet.tablet_id, target_node_id, "voter", now_ms)
+            .await?;
         let changed = tablets::complete_handoff_with_lease(
             pool,
             tablet.tablet_id,
@@ -499,7 +477,7 @@ async fn complete_ready_replacement_intent(
         .await?
         .is_some();
         if changed {
-            let _ = tablet_replicas::set_health(
+            let _ = tablet_replicas::set_state(
                 pool,
                 tablet.tablet_id,
                 source_node_id,
@@ -535,63 +513,35 @@ async fn prepare_replacement_intent(
     if dry_run {
         return Ok(true);
     }
-    let replicas = tablet_replicas::list_by_tablet(pool, tablet_id).await?;
-    let source_replica =
-        source_node_id.and_then(|source| replicas.iter().find(|replica| replica.node_id == source));
+    let intent = tablet_replicas::list_intent_by_tablet(pool, tablet_id).await?;
+    let source_role = source_node_id.and_then(|source| {
+        intent
+            .iter()
+            .find(|row| row.node_id == source)
+            .map(|row| row.role.clone())
+    });
     let mut changed = false;
     if let Some(source_node_id) = source_node_id {
-        if source_replica
-            .map(|replica| replica.role != "voter")
-            .unwrap_or(true)
-        {
-            tablet_replicas::upsert(
-                pool,
-                tablet_id,
-                source_node_id,
-                "voter",
-                source_replica
-                    .map(|replica| replica.health.as_str())
-                    .unwrap_or("healthy"),
-                source_replica
-                    .map(|replica| replica.applied_index)
-                    .unwrap_or(0),
-                source_replica
-                    .map(|replica| replica.match_index)
-                    .unwrap_or(0),
-                now_ms,
-            )
-            .await?;
+        if source_role.as_deref() != Some("voter") {
+            tablet_replicas::upsert_intent(pool, tablet_id, source_node_id, "voter", now_ms)
+                .await?;
             changed = true;
         }
     }
-    let target_replica = replicas
+    let target_role = intent
         .iter()
-        .find(|replica| replica.node_id == target_node_id);
-    if target_replica
-        .map(|replica| replica.role != "learner")
-        .unwrap_or(true)
-    {
-        tablet_replicas::upsert(
-            pool,
-            tablet_id,
-            target_node_id,
-            "learner",
-            target_replica
-                .map(|replica| replica.health.as_str())
-                .unwrap_or("lagging"),
-            target_replica
-                .map(|replica| replica.applied_index)
-                .unwrap_or(0),
-            target_replica
-                .map(|replica| replica.match_index)
-                .unwrap_or(0),
-            now_ms,
-        )
-        .await?;
+        .find(|row| row.node_id == target_node_id)
+        .map(|row| row.role.clone());
+    if target_role.as_deref() != Some("learner") {
+        tablet_replicas::upsert_intent(pool, tablet_id, target_node_id, "learner", now_ms).await?;
         changed = true;
     }
     let handoff_changed = tablets::mark_for_handoff(pool, tablet_id, target_node_id).await?;
     Ok(changed || handoff_changed)
+}
+
+fn cutoff_ms(now_ms: i64) -> i64 {
+    now_ms.saturating_sub(node_operational::DEFAULT_STALENESS_MS)
 }
 
 fn owner_counts(tablets: &[tablets::Tablet]) -> HashMap<String, usize> {
@@ -610,8 +560,11 @@ async fn select_unowned_tablet_target(
     counts: &HashMap<String, usize>,
     fresh_alive_nodes: &HashMap<String, &Node>,
     placement: &PlacementContext<'_>,
+    now_ms: i64,
 ) -> MetaResult<Option<String>> {
-    let replicas = tablet_replicas::list_by_tablet(pool, tablet.tablet_id).await?;
+    let replicas =
+        node_operational::merged_replica_view_by_tablet(pool, tablet.tablet_id, cutoff_ms(now_ms))
+            .await?;
     let eligible = eligible_targets(tablet, &replicas, None, false, fresh_alive_nodes, placement);
     if eligible.is_empty() {
         return Ok(None);
@@ -662,8 +615,11 @@ async fn select_replacement_target(
     counts: &HashMap<String, usize>,
     fresh_alive_nodes: &HashMap<String, &Node>,
     placement: &PlacementContext<'_>,
+    now_ms: i64,
 ) -> MetaResult<Option<String>> {
-    let replicas = tablet_replicas::list_by_tablet(pool, tablet.tablet_id).await?;
+    let replicas =
+        node_operational::merged_replica_view_by_tablet(pool, tablet.tablet_id, cutoff_ms(now_ms))
+            .await?;
     let eligible = eligible_targets(
         tablet,
         &replicas,
@@ -688,6 +644,7 @@ async fn select_load_balance_move(
     counts: &HashMap<String, usize>,
     fresh_alive_nodes: &HashMap<String, &Node>,
     placement: &PlacementContext<'_>,
+    now_ms: i64,
 ) -> MetaResult<Option<(usize, String, String)>> {
     let mut order: Vec<_> = candidates.iter().enumerate().collect();
     order.sort_by(|(_, left), (_, right)| {
@@ -719,6 +676,7 @@ async fn select_load_balance_move(
             counts,
             fresh_alive_nodes,
             placement,
+            now_ms,
         )
         .await?
         else {
@@ -934,6 +892,51 @@ mod tests {
         crate::test_pool_sqlite_memory().await
     }
 
+    /// Seed both placement intent and an operational observation, the way
+    /// the pre-stage-1 `tablet_replicas::upsert` used to in one row.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_replica(
+        p: &sqlx::AnyPool,
+        tablet_id: i64,
+        node_id: &str,
+        role: &str,
+        health: &str,
+        applied: i64,
+        matched: i64,
+        now_ms: i64,
+    ) {
+        tablet_replicas::upsert_intent(p, tablet_id, node_id, role, now_ms)
+            .await
+            .unwrap();
+        let mut summary = node_operational::list_all(p)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.node_id == node_id)
+            .map(|r| r.summary)
+            .unwrap_or_default();
+        summary
+            .replicas
+            .retain(|o| !(o.tablet_id == tablet_id && o.node_id == node_id));
+        summary.replicas.push(node_operational::ReplicaObservation {
+            tablet_id,
+            node_id: node_id.into(),
+            role: role.into(),
+            health: health.into(),
+            applied_index: applied,
+            match_index: matched,
+        });
+        node_operational::report(p, node_id, now_ms, &summary)
+            .await
+            .unwrap();
+    }
+
+    async fn merged_by_tablet(p: &sqlx::AnyPool, tablet_id: i64) -> Vec<TabletReplica> {
+        node_operational::merged_replica_view_by_tablet(p, tablet_id, 0)
+            .await
+            .unwrap()
+    }
+
     async fn cell(
         p: &sqlx::AnyPool,
         cell_id: &str,
@@ -1042,17 +1045,19 @@ mod tests {
             .any(|action| action.action == "prepare_replacement"
                 && action.source_node_id.as_deref() == Some("node-c")));
         assert!(report.changed_count() >= 2);
-        let replicas = tablet_replicas::list_by_tablet(&p, 3).await.unwrap();
+        let replicas = merged_by_tablet(&p, 3).await;
         assert!(replicas
             .iter()
             .any(|replica| replica.node_id == "node-c" && replica.role == "voter"));
         assert!(replicas
             .iter()
             .any(|replica| replica.node_id != "node-c" && replica.role == "learner"));
-        let assigned_replicas = tablet_replicas::list_by_tablet(&p, 4).await.unwrap();
+        let assigned_replicas = merged_by_tablet(&p, 4).await;
+        // Assignment writes placement INTENT; observed health arrives later
+        // through node reports, so a fresh assignment reads as "unknown".
         assert!(assigned_replicas
             .iter()
-            .any(|replica| replica.role == "voter" && replica.health == "healthy"));
+            .any(|replica| replica.role == "voter"));
         let assigned = tablets::get(&p, 4).await.unwrap().unwrap();
         assert!(assigned.lease_expires_at_ms > 2_000);
         assert_eq!(assigned.epoch, 1);
@@ -1068,12 +1073,8 @@ mod tests {
             .await
             .unwrap();
         tablets::get_or_create(&p, 7, 100).await.unwrap();
-        tablet_replicas::upsert(&p, 7, "node-a", "voter", "healthy", 100, 100, 100)
-            .await
-            .unwrap();
-        tablet_replicas::upsert(&p, 7, "node-b", "voter", "healthy", 90, 90, 100)
-            .await
-            .unwrap();
+        seed_replica(&p, 7, "node-a", "voter", "healthy", 100, 100, 100).await;
+        seed_replica(&p, 7, "node-b", "voter", "healthy", 90, 90, 100).await;
 
         let report = run(
             &p,
@@ -1096,9 +1097,8 @@ mod tests {
         assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
         assert!(tablet.lease_expires_at_ms > 2_000);
         assert_eq!(tablet.epoch, 1);
-        let owner_replica = tablet_replicas::list_by_tablet(&p, 7)
+        let owner_replica = merged_by_tablet(&p, 7)
             .await
-            .unwrap()
             .into_iter()
             .find(|replica| replica.node_id == "node-a")
             .unwrap();
@@ -1119,16 +1119,10 @@ mod tests {
             tablets::get_or_create(&p, id, 100).await.unwrap();
             tablets::assign_to(&p, id, "node-a").await.unwrap();
             tablets::mark_for_handoff(&p, id, "node-b").await.unwrap();
-            tablet_replicas::upsert(&p, id, "node-a", "voter", "healthy", 10, 10, 100)
-                .await
-                .unwrap();
+            seed_replica(&p, id, "node-a", "voter", "healthy", 10, 10, 100).await;
         }
-        tablet_replicas::upsert(&p, 7, "node-b", "learner", "healthy", 10, 10, 100)
-            .await
-            .unwrap();
-        tablet_replicas::upsert(&p, 8, "node-b", "learner", "healthy", 9, 9, 100)
-            .await
-            .unwrap();
+        seed_replica(&p, 7, "node-b", "learner", "healthy", 10, 10, 100).await;
+        seed_replica(&p, 8, "node-b", "learner", "healthy", 9, 9, 100).await;
 
         let report = run(
             &p,
@@ -1155,16 +1149,14 @@ mod tests {
         let completed = tablets::get(&p, 7).await.unwrap().unwrap();
         assert_eq!(completed.owner_node_id.as_deref(), Some("node-b"));
         assert_eq!(completed.handoff_target_node_id, None);
-        let target = tablet_replicas::list_by_tablet(&p, 7)
+        let target = merged_by_tablet(&p, 7)
             .await
-            .unwrap()
             .into_iter()
             .find(|replica| replica.node_id == "node-b")
             .unwrap();
         assert_eq!(target.role, "voter");
-        let source = tablet_replicas::list_by_tablet(&p, 7)
+        let source = merged_by_tablet(&p, 7)
             .await
-            .unwrap()
             .into_iter()
             .find(|replica| replica.node_id == "node-a")
             .unwrap();
@@ -1212,9 +1204,7 @@ mod tests {
         node_with_cell(&p, "node-c", "alive", "cell-a", "us-west-2b", "stable").await;
         scoped_tablet(&p, 60, "tenant/a", "cell-a").await;
         tablets::assign_to(&p, 60, "node-a").await.unwrap();
-        tablet_replicas::upsert(&p, 60, "node-a", "voter", "healthy", 10, 10, 100)
-            .await
-            .unwrap();
+        seed_replica(&p, 60, "node-a", "voter", "healthy", 10, 10, 100).await;
 
         let report = run(
             &p,
@@ -1244,9 +1234,7 @@ mod tests {
         node_with_cell(&p, "node-c", "alive", "cell-a", "us-west-2a", "stable").await;
         scoped_tablet(&p, 61, "tenant/a", "cell-a").await;
         tablets::assign_to(&p, 61, "node-a").await.unwrap();
-        tablet_replicas::upsert(&p, 61, "node-a", "voter", "healthy", 10, 10, 100)
-            .await
-            .unwrap();
+        seed_replica(&p, 61, "node-a", "voter", "healthy", 10, 10, 100).await;
 
         let report = run(
             &p,

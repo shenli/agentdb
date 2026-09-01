@@ -7,7 +7,7 @@ use std::{
 };
 
 use agentdb_meta::{
-    cells, nodes, placement_scopes, tablet_ranges, tablet_replicas, tablets, tenant_policies,
+    cells, node_operational, nodes, placement_scopes, tablet_ranges, tablets, tenant_policies,
     MetaStore,
 };
 use agentdb_storage::{GroupedRocksDbTabletStore, TabletStoreLifecycle};
@@ -352,7 +352,7 @@ async fn reset_cluster_meta(meta: &MetaStore) -> Result<()> {
     let pool = meta.pool();
     for table in [
         "tablet_snapshots",
-        "tablet_stats",
+        "node_operational",
         "tablet_movements",
         "tablet_replicas",
         "tablet_ranges",
@@ -524,7 +524,7 @@ async fn seed_tablet_meta(
     )
     .await?;
     for node in node_specs {
-        tablet_replicas::upsert(pool, tablet_id, &node.id, "voter", "healthy", 0, 0, now_ms)
+        node_operational::seed_replica(pool, tablet_id, &node.id, "voter", "healthy", 0, 0, now_ms)
             .await?;
     }
     Ok(())

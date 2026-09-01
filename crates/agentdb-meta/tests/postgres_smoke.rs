@@ -16,7 +16,9 @@
 use std::time::Duration;
 
 use agentdb_meta::change_notifier::{subscribe, Channel};
-use agentdb_meta::{admin_tokens, nodes, session_locators, tablet_replicas, tenants, MetaStore};
+use agentdb_meta::{
+    admin_tokens, node_operational, nodes, session_locators, tenants, MetaStore,
+};
 
 fn pg_url() -> Option<String> {
     std::env::var("AGENTDB_TEST_PG_URL").ok()
@@ -228,7 +230,7 @@ async fn pg_listen_notify_delivers_a_tablet_replica_change() {
     let mut rx = subscribe(&store, &[Channel::Tablets]);
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    tablet_replicas::upsert(
+    node_operational::seed_replica(
         store.pool(),
         7,
         "pg-replica-notify-test",

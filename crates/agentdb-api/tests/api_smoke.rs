@@ -6,6 +6,15 @@
 
 mod common;
 
+/// Operational reports are staleness-filtered against the real clock by the
+/// admin endpoints, so tests seed with fresh timestamps.
+fn recent_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -26,8 +35,8 @@ use agentdb_core::{
     RUNTIME_PRIMARY_TABLET_ID,
 };
 use agentdb_meta::{
-    cells, nodes::Node, placement_scopes, session_locators, tablet_replicas, tablet_snapshots,
-    tablets, tablets::Tablet, MetaStore,
+    cells, node_operational, nodes::Node, placement_scopes, session_locators,
+    tablet_snapshots, tablets, tablets::Tablet, MetaStore,
 };
 use agentdb_storage::{
     AsyncMirrorContentBackend, ContentBackend, GroupedRocksDbTabletStore, InMemoryContentBackend,
@@ -1035,10 +1044,10 @@ async fn admin_raft_status_reports_registered_tablets() {
 #[tokio::test]
 async fn admin_raft_status_joins_control_plane_replica_metadata() {
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 11, 12, 100)
+    node_operational::seed_replica(meta.pool(), 7, "1", "voter", "healthy", 11, 12, recent_ms())
         .await
         .unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "2", "learner", "lagging", 3, 4, 100)
+    node_operational::seed_replica(meta.pool(), 7, "2", "learner", "lagging", 3, 4, recent_ms())
         .await
         .unwrap();
     let (_dir, group, _logs) = test_raft_group();
@@ -1084,9 +1093,18 @@ async fn admin_raft_status_joins_control_plane_replica_metadata() {
 #[tokio::test]
 async fn admin_raft_status_reports_configured_only_replicas() {
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-    tablet_replicas::upsert(meta.pool(), 17, "node-b", "learner", "lagging", 3, 4, 100)
-        .await
-        .unwrap();
+    node_operational::seed_replica(
+        meta.pool(),
+        17,
+        "node-b",
+        "learner",
+        "lagging",
+        3,
+        4,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
     let state = AppState::new(Runtime::in_memory()).with_meta(meta);
     let app = spawn_app_with_state(state).await;
 
@@ -1123,10 +1141,10 @@ async fn admin_raft_status_reports_configured_only_replicas() {
 #[tokio::test]
 async fn admin_raft_catch_up_dry_run_reports_snapshot_candidates() {
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 2, 2, 100)
+    node_operational::seed_replica(meta.pool(), 7, "1", "voter", "healthy", 2, 2, recent_ms())
         .await
         .unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "2", "learner", "lagging", 0, 0, 100)
+    node_operational::seed_replica(meta.pool(), 7, "2", "learner", "lagging", 0, 0, recent_ms())
         .await
         .unwrap();
     let (_dir, group, logs) = test_raft_group();
@@ -1170,10 +1188,10 @@ async fn admin_raft_catch_up_dry_run_reports_snapshot_candidates() {
 #[tokio::test]
 async fn admin_raft_status_reports_latest_snapshot_metadata() {
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 5, 5, 100)
+    node_operational::seed_replica(meta.pool(), 7, "1", "voter", "healthy", 5, 5, recent_ms())
         .await
         .unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "2", "learner", "healthy", 4, 4, 100)
+    node_operational::seed_replica(meta.pool(), 7, "2", "learner", "healthy", 4, 4, recent_ms())
         .await
         .unwrap();
     tablet_snapshots::record(
@@ -1389,7 +1407,7 @@ async fn internal_raft_message_accepts_previous_token_during_rotation() {
 #[tokio::test]
 async fn internal_raft_message_rejects_unconfigured_peer_when_meta_is_enabled() {
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 1, 1, 100)
+    node_operational::seed_replica(meta.pool(), 7, "1", "voter", "healthy", 1, 1, recent_ms())
         .await
         .unwrap();
     let ingress = Arc::new(TestRaftIngress::default());
@@ -1459,10 +1477,10 @@ async fn internal_raft_snapshot_dispatches_to_ingress() {
 #[tokio::test]
 async fn internal_raft_snapshot_updates_replica_progress() {
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 42, 42, 100)
+    node_operational::seed_replica(meta.pool(), 7, "1", "voter", "healthy", 42, 42, recent_ms())
         .await
         .unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "2", "learner", "lagging", 1, 1, 100)
+    node_operational::seed_replica(meta.pool(), 7, "2", "learner", "lagging", 1, 1, recent_ms())
         .await
         .unwrap();
     let ingress = Arc::new(TestRaftIngress::default());
@@ -1470,6 +1488,7 @@ async fn internal_raft_snapshot_updates_replica_progress() {
         .with_meta(meta.clone())
         .with_raft_ingress(ingress)
         .with_internal_auth_token("secret");
+    let operational = state.operational.clone();
     let app = spawn_app_with_state(state).await;
 
     app.client
@@ -1489,16 +1508,17 @@ async fn internal_raft_snapshot_updates_replica_progress() {
         .error_for_status()
         .unwrap();
 
-    let replica = tablet_replicas::list_by_tablet(meta.pool(), 7)
-        .await
-        .unwrap()
+    // Progress lands in the receiving node's in-process registry under its
+    // own identity; the heartbeat serializes it into the node report.
+    let (_, node_id, observed) = operational
+        .snapshot(0)
         .into_iter()
-        .find(|replica| replica.node_id == "2")
-        .unwrap();
-    assert_eq!(replica.node_id, "2");
-    assert_eq!(replica.applied_index, 42);
-    assert_eq!(replica.match_index, 42);
-    assert_eq!(replica.health, "healthy");
+        .find(|(tablet_id, _, _)| *tablet_id == 7)
+        .expect("local progress observation");
+    assert_eq!(node_id, "single-node");
+    assert_eq!(observed.applied_index, 42);
+    assert_eq!(observed.match_index, 42);
+    assert_eq!(observed.health, "healthy");
 }
 
 #[tokio::test]
@@ -2002,7 +2022,7 @@ async fn admin_tablets_returns_rows() {
 async fn admin_tablet_stats_returns_rows_and_aggregates() {
     let runtime = Runtime::in_memory();
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-    agentdb_meta::tablet_stats::upsert_with_rate(
+    agentdb_meta::node_operational::seed_tablet_stats(
         meta.pool(),
         7,
         "node-a",
@@ -2015,13 +2035,27 @@ async fn admin_tablet_stats_returns_rows_and_aggregates() {
         6,
         6_000,
         500,
-        100,
+        recent_ms(),
     )
     .await
     .unwrap();
-    agentdb_meta::tablet_stats::upsert(meta.pool(), 7, "node-b", 8, 80, 900, 980, 11, 110)
-        .await
-        .unwrap();
+    agentdb_meta::node_operational::seed_tablet_stats(
+        meta.pool(),
+        7,
+        "node-b",
+        8,
+        80,
+        900,
+        980,
+        11,
+        0,
+        0,
+        0,
+        0,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
     let state = AppState::new(runtime).with_meta(meta);
     let app = spawn_app_with_state(state).await;
 
@@ -2203,9 +2237,18 @@ async fn admin_tablet_replacement_requires_caught_up_target() {
     agentdb_meta::tablets::assume_ownership(meta.pool(), 9, 0, "node-a", 500)
         .await
         .unwrap();
-    tablet_replicas::upsert(meta.pool(), 9, "node-a", "voter", "healthy", 42, 42, 100)
-        .await
-        .unwrap();
+    node_operational::seed_replica(
+        meta.pool(),
+        9,
+        "node-a",
+        "voter",
+        "healthy",
+        42,
+        42,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
     let state = AppState::new(runtime).with_meta(meta.clone());
     let app = spawn_app_with_state(state).await;
 
@@ -2227,7 +2270,9 @@ async fn admin_tablet_replacement_requires_caught_up_target() {
     assert_eq!(prepared["changed"], true);
     assert_eq!(prepared["source_node_id"], "node-a");
     assert_eq!(prepared["target_replica"]["role"], "learner");
-    assert_eq!(prepared["target_replica"]["health"], "lagging");
+    // Prepare writes placement INTENT; observed health arrives via node
+    // reports, so a fresh target reads "unknown" (treated as not caught up).
+    assert_eq!(prepared["target_replica"]["health"], "unknown");
     assert_eq!(prepared["tablet"]["handoff_target_node_id"], "node-b");
 
     let rejected = app
@@ -2242,9 +2287,18 @@ async fn admin_tablet_replacement_requires_caught_up_target() {
         .unwrap();
     assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 
-    tablet_replicas::upsert(meta.pool(), 9, "node-b", "learner", "healthy", 42, 42, 200)
-        .await
-        .unwrap();
+    node_operational::seed_replica(
+        meta.pool(),
+        9,
+        "node-b",
+        "learner",
+        "healthy",
+        42,
+        42,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
 
     let completed: serde_json::Value = app
         .client
@@ -2639,9 +2693,18 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
     )
     .await
     .unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 12, 12, 100)
-        .await
-        .unwrap();
+    node_operational::seed_replica(
+        meta.pool(),
+        7,
+        "node-a",
+        "voter",
+        "healthy",
+        12,
+        12,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
     agentdb_meta::tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
         .await
         .unwrap();
@@ -2707,7 +2770,7 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
     assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 
     for tablet_id in [8, 9] {
-        tablet_replicas::upsert(
+        node_operational::seed_replica(
             meta.pool(),
             tablet_id,
             "node-a",
@@ -2715,7 +2778,7 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
             "healthy",
             12,
             12,
-            200,
+            recent_ms(),
         )
         .await
         .unwrap();
@@ -2782,9 +2845,18 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
         .unwrap()
         .iter()
         .any(|tablet| tablet["tablet_id"] == 10 && tablet["state"] == "creating"));
-    tablet_replicas::upsert(meta.pool(), 10, "node-a", "voter", "healthy", 12, 12, 300)
-        .await
-        .unwrap();
+    node_operational::seed_replica(
+        meta.pool(),
+        10,
+        "node-a",
+        "voter",
+        "healthy",
+        12,
+        12,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
 
     let merge_complete: serde_json::Value = app
         .client
@@ -3023,12 +3095,30 @@ async fn admin_tablet_rebalance_promotes_target_and_retires_source_in_raft() {
     agentdb_meta::tablets::mark_for_handoff(meta.pool(), 7, "node-a")
         .await
         .unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
-        .await
-        .unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "node-a", "learner", "healthy", 10, 10, 100)
-        .await
-        .unwrap();
+    node_operational::seed_replica(
+        meta.pool(),
+        7,
+        "node-b",
+        "voter",
+        "healthy",
+        10,
+        10,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
+    node_operational::seed_replica(
+        meta.pool(),
+        7,
+        "node-a",
+        "learner",
+        "healthy",
+        10,
+        10,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
 
     let dir = TempDir::new().unwrap();
     let configs = vec![
@@ -3068,13 +3158,15 @@ async fn admin_tablet_rebalance_promotes_target_and_retires_source_in_raft() {
         .unwrap()
         .unwrap();
     assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
-    let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+    // Retirement removes placement INTENT; stale observations age out with
+    // their reports.
+    let intent = agentdb_meta::tablet_replicas::list_intent_by_tablet(meta.pool(), 7)
         .await
         .unwrap();
-    assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
-    assert!(replicas
+    assert!(!intent.iter().any(|row| row.node_id == "node-b"));
+    assert!(intent
         .iter()
-        .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
+        .any(|row| row.node_id == "node-a" && row.role == "voter"));
 }
 
 #[tokio::test]
@@ -3114,12 +3206,30 @@ async fn admin_tablet_rebalance_skips_raft_retirement_when_group_is_unregistered
     agentdb_meta::tablets::mark_for_handoff(meta.pool(), 7, "node-a")
         .await
         .unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
-        .await
-        .unwrap();
-    tablet_replicas::upsert(meta.pool(), 7, "node-a", "learner", "healthy", 10, 10, 100)
-        .await
-        .unwrap();
+    node_operational::seed_replica(
+        meta.pool(),
+        7,
+        "node-b",
+        "voter",
+        "healthy",
+        10,
+        10,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
+    node_operational::seed_replica(
+        meta.pool(),
+        7,
+        "node-a",
+        "learner",
+        "healthy",
+        10,
+        10,
+        recent_ms(),
+    )
+    .await
+    .unwrap();
 
     let registry = RaftRsGroupRegistry::shared();
     let state = AppState::new(runtime)
@@ -3149,7 +3259,7 @@ async fn admin_tablet_rebalance_skips_raft_retirement_when_group_is_unregistered
         .unwrap()
         .unwrap();
     assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
-    let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+    let replicas = node_operational::merged_replica_view_by_tablet(meta.pool(), 7, 0)
         .await
         .unwrap();
     assert!(replicas
@@ -3177,10 +3287,10 @@ async fn admin_tablet_rebalance_skips_raft_retirement_when_group_is_unregistered
         .unwrap()
         .error_for_status()
         .unwrap();
-    let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+    let intent = agentdb_meta::tablet_replicas::list_intent_by_tablet(meta.pool(), 7)
         .await
         .unwrap();
-    assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
+    assert!(!intent.iter().any(|row| row.node_id == "node-b"));
 }
 
 #[tokio::test]

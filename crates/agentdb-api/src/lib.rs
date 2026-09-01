@@ -8,6 +8,7 @@ mod auth;
 pub mod dto;
 pub mod errors;
 pub mod internal_raft_http;
+pub mod operational;
 pub mod raft_ingress;
 pub mod routes;
 pub mod routing_http;

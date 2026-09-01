@@ -955,6 +955,23 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
   delta replay incl. purge scrub, corruption fallback, min-advance gate),
   which runs in the quick profile in both hydration modes.
 
+### Metadata self-hosting stage 1 (2026-08-31)
+
+- Migration 027: `tablet_replicas` becomes placement intent (role +
+  active/draining state); observed progress/health and all tablet stats
+  ride per-node `node_operational` JSON summaries at heartbeat cadence.
+- Raft hot paths (send, receive, apply, snapshot, movement observers) are
+  SQL-free: observations land in an in-process registry; the heartbeat
+  serializes it. Ingress peer validation uses a 5s in-process cache of the
+  intent-derived peer set with refresh-once-before-reject.
+- Merged-view semantics pinned by unit tests: intent DEFINES the replica
+  set, observations enrich (health `unknown` until the first fresh report;
+  progress max-merged across observers; any observer's `unreachable`
+  degrades); observation-only echoes of retired replicas are not replicas.
+- Validation: meta/server/api suites rewritten to the intent/observation
+  split (seed helpers mirror the old one-call shape); S8 + S9 real-cluster
+  smokes re-run against the new plumbing.
+
 ## 7b. Coverage adequacy argument
 
 | Claim | Threat model (how it could fail) | Scenarios that exercise the threats | Why these are sufficient |

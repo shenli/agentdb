@@ -1546,7 +1546,18 @@ async fn validate_internal_raft_peer_ids(
     let Some(meta) = state.meta.as_ref() else {
         return Ok(());
     };
-    let replicas = tablet_replicas::list_by_tablet(meta.pool(), tablet_id)
+    // Peer membership is placement intent, cached in-process so the message
+    // ingress does not touch SQL per message. On a miss against the cached
+    // set (or an expired cache), refresh once before rejecting — membership
+    // may have just changed.
+    let now_ms = now_ms_i64();
+    let cached = state.operational.cached_peer_set(tablet_id, now_ms);
+    if let Some(set) = &cached {
+        if set.contains(&from) && set.contains(&to) {
+            return Ok(());
+        }
+    }
+    let intent = tablet_replicas::list_intent_by_tablet(meta.pool(), tablet_id)
         .await
         .map_err(|err| {
             internal_raft_error(
@@ -1555,14 +1566,15 @@ async fn validate_internal_raft_peer_ids(
                 err.to_string(),
             )
         })?;
-    let has_from = replicas.iter().any(|replica| {
-        agentdb_storage::stable_raft_node_id(&replica.node_id)
-            .is_ok_and(|candidate| candidate == from)
-    });
-    let has_to = replicas.iter().any(|replica| {
-        agentdb_storage::stable_raft_node_id(&replica.node_id)
-            .is_ok_and(|candidate| candidate == to)
-    });
+    let set: std::collections::BTreeSet<u64> = intent
+        .iter()
+        .filter_map(|row| agentdb_storage::stable_raft_node_id(&row.node_id).ok())
+        .collect();
+    state
+        .operational
+        .store_peer_set(tablet_id, now_ms, set.clone());
+    let has_from = set.contains(&from);
+    let has_to = set.contains(&to);
     if !has_from || !has_to {
         return Err(internal_raft_error(
             StatusCode::FORBIDDEN,
@@ -1590,64 +1602,22 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, Box<Response>> {
 async fn record_local_raft_replica_progress(
     state: &AppState,
     tablet_id: i64,
-    raft_node_id: u64,
+    _raft_node_id: u64,
     applied_index: u64,
     match_index: u64,
 ) {
-    let Some(meta) = state.meta.as_ref() else {
-        return;
-    };
-    let local_node_id = match resolve_control_plane_node_id(meta, tablet_id, raft_node_id).await {
-        Ok(Some(node_id)) => node_id,
-        Ok(None) => {
-            tracing::debug!(
-                tablet_id,
-                raft_node_id,
-                "skipping raft replica progress update; control-plane node not found"
-            );
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(
-                tablet_id,
-                raft_node_id,
-                ?error,
-                "failed to resolve raft replica control-plane node"
-            );
-            return;
-        }
-    };
-    let now_ms = now_ms_i64();
+    // This is always the RECEIVING node's own progress; the node knows its
+    // identity, and the observation goes into the in-process registry (the
+    // heartbeat serializes it) — the raft receive path never touches SQL.
     let applied = applied_index.min(i64::MAX as u64) as i64;
     let matched = match_index.min(i64::MAX as u64) as i64;
-    if let Err(error) = tablet_replicas::set_progress(
-        meta.pool(),
+    state.operational.record_progress(
         tablet_id,
-        &local_node_id,
+        state.drain.node_id(),
         applied,
         matched,
-        now_ms,
-    )
-    .await
-    {
-        tracing::warn!(
-            tablet_id,
-            node_id = %local_node_id,
-            ?error,
-            "failed to update raft replica progress"
-        );
-        return;
-    }
-    if let Err(error) =
-        tablet_replicas::set_health(meta.pool(), tablet_id, &local_node_id, "healthy", now_ms).await
-    {
-        tracing::warn!(
-            tablet_id,
-            node_id = %local_node_id,
-            ?error,
-            "failed to update raft replica health"
-        );
-    }
+        now_ms_i64(),
+    );
 }
 
 async fn resolve_control_plane_node_id(
@@ -1655,12 +1625,12 @@ async fn resolve_control_plane_node_id(
     tablet_id: i64,
     raft_node_id: u64,
 ) -> agentdb_meta::MetaResult<Option<String>> {
-    for replica in tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await? {
-        let Ok(candidate) = agentdb_storage::stable_raft_node_id(&replica.node_id) else {
+    for row in tablet_replicas::list_intent_by_tablet(meta.pool(), tablet_id).await? {
+        let Ok(candidate) = agentdb_storage::stable_raft_node_id(&row.node_id) else {
             continue;
         };
         if candidate == raft_node_id {
-            return Ok(Some(replica.node_id));
+            return Ok(Some(row.node_id));
         }
     }
     Ok(None)
@@ -2203,6 +2173,9 @@ async fn delete_admin_node(
             err.to_string(),
         ))
     })?;
+    // A removed node's operational report goes with it (it would age out
+    // anyway; this just avoids a stale row lingering for the cutoff window).
+    let _ = agentdb_meta::node_operational::delete(meta.pool(), &node_id).await;
     Ok(Json(DeleteAdminNodeResponse { node_id, removed }))
 }
 
@@ -2349,14 +2322,40 @@ async fn require_assignable_node(
     Ok(node)
 }
 
+/// Placement intent merged with fresh per-node observations — the stage-1
+/// replacement for reading the old observed columns off `tablet_replicas`.
+async fn merged_replicas_by_tablet(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+) -> Result<Vec<tablet_replicas::TabletReplica>, ApiError> {
+    agentdb_meta::node_operational::merged_replica_view_by_tablet(
+        meta.pool(),
+        tablet_id,
+        operational_cutoff_ms(),
+    )
+    .await
+    .map_err(internal_error)
+}
+
+async fn merged_replicas_all(
+    meta: &agentdb_meta::MetaStore,
+) -> Result<Vec<tablet_replicas::TabletReplica>, ApiError> {
+    agentdb_meta::node_operational::merged_replica_view_all(meta.pool(), operational_cutoff_ms())
+        .await
+        .map_err(internal_error)
+}
+
+fn operational_cutoff_ms() -> i64 {
+    now_ms_i64().saturating_sub(agentdb_meta::node_operational::DEFAULT_STALENESS_MS)
+}
+
 async fn get_tablet_replica(
     meta: &agentdb_meta::MetaStore,
     tablet_id: i64,
     node_id: &str,
 ) -> Result<Option<tablet_replicas::TabletReplica>, ApiError> {
-    Ok(tablet_replicas::list_by_tablet(meta.pool(), tablet_id)
-        .await
-        .map_err(internal_error)?
+    Ok(merged_replicas_by_tablet(meta, tablet_id)
+        .await?
         .into_iter()
         .find(|replica| replica.node_id == node_id))
 }
@@ -2478,10 +2477,7 @@ async fn source_applied_index(
 ) -> Result<i64, ApiError> {
     let mut max_index = 0;
     for tablet_id in source_tablet_ids {
-        for replica in tablet_replicas::list_by_tablet(meta.pool(), *tablet_id)
-            .await
-            .map_err(internal_error)?
-        {
+        for replica in merged_replicas_by_tablet(meta, *tablet_id).await? {
             if replica.role != "log_only" {
                 max_index = max_index.max(replica.applied_index);
             }
@@ -2498,10 +2494,7 @@ async fn seed_destination_replicas_from_sources(
 ) -> Result<bool, ApiError> {
     let mut by_node = BTreeMap::<String, (String, i64, i64)>::new();
     for source_id in source_tablet_ids {
-        for replica in tablet_replicas::list_by_tablet(meta.pool(), *source_id)
-            .await
-            .map_err(internal_error)?
-        {
+        for replica in merged_replicas_by_tablet(meta, *source_id).await? {
             let priority = replica_role_priority(&replica.role);
             by_node
                 .entry(replica.node_id)
@@ -2517,25 +2510,14 @@ async fn seed_destination_replicas_from_sources(
     }
     let mut changed = false;
     for destination_id in destination_tablet_ids {
-        let existing = tablet_replicas::list_by_tablet(meta.pool(), *destination_id)
-            .await
-            .map_err(internal_error)?;
+        let existing = merged_replicas_by_tablet(meta, *destination_id).await?;
         for (node_id, (role, _, _)) in &by_node {
             if existing.iter().any(|replica| replica.node_id == *node_id) {
                 continue;
             }
-            tablet_replicas::upsert(
-                meta.pool(),
-                *destination_id,
-                node_id,
-                role,
-                "lagging",
-                0,
-                0,
-                now_ms,
-            )
-            .await
-            .map_err(internal_error)?;
+            tablet_replicas::upsert_intent(meta.pool(), *destination_id, node_id, role, now_ms)
+                .await
+                .map_err(internal_error)?;
             changed = true;
         }
     }
@@ -2559,9 +2541,7 @@ async fn ensure_destinations_ready(
 ) -> Result<bool, ApiError> {
     let mut all_ready = true;
     for destination_id in destination_tablet_ids {
-        let replicas = tablet_replicas::list_by_tablet(meta.pool(), *destination_id)
-            .await
-            .map_err(internal_error)?;
+        let replicas = merged_replicas_by_tablet(meta, *destination_id).await?;
         let serving_replicas: Vec<_> = replicas
             .iter()
             .filter(|replica| replica.role != "log_only")
@@ -2590,9 +2570,8 @@ async fn lifecycle_replicas(
     let mut replicas = Vec::new();
     for tablet_id in tablet_ids {
         replicas.extend(
-            tablet_replicas::list_by_tablet(meta.pool(), *tablet_id)
-                .await
-                .map_err(internal_error)?
+            merged_replicas_by_tablet(meta, *tablet_id)
+                .await?
                 .into_iter()
                 .map(tablet_replica_view),
         );
@@ -2718,23 +2697,24 @@ async fn get_admin_tablet_stats(
             return Err(invalid_admin_request("tablet_id must be non-negative"));
         }
     }
-    let stats = if let Some(tablet_id) = query.tablet_id {
-        tablet_stats::list_by_tablet(meta.pool(), tablet_id)
-            .await
-            .map_err(internal_error)?
-    } else {
-        tablet_stats::list_all(meta.pool())
-            .await
-            .map_err(internal_error)?
-    };
-    let aggregates = tablet_stats::list_aggregates(meta.pool())
+    let reports = agentdb_meta::node_operational::list_all(meta.pool())
         .await
-        .map_err(internal_error)?
+        .map_err(internal_error)?;
+    let all_stats = agentdb_meta::node_operational::stats_view(&reports, operational_cutoff_ms());
+    let aggregates = agentdb_meta::node_operational::stats_aggregates(&all_stats)
         .into_iter()
         .filter(|aggregate| {
             query
                 .tablet_id
                 .is_none_or(|tablet_id| aggregate.tablet_id == tablet_id)
+        })
+        .collect();
+    let stats = all_stats
+        .into_iter()
+        .filter(|row| {
+            query
+                .tablet_id
+                .is_none_or(|tablet_id| row.tablet_id == tablet_id)
         })
         .collect();
     Ok(Json(AdminTabletStatsResponse { stats, aggregates }))
@@ -3450,26 +3430,11 @@ async fn prepare_admin_tablet_replacement(
         .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS);
     let _ = require_assignable_node(meta, &body.target_node_id, now_ms, stale_threshold_ms).await?;
     let existing_target = get_tablet_replica(meta, tablet_id, &body.target_node_id).await?;
-    let target_applied = existing_target
-        .as_ref()
-        .map(|replica| replica.applied_index)
-        .unwrap_or(0);
-    let target_match = existing_target
-        .as_ref()
-        .map(|replica| replica.match_index)
-        .unwrap_or(0);
-    let target_health = existing_target
-        .as_ref()
-        .map(|replica| replica.health.as_str())
-        .unwrap_or("lagging");
-    tablet_replicas::upsert(
+    tablet_replicas::upsert_intent(
         meta.pool(),
         tablet_id,
         &body.target_node_id,
         "learner",
-        target_health,
-        target_applied,
-        target_match,
         now_ms,
     )
     .await
@@ -3758,14 +3723,11 @@ async fn complete_admin_tablet_replacement(
                     Ok(()) => {
                         raft_membership_changed = true;
                         target_replica.role = "voter".to_string();
-                        tablet_replicas::upsert(
+                        tablet_replicas::upsert_intent(
                             meta.pool(),
                             tablet_id,
                             &target_node_id,
                             "voter",
-                            &target_replica.health,
-                            target_replica.applied_index,
-                            target_replica.match_index,
                             now_ms_i64(),
                         )
                         .await
@@ -4045,18 +4007,9 @@ async fn complete_admin_tablet_replacement(
     }
 
     let now_ms = now_ms_i64();
-    tablet_replicas::upsert(
-        meta.pool(),
-        tablet_id,
-        &target_node_id,
-        "voter",
-        &target_replica.health,
-        target_replica.applied_index,
-        target_replica.match_index,
-        now_ms,
-    )
-    .await
-    .map_err(internal_error)?;
+    tablet_replicas::upsert_intent(meta.pool(), tablet_id, &target_node_id, "voter", now_ms)
+        .await
+        .map_err(internal_error)?;
     if retire_source {
         if let Some(source_node_id) = source_node_id.as_ref() {
             let _ = tablet_replicas::delete(meta.pool(), tablet_id, source_node_id)
@@ -4309,9 +4262,7 @@ async fn retire_draining_rebalance_raft_replicas(
         .into_iter()
         .map(|tablet| (tablet.tablet_id, tablet))
         .collect();
-    let replicas = tablet_replicas::list_all(meta.pool())
-        .await
-        .map_err(internal_error)?;
+    let replicas = merged_replicas_all(meta).await?;
     let mut retired = 0usize;
     for replica in replicas {
         if replica.role == "log_only" || replica.health != "draining" {
@@ -4822,25 +4773,19 @@ async fn run_raft_catch_up(
             if to == source_status.node_id {
                 if !dry_run {
                     let index = raft_index_to_i64(source_status.applied_index)?;
-                    tablet_replicas::set_progress(
-                        meta.pool(),
+                    s.operational.record_progress(
                         tablet_id,
                         &replica.node_id,
                         index,
                         index,
                         now_ms_i64(),
-                    )
-                    .await
-                    .map_err(internal_error)?;
-                    tablet_replicas::set_health(
-                        meta.pool(),
+                    );
+                    s.operational.record_health(
                         tablet_id,
                         &replica.node_id,
                         "healthy",
                         now_ms_i64(),
-                    )
-                    .await
-                    .map_err(internal_error)?;
+                    );
                 }
                 response.skipped += 1;
                 continue;
@@ -4895,15 +4840,8 @@ async fn run_raft_catch_up(
                     continue;
                 }
             };
-            tablet_replicas::set_health(
-                meta.pool(),
-                tablet_id,
-                &replica.node_id,
-                "lagging",
-                now_ms_i64(),
-            )
-            .await
-            .map_err(internal_error)?;
+            s.operational
+                .record_health(tablet_id, &replica.node_id, "lagging", now_ms_i64());
             match outbox
                 .as_ref()
                 .unwrap()
@@ -4932,25 +4870,19 @@ async fn run_raft_catch_up(
                     )
                     .await
                     .map_err(internal_error)?;
-                    tablet_replicas::set_progress(
-                        meta.pool(),
+                    s.operational.record_progress(
                         tablet_id,
                         &replica.node_id,
                         index,
                         index,
                         now_ms_i64(),
-                    )
-                    .await
-                    .map_err(internal_error)?;
-                    tablet_replicas::set_health(
-                        meta.pool(),
+                    );
+                    s.operational.record_health(
                         tablet_id,
                         &replica.node_id,
                         "healthy",
                         now_ms_i64(),
-                    )
-                    .await
-                    .map_err(internal_error)?;
+                    );
                     compact_through = compact_through.max(transfer.index);
                     response.sent += 1;
                     response.actions.push(RaftCatchUpAction {
@@ -4964,15 +4896,12 @@ async fn run_raft_catch_up(
                     });
                 }
                 Err(err) => {
-                    tablet_replicas::set_health(
-                        meta.pool(),
+                    s.operational.record_health(
                         tablet_id,
                         &replica.node_id,
                         "unreachable",
                         now_ms_i64(),
-                    )
-                    .await
-                    .map_err(internal_error)?;
+                    );
                     response.failures.push(RaftCatchUpFailure {
                         tablet_id,
                         node_id: replica.node_id.clone(),
@@ -5049,10 +4978,7 @@ async fn load_configured_raft_replicas(
         return Ok(BTreeMap::new());
     };
     let mut by_tablet: BTreeMap<i64, Vec<tablet_replicas::TabletReplica>> = BTreeMap::new();
-    for replica in tablet_replicas::list_all(meta.pool())
-        .await
-        .map_err(internal_error)?
-    {
+    for replica in merged_replicas_all(meta).await? {
         by_tablet
             .entry(replica.tablet_id)
             .or_default()
@@ -5199,7 +5125,10 @@ fn configured_raft_replica_statuses(
                 "retirement_pending"
             } else if replica.health == "unreachable" {
                 "unreachable"
-            } else if replication_lag > 0 || replica.health == "lagging" {
+            } else if replication_lag > 0
+                || replica.health == "lagging"
+                || replica.health == "unknown"
+            {
                 "catch_up_required"
             } else {
                 "stable"
@@ -5212,7 +5141,11 @@ fn configured_raft_replica_statuses(
                 applied_index: replica.applied_index,
                 match_index: replica.match_index,
                 replication_lag,
-                catch_up_required: replication_lag > 0 || replica.health == "lagging",
+                // "unknown" (no fresh observation yet) cannot be confirmed
+                // caught up — fail safe.
+                catch_up_required: replication_lag > 0
+                    || replica.health == "lagging"
+                    || replica.health == "unknown",
                 last_snapshot_index: latest_snapshot.map(|snapshot| snapshot.snapshot_index),
                 last_snapshot_age_ms: latest_snapshot
                     .map(|snapshot| now_ms.saturating_sub(snapshot.created_at_ms)),

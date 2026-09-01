@@ -175,6 +175,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/026_admin_token_tenant_scope.sql"),
         include_str!("../migrations/026_admin_token_tenant_scope.pg.sql"),
     ),
+    (
+        27,
+        "node operational summaries; tablet_replicas becomes placement intent",
+        include_str!("../migrations/027_node_operational.sql"),
+        include_str!("../migrations/027_node_operational.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the

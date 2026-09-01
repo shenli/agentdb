@@ -593,6 +593,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         let cluster_worker_config = ClusterWorkerConfig::from_env();
         spawn_cluster_workers(
             ClusterWorkerDeps {
+                operational: state.operational.clone(),
                 meta: startup.meta.clone(),
                 node_id: startup.node_id.clone(),
                 runtime: runtime.clone(),
@@ -680,6 +681,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         Duration::from_millis(raft_owner_campaign_interval_ms),
                     );
                     spawn_raft_rs_message_outbox_worker(
+                        state.operational.clone(),
                         startup.meta.clone(),
                         registry.clone(),
                         outbox.clone(),
@@ -709,6 +711,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     )
                     .max(0);
                     spawn_raft_rs_snapshot_worker(RaftRsSnapshotWorker {
+                        operational: state.operational.clone(),
                         meta: startup.meta.clone(),
                         registry: registry.clone(),
                         runtime: runtime.clone(),
@@ -725,6 +728,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         )
                         .max(1_000);
                         spawn_raft_snapshot_restore_worker(
+                            state.operational.clone(),
                             startup.meta.clone(),
                             startup.node_id.clone(),
                             registry.clone(),
@@ -2522,7 +2526,10 @@ async fn load_raft_rs_node_configs(
     tablet_id: i64,
     raft_engine_root: &std::path::Path,
 ) -> anyhow::Result<Vec<agentdb_storage::RaftRsNodeConfig>> {
-    let replicas = agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+    // Raft group membership comes from placement INTENT, never from
+    // observations (an observation-only row must not create a voter).
+    let replicas =
+        agentdb_meta::tablet_replicas::list_intent_by_tablet(meta.pool(), tablet_id).await?;
     let mut configs = Vec::new();
     for replica in replicas {
         if replica.role == "log_only" {
@@ -2555,7 +2562,7 @@ async fn sync_raft_rs_registry(
         .into_iter()
         .map(|tablet| (tablet.tablet_id, tablet.state))
         .collect();
-    let local_tablet_ids: BTreeSet<_> = agentdb_meta::tablet_replicas::list_all(meta.pool())
+    let local_tablet_ids: BTreeSet<_> = agentdb_meta::tablet_replicas::list_intent_all(meta.pool())
         .await?
         .into_iter()
         .filter(|replica| {
@@ -2639,7 +2646,7 @@ async fn load_raft_rs_peer_urls(
     let mut peer_urls = BTreeMap::new();
     for tablet_id in tablet_ids {
         let replicas =
-            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+            agentdb_meta::tablet_replicas::list_intent_by_tablet(meta.pool(), tablet_id).await?;
         for replica in replicas {
             if !matches!(replica.role.as_str(), "voter" | "learner") {
                 continue;
@@ -2793,30 +2800,34 @@ fn spawn_raft_rs_tick_worker(
                     BTreeMap::new()
                 }
             };
-            let raft_replicas_by_id =
-                match agentdb_meta::tablet_replicas::list_all(meta.pool()).await {
-                    Ok(replicas) => replicas
-                        .into_iter()
-                        .filter_map(|replica| {
-                            agentdb_storage::stable_raft_node_id(&replica.node_id)
-                                .ok()
-                                .map(|raft_node_id| {
-                                    (
-                                        (replica.tablet_id, raft_node_id),
-                                        (replica.node_id, replica.applied_index),
-                                    )
-                                })
-                        })
-                        .collect::<BTreeMap<_, _>>(),
-                    Err(error) => {
-                        tracing::warn!(
-                            local_node_id,
-                            ?error,
-                            "failed to load tablet replicas for raft-rs tick"
-                        );
-                        BTreeMap::new()
-                    }
-                };
+            let raft_replicas_by_id = match agentdb_meta::node_operational::merged_replica_view_all(
+                meta.pool(),
+                now_ms_i64().saturating_sub(agentdb_meta::node_operational::DEFAULT_STALENESS_MS),
+            )
+            .await
+            {
+                Ok(replicas) => replicas
+                    .into_iter()
+                    .filter_map(|replica| {
+                        agentdb_storage::stable_raft_node_id(&replica.node_id)
+                            .ok()
+                            .map(|raft_node_id| {
+                                (
+                                    (replica.tablet_id, raft_node_id),
+                                    (replica.node_id, replica.applied_index),
+                                )
+                            })
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                Err(error) => {
+                    tracing::warn!(
+                        local_node_id,
+                        ?error,
+                        "failed to load tablet replicas for raft-rs tick"
+                    );
+                    BTreeMap::new()
+                }
+            };
             let now_ms = now_ms_i64();
             for (tablet_id, group) in registry.groups_snapshot() {
                 let statuses = group.status();
@@ -3080,7 +3091,7 @@ async fn local_tablet_replica_is_voter(
     local_node_id: &str,
 ) -> anyhow::Result<bool> {
     Ok(
-        agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id)
+        agentdb_meta::tablet_replicas::list_intent_by_tablet(meta.pool(), tablet_id)
             .await?
             .into_iter()
             .any(|replica| replica.node_id == local_node_id && replica.role == "voter"),
@@ -3088,6 +3099,7 @@ async fn local_tablet_replica_is_voter(
 }
 
 fn spawn_raft_rs_message_outbox_worker(
+    operational: Arc<agentdb_api::operational::OperationalRegistry>,
     meta: agentdb_meta::MetaStore,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
     outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
@@ -3100,9 +3112,14 @@ fn spawn_raft_rs_message_outbox_worker(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(error) =
-                run_raft_rs_message_outbox_tick(&meta, &registry, &outbox, max_messages_per_tick)
-                    .await
+            if let Err(error) = run_raft_rs_message_outbox_tick(
+                &operational,
+                &meta,
+                &registry,
+                &outbox,
+                max_messages_per_tick,
+            )
+            .await
             {
                 tracing::warn!(?error, "failed to run raft-rs message outbox tick");
             }
@@ -3111,6 +3128,7 @@ fn spawn_raft_rs_message_outbox_worker(
 }
 
 async fn run_raft_rs_message_outbox_tick(
+    operational: &agentdb_api::operational::OperationalRegistry,
     meta: &agentdb_meta::MetaStore,
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
@@ -3126,6 +3144,7 @@ async fn run_raft_rs_message_outbox_tick(
         }
         let remaining_budget = max_messages_per_tick - sent;
         match flush_raft_rs_group_messages_with_health(
+            operational,
             meta,
             tablet_id,
             &group,
@@ -3144,6 +3163,7 @@ async fn run_raft_rs_message_outbox_tick(
 }
 
 async fn flush_raft_rs_group_messages_with_health(
+    operational: &agentdb_api::operational::OperationalRegistry,
     meta: &agentdb_meta::MetaStore,
     tablet_id: i64,
     group: &agentdb_storage::RaftRsSharedGroup,
@@ -3190,9 +3210,14 @@ async fn flush_raft_rs_group_messages_with_health(
     let health_budget = Duration::from_millis(2_000);
     let report = async {
         for (raft_node_id, health) in &peer_health {
-            if let Err(error) =
-                set_raft_replica_health_by_raft_node_id(meta, tablet_id, *raft_node_id, health)
-                    .await
+            if let Err(error) = set_raft_replica_health_by_raft_node_id(
+                operational,
+                meta,
+                tablet_id,
+                *raft_node_id,
+                health,
+            )
+            .await
             {
                 tracing::warn!(
                     tablet_id,
@@ -3215,6 +3240,7 @@ async fn flush_raft_rs_group_messages_with_health(
 }
 
 struct RaftRsSnapshotWorker {
+    operational: Arc<agentdb_api::operational::OperationalRegistry>,
     meta: agentdb_meta::MetaStore,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
     runtime: Arc<agentdb_core::Runtime>,
@@ -3227,6 +3253,7 @@ struct RaftRsSnapshotWorker {
 
 fn spawn_raft_rs_snapshot_worker(worker: RaftRsSnapshotWorker) {
     let RaftRsSnapshotWorker {
+        operational,
         meta,
         registry,
         runtime,
@@ -3241,7 +3268,9 @@ fn spawn_raft_rs_snapshot_worker(worker: RaftRsSnapshotWorker) {
         loop {
             interval.tick().await;
             if let Err(error) = run_raft_rs_snapshot_tick(
+                &operational,
                 &meta,
+                now_ms_i64(),
                 &registry,
                 runtime.clone(),
                 &outbox,
@@ -3257,8 +3286,11 @@ fn spawn_raft_rs_snapshot_worker(worker: RaftRsSnapshotWorker) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_raft_rs_snapshot_tick(
+    operational: &agentdb_api::operational::OperationalRegistry,
     meta: &agentdb_meta::MetaStore,
+    now_ms: i64,
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
     runtime: Arc<agentdb_core::Runtime>,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
@@ -3271,8 +3303,7 @@ async fn run_raft_rs_snapshot_tick(
         let Some(local_status) = group.status().into_iter().next() else {
             continue;
         };
-        let replicas =
-            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        let replicas = merged_replicas_by_tablet(meta, tablet_id, now_ms).await?;
         let source_node_id = raft_node_label(&replicas, local_status.node_id)
             .unwrap_or_else(|| local_status.node_id.to_string());
         let mut target_nodes = Vec::new();
@@ -3283,14 +3314,13 @@ async fn run_raft_rs_snapshot_tick(
             let to = agentdb_storage::stable_raft_node_id(&replica.node_id)?;
             if to == local_status.node_id {
                 update_raft_replica_progress_health(
-                    meta,
+                    operational,
                     tablet_id,
                     &replica.node_id,
                     local_status.applied_index,
                     local_status.commit_index,
                     "healthy",
-                )
-                .await?;
+                );
                 continue;
             }
             let peer_applied = replica.applied_index.max(0) as u64;
@@ -3299,14 +3329,7 @@ async fn run_raft_rs_snapshot_tick(
                 continue;
             }
             if replica.health != "lagging" {
-                agentdb_meta::tablet_replicas::set_health(
-                    meta.pool(),
-                    tablet_id,
-                    &replica.node_id,
-                    "lagging",
-                    now_ms_i64(),
-                )
-                .await?;
+                operational.record_health(tablet_id, &replica.node_id, "lagging", now_ms_i64());
             }
             target_nodes.push((to, replica.node_id));
         }
@@ -3332,14 +3355,7 @@ async fn run_raft_rs_snapshot_tick(
                 application_snapshot.clone(),
             )?;
             if let Err(error) = outbox.send_snapshot_to_peer(&transfer).await {
-                agentdb_meta::tablet_replicas::set_health(
-                    meta.pool(),
-                    tablet_id,
-                    &node_id,
-                    "unreachable",
-                    now_ms_i64(),
-                )
-                .await?;
+                operational.record_health(tablet_id, &node_id, "unreachable", now_ms_i64());
                 tracing::warn!(
                     tablet_id,
                     from = local_status.node_id,
@@ -3350,14 +3366,13 @@ async fn run_raft_rs_snapshot_tick(
                 continue;
             }
             update_raft_replica_progress_health(
-                meta,
+                operational,
                 tablet_id,
                 &node_id,
                 transfer.index,
                 transfer.index,
                 "healthy",
-            )
-            .await?;
+            );
             let now_ms = now_ms_i64();
             let expires_at_ms = now_ms.checked_add(retention_ms);
             let storage_uri = match snapshot_store.as_ref() {
@@ -3443,6 +3458,7 @@ fn spawn_raft_snapshot_prune_worker(
 }
 
 fn spawn_raft_snapshot_restore_worker(
+    operational: Arc<agentdb_api::operational::OperationalRegistry>,
     meta: agentdb_meta::MetaStore,
     local_node_id: String,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
@@ -3455,6 +3471,7 @@ fn spawn_raft_snapshot_restore_worker(
         loop {
             interval.tick().await;
             if let Err(error) = run_raft_snapshot_restore_tick(
+                &operational,
                 &meta,
                 &local_node_id,
                 &registry,
@@ -3470,6 +3487,7 @@ fn spawn_raft_snapshot_restore_worker(
 }
 
 async fn run_raft_snapshot_restore_tick(
+    operational: &agentdb_api::operational::OperationalRegistry,
     meta: &agentdb_meta::MetaStore,
     local_node_id: &str,
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
@@ -3528,14 +3546,13 @@ async fn run_raft_snapshot_restore_tick(
                 .map_err(|error| anyhow::anyhow!(error.message))?;
         }
         update_raft_replica_progress_health(
-            meta,
+            operational,
             snapshot.tablet_id,
             local_node_id,
             snapshot.snapshot_index as u64,
             snapshot.snapshot_index as u64,
             "healthy",
-        )
-        .await?;
+        );
         installed += 1;
     }
     Ok(installed)
@@ -3575,27 +3592,23 @@ async fn run_raft_snapshot_prune_tick(
     Ok(deleted)
 }
 
-async fn update_raft_replica_progress_health(
-    meta: &agentdb_meta::MetaStore,
+fn update_raft_replica_progress_health(
+    operational: &agentdb_api::operational::OperationalRegistry,
     tablet_id: i64,
     node_id: &str,
     applied_index: u64,
     match_index: u64,
     health: &str,
-) -> anyhow::Result<()> {
+) {
     let now_ms = now_ms_i64();
-    agentdb_meta::tablet_replicas::set_progress(
-        meta.pool(),
+    operational.record_progress(
         tablet_id,
         node_id,
         applied_index.min(i64::MAX as u64) as i64,
         match_index.min(i64::MAX as u64) as i64,
         now_ms,
-    )
-    .await?;
-    agentdb_meta::tablet_replicas::set_health(meta.pool(), tablet_id, node_id, health, now_ms)
-        .await?;
-    Ok(())
+    );
+    operational.record_health(tablet_id, node_id, health, now_ms);
 }
 
 fn raft_snapshot_id(tablet_id: i64, from: u64, to: u64, index: u64) -> String {
@@ -3613,29 +3626,33 @@ fn raft_node_label(
 }
 
 async fn set_raft_replica_health_by_raft_node_id(
+    operational: &agentdb_api::operational::OperationalRegistry,
     meta: &agentdb_meta::MetaStore,
     tablet_id: i64,
     raft_node_id: u64,
     health: &str,
 ) -> anyhow::Result<bool> {
-    let Some(node_id) = resolve_raft_replica_node_id(meta, tablet_id, raft_node_id).await? else {
-        tracing::debug!(
-            tablet_id,
-            raft_node_id,
-            health,
-            "skipping raft replica health update; control-plane node not found"
-        );
-        return Ok(false);
+    // Resolution is memoized (raft ids are stable per node); the SQL
+    // fallback runs once per unknown peer, never per message.
+    let node_id = match operational.resolve_raft_node(raft_node_id) {
+        Some(node_id) => node_id,
+        None => {
+            let Some(node_id) = resolve_raft_replica_node_id(meta, tablet_id, raft_node_id).await?
+            else {
+                tracing::debug!(
+                    tablet_id,
+                    raft_node_id,
+                    health,
+                    "skipping raft replica health update; control-plane node not found"
+                );
+                return Ok(false);
+            };
+            operational.map_raft_node(raft_node_id, &node_id);
+            node_id
+        }
     };
-    let updated = agentdb_meta::tablet_replicas::set_health(
-        meta.pool(),
-        tablet_id,
-        &node_id,
-        health,
-        now_ms_i64(),
-    )
-    .await?;
-    Ok(updated)
+    operational.record_health(tablet_id, &node_id, health, now_ms_i64());
+    Ok(true)
 }
 
 async fn resolve_raft_replica_node_id(
@@ -3643,12 +3660,12 @@ async fn resolve_raft_replica_node_id(
     tablet_id: i64,
     raft_node_id: u64,
 ) -> agentdb_meta::MetaResult<Option<String>> {
-    for replica in agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await? {
-        let Ok(candidate) = agentdb_storage::stable_raft_node_id(&replica.node_id) else {
+    for row in agentdb_meta::tablet_replicas::list_intent_by_tablet(meta.pool(), tablet_id).await? {
+        let Ok(candidate) = agentdb_storage::stable_raft_node_id(&row.node_id) else {
             continue;
         };
         if candidate == raft_node_id {
-            return Ok(Some(replica.node_id));
+            return Ok(Some(row.node_id));
         }
     }
     Ok(None)
@@ -3749,6 +3766,7 @@ fn spawn_route_snapshot_refresher(
 }
 
 struct ClusterWorkerDeps {
+    operational: Arc<agentdb_api::operational::OperationalRegistry>,
     meta: agentdb_meta::MetaStore,
     node_id: String,
     runtime: Arc<agentdb_core::Runtime>,
@@ -3765,6 +3783,7 @@ struct ClusterWorkerDeps {
 
 fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
     let ClusterWorkerDeps {
+        operational,
         meta,
         node_id,
         runtime,
@@ -3779,6 +3798,8 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
         drain,
     } = deps;
     let heartbeat_meta = meta.clone();
+    let heartbeat_operational = operational.clone();
+    let heartbeat_raft_registry = raft_registry.clone();
     let heartbeat_node_id = node_id.clone();
     let heartbeat_node_address = node_address.clone();
     let heartbeat_region = region.clone();
@@ -3811,16 +3832,28 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
             {
                 tracing::warn!(node_id = %heartbeat_node_id, error = %error, "node heartbeat failed");
             }
+            if let Err(error) = report_node_operational_once(
+                &heartbeat_operational,
+                heartbeat_raft_registry.as_deref(),
+                &heartbeat_meta,
+                &heartbeat_node_id,
+                now_ms,
+            )
+            .await
+            {
+                tracing::warn!(node_id = %heartbeat_node_id, error = %error, "operational report failed");
+            }
         }
     });
 
-    let maintenance_meta = meta.clone();
+    let maintenance_operational = operational.clone();
     let maintenance_node_id = node_id.clone();
     let maintenance_runtime = runtime.clone();
     let maintenance_scheduler_status = scheduler_status.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
+        let mut stats_previous_samples: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
         loop {
             interval.tick().await;
             let now_ms = now_ms_i64();
@@ -3848,13 +3881,11 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
                 }
             }
             match run_local_tablet_stats_tick(
-                &maintenance_meta,
+                &maintenance_operational,
                 &maintenance_runtime,
-                &maintenance_node_id,
+                &mut stats_previous_samples,
                 now_ms,
-            )
-            .await
-            {
+            ) {
                 Ok(published_count) if published_count > 0 => {
                     tracing::debug!(
                         node_id = %maintenance_node_id,
@@ -3875,6 +3906,7 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
     });
 
     let movement_meta = meta.clone();
+    let movement_operational = operational.clone();
     let movement_node_id = node_id.clone();
     let movement_runtime = runtime.clone();
     let movement_snapshot_client = movement_snapshot_client.clone();
@@ -3886,6 +3918,7 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
             interval.tick().await;
             let now_ms = now_ms_i64();
             match run_local_tablet_movement_executor_tick(
+                &movement_operational,
                 &movement_meta,
                 &movement_runtime,
                 movement_snapshot_client.as_ref(),
@@ -3940,6 +3973,34 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Placement intent merged with fresh per-node observations (stage 1 of
+/// metadata self-hosting): the replacement for reading observed columns
+/// off the old `tablet_replicas` table.
+async fn merged_replicas_by_tablet(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    now_ms: i64,
+) -> agentdb_meta::MetaResult<Vec<agentdb_meta::tablet_replicas::TabletReplica>> {
+    agentdb_meta::node_operational::merged_replica_view_by_tablet(
+        meta.pool(),
+        tablet_id,
+        now_ms.saturating_sub(agentdb_meta::node_operational::DEFAULT_STALENESS_MS),
+    )
+    .await
+}
+
+async fn merged_replicas_all(
+    meta: &agentdb_meta::MetaStore,
+    now_ms: i64,
+) -> agentdb_meta::MetaResult<Vec<agentdb_meta::tablet_replicas::TabletReplica>> {
+    agentdb_meta::node_operational::merged_replica_view_all(
+        meta.pool(),
+        now_ms.saturating_sub(agentdb_meta::node_operational::DEFAULT_STALENESS_MS),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn heartbeat_node_once(
     meta: &agentdb_meta::MetaStore,
     node_id: &str,
@@ -3964,6 +4025,67 @@ async fn heartbeat_node_once(
         capacity_class,
     )
     .await
+}
+
+/// Serialize this node's operational view into its one summary row —
+/// stage 1 of metadata self-hosting. Everything the old per-tablet
+/// `tablet_replicas` progress/health writes and `tablet_stats` rows
+/// carried now rides here, at heartbeat cadence.
+async fn report_node_operational_once(
+    operational: &agentdb_api::operational::OperationalRegistry,
+    raft_registry: Option<&agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    meta: &agentdb_meta::MetaStore,
+    node_id: &str,
+    now_ms: i64,
+) -> agentdb_meta::MetaResult<()> {
+    let cutoff = now_ms.saturating_sub(agentdb_meta::node_operational::DEFAULT_STALENESS_MS);
+    let mut replicas: BTreeMap<(i64, String), agentdb_meta::node_operational::ReplicaObservation> =
+        BTreeMap::new();
+    for (tablet_id, observed_node, observation) in operational.snapshot(cutoff) {
+        replicas.insert(
+            (tablet_id, observed_node.clone()),
+            agentdb_meta::node_operational::ReplicaObservation {
+                tablet_id,
+                node_id: observed_node,
+                role: "voter".to_string(),
+                health: observation.health.clone(),
+                applied_index: observation.applied_index,
+                match_index: observation.match_index,
+            },
+        );
+    }
+    // Live raft status covers the local replica even when no message has
+    // flowed recently (leaders of quiet tablets included).
+    if let Some(registry) = raft_registry {
+        let local_raft_node_id = agentdb_storage::stable_raft_node_id(node_id)
+            .map_err(|e| agentdb_meta::MetaError::InvalidInput(e.to_string()))?;
+        for (tablet_id, group) in registry.groups_snapshot() {
+            for status in group.status() {
+                if status.node_id != local_raft_node_id {
+                    continue;
+                }
+                let applied = status.applied_index.min(i64::MAX as u64) as i64;
+                let entry = replicas
+                    .entry((tablet_id, node_id.to_string()))
+                    .or_insert_with(|| agentdb_meta::node_operational::ReplicaObservation {
+                        tablet_id,
+                        node_id: node_id.to_string(),
+                        role: status.role.to_ascii_lowercase(),
+                        health: "healthy".to_string(),
+                        applied_index: applied,
+                        match_index: applied,
+                    });
+                entry.role = status.role.to_ascii_lowercase();
+                entry.applied_index = entry.applied_index.max(applied);
+                entry.match_index = entry.match_index.max(applied);
+            }
+        }
+    }
+    let summary = agentdb_meta::node_operational::NodeOperationalSummary {
+        replicas: replicas.into_values().collect(),
+        tablet_stats: operational.tablet_stats_snapshot(),
+    };
+    agentdb_meta::node_operational::report(meta.pool(), node_id, now_ms, &summary).await
 }
 
 fn run_local_tablet_log_compaction_tick(
@@ -3991,52 +4113,45 @@ fn run_local_tablet_log_compaction_tick(
     Ok(compacted_count)
 }
 
-async fn run_local_tablet_stats_tick(
-    meta: &agentdb_meta::MetaStore,
+/// Sample local tablet storage stats into the in-process registry. The
+/// write-rate baseline (`previous_samples`: tablet -> (applied, at_ms)) is
+/// owned by the calling worker loop — no SQL round trip in either
+/// direction; the heartbeat serializes the registry.
+fn run_local_tablet_stats_tick(
+    operational: &agentdb_api::operational::OperationalRegistry,
     runtime: &Arc<agentdb_core::Runtime>,
-    node_id: &str,
+    previous_samples: &mut BTreeMap<i64, (i64, i64)>,
     now_ms: i64,
 ) -> anyhow::Result<usize> {
-    let previous_stats: BTreeMap<_, _> = agentdb_meta::tablet_stats::list_all(meta.pool())
-        .await?
-        .into_iter()
-        .filter(|stats| stats.node_id == node_id)
-        .map(|stats| (stats.tablet_id, stats))
-        .collect();
     let stats = runtime
         .local_tablet_storage_stats()
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let mut observations = Vec::with_capacity(stats.len());
     for stats in &stats {
         let applied_index = u64_to_i64_saturating(stats.applied_index);
-        let (sample_interval_ms, write_ops_delta, write_ops_per_sec_milli) = previous_stats
+        let (sample_interval_ms, write_ops_delta, write_ops_per_sec_milli) = previous_samples
             .get(&stats.tablet_id)
-            .map(|previous| {
-                tablet_write_rate_sample(
-                    previous.applied_index,
-                    previous.updated_at_ms,
-                    applied_index,
-                    now_ms,
-                )
+            .map(|(previous_applied, previous_at_ms)| {
+                tablet_write_rate_sample(*previous_applied, *previous_at_ms, applied_index, now_ms)
             })
             .unwrap_or((0, 0, 0));
-        agentdb_meta::tablet_stats::upsert_with_rate(
-            meta.pool(),
-            stats.tablet_id,
-            node_id,
-            u64_to_i64_saturating(stats.key_count),
-            u64_to_i64_saturating(stats.key_bytes),
-            u64_to_i64_saturating(stats.value_bytes),
-            u64_to_i64_saturating(stats.storage_bytes),
+        previous_samples.insert(stats.tablet_id, (applied_index, now_ms));
+        observations.push(agentdb_meta::node_operational::TabletStatsObservation {
+            tablet_id: stats.tablet_id,
+            key_count: u64_to_i64_saturating(stats.key_count),
+            key_bytes: u64_to_i64_saturating(stats.key_bytes),
+            value_bytes: u64_to_i64_saturating(stats.value_bytes),
+            storage_bytes: u64_to_i64_saturating(stats.storage_bytes),
             applied_index,
             sample_interval_ms,
             write_ops_delta,
             write_ops_per_sec_milli,
-            u64_to_i64_saturating(stats.compaction_debt_ops),
-            now_ms,
-        )
-        .await?;
+            compaction_debt_ops: u64_to_i64_saturating(stats.compaction_debt_ops),
+        });
     }
-    Ok(stats.len())
+    let published = observations.len();
+    operational.set_tablet_stats(observations);
+    Ok(published)
 }
 
 fn tablet_write_rate_sample(
@@ -4195,18 +4310,6 @@ async fn run_cluster_scheduler_tick(
             "scheduler cleared tablet ownership from dead nodes"
         );
     }
-    let deleted_stale_tablet_stats = agentdb_meta::tablet_stats::delete_stale(
-        pool,
-        now_ms.saturating_sub(config.stale_node_threshold_ms).max(0),
-    )
-    .await?;
-    if deleted_stale_tablet_stats > 0 {
-        tracing::debug!(
-            node_id = %node_id,
-            deleted_stale_tablet_stats,
-            "scheduler deleted stale tablet storage stats"
-        );
-    }
 
     let cleared = agentdb_meta::tablets::clear_expired_ownership(
         pool,
@@ -4239,7 +4342,7 @@ async fn run_cluster_scheduler_tick(
                 0
             };
             let retired_draining_sources =
-                retire_draining_rebalance_raft_replicas(meta, registry).await?;
+                retire_draining_rebalance_raft_replicas(meta, registry, now_ms).await?;
             if membership_changes > 0 || retired_draining_sources > 0 {
                 tracing::info!(
                     node_id = %node_id,
@@ -4335,8 +4438,7 @@ async fn reconcile_raft_leader_tablet_ownership(
         let Some(leader_raft_node_id) = raft_leader_id_from_statuses(&statuses) else {
             continue;
         };
-        let replicas =
-            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        let replicas = merged_replicas_by_tablet(meta, tablet_id, now_ms).await?;
         let Some(leader_replica) = replicas.into_iter().find(|replica| {
             matches!(replica.role.as_str(), "voter" | "learner")
                 && agentdb_storage::stable_raft_node_id(&replica.node_id)
@@ -4576,6 +4678,7 @@ async fn apply_scheduler_rebalance_raft_membership_changes(
 async fn retire_draining_rebalance_raft_replicas(
     meta: &agentdb_meta::MetaStore,
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+    now_ms: i64,
 ) -> agentdb_meta::MetaResult<usize> {
     let tablets: BTreeMap<i64, agentdb_meta::tablets::Tablet> =
         agentdb_meta::tablets::list_all(meta.pool())
@@ -4583,7 +4686,7 @@ async fn retire_draining_rebalance_raft_replicas(
             .into_iter()
             .map(|tablet| (tablet.tablet_id, tablet))
             .collect();
-    let replicas = agentdb_meta::tablet_replicas::list_all(meta.pool()).await?;
+    let replicas = merged_replicas_all(meta, now_ms).await?;
     let mut retired = 0usize;
     for replica in replicas {
         if replica.role == "log_only" || replica.health != "draining" {
@@ -4692,11 +4795,15 @@ async fn run_tablet_lifecycle_policy_tick(
 
     let tablets = agentdb_meta::tablets::list_all(meta.pool()).await?;
     let ranges = agentdb_meta::tablet_ranges::list_all(meta.pool()).await?;
-    let stats_by_tablet: BTreeMap<_, _> = agentdb_meta::tablet_stats::list_aggregates(meta.pool())
-        .await?
-        .into_iter()
-        .map(|stats| (stats.tablet_id, stats))
-        .collect();
+    let stats_by_tablet: BTreeMap<_, _> = {
+        let reports = agentdb_meta::node_operational::list_all(meta.pool()).await?;
+        let cutoff = now_ms.saturating_sub(agentdb_meta::node_operational::DEFAULT_STALENESS_MS);
+        let stats = agentdb_meta::node_operational::stats_view(&reports, cutoff);
+        agentdb_meta::node_operational::stats_aggregates(&stats)
+            .into_iter()
+            .map(|stats| (stats.tablet_id, stats))
+            .collect()
+    };
     let recent_movements =
         agentdb_meta::tablet_movements::list_recent(meta.pool(), None, 1_000).await?;
     let mut busy_tablet_ids = BTreeSet::new();
@@ -4761,7 +4868,7 @@ async fn run_tablet_lifecycle_policy_tick(
             if !should_split_tablet(config, shard_count, stats) || shard_count < 2 {
                 continue;
             }
-            if lifecycle_source_applied_index(meta, &[tablet.tablet_id])
+            if lifecycle_source_applied_index(meta, &[tablet.tablet_id], now_ms)
                 .await?
                 .is_none()
             {
@@ -4849,7 +4956,7 @@ async fn run_tablet_lifecycle_policy_tick(
                 report.skipped_count += 1;
                 continue;
             }
-            if lifecycle_source_applied_index(meta, &[left.tablet_id, right.tablet_id])
+            if lifecycle_source_applied_index(meta, &[left.tablet_id, right.tablet_id], now_ms)
                 .await?
                 .is_none()
             {
@@ -4953,7 +5060,7 @@ async fn prepare_lifecycle_split(
     child_ranges: &[agentdb_meta::tablet_ranges::ReplacementRange; 2],
     now_ms: i64,
 ) -> agentdb_meta::MetaResult<()> {
-    let required_applied_index = lifecycle_source_applied_index(meta, &[source.tablet_id])
+    let required_applied_index = lifecycle_source_applied_index(meta, &[source.tablet_id], now_ms)
         .await?
         .unwrap_or(0);
     for child in child_ranges {
@@ -5007,7 +5114,7 @@ async fn prepare_lifecycle_merge(
     now_ms: i64,
 ) -> agentdb_meta::MetaResult<()> {
     let source_ids = [left.tablet_id, right.tablet_id];
-    let required_applied_index = lifecycle_source_applied_index(meta, &source_ids)
+    let required_applied_index = lifecycle_source_applied_index(meta, &source_ids, now_ms)
         .await?
         .unwrap_or(0);
     let raft_group_id = format!("raft/{destination_tablet_id}");
@@ -5052,13 +5159,12 @@ async fn prepare_lifecycle_merge(
 async fn lifecycle_source_applied_index(
     meta: &agentdb_meta::MetaStore,
     source_tablet_ids: &[i64],
+    now_ms: i64,
 ) -> agentdb_meta::MetaResult<Option<i64>> {
     let mut max_index = 0;
     let mut found = false;
     for tablet_id in source_tablet_ids {
-        for replica in
-            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), *tablet_id).await?
-        {
+        for replica in merged_replicas_by_tablet(meta, *tablet_id, now_ms).await? {
             if replica.role == "log_only" {
                 continue;
             }
@@ -5077,9 +5183,7 @@ async fn seed_lifecycle_destination_replicas(
 ) -> agentdb_meta::MetaResult<()> {
     let mut by_node = BTreeMap::<String, (String, i64, i64, i64)>::new();
     for source_id in source_tablet_ids {
-        for replica in
-            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), *source_id).await?
-        {
+        for replica in merged_replicas_by_tablet(meta, *source_id, now_ms).await? {
             let priority = lifecycle_replica_role_priority(&replica.role);
             if priority == 0 {
                 continue;
@@ -5103,15 +5207,12 @@ async fn seed_lifecycle_destination_replicas(
         }
     }
     for destination_id in destination_tablet_ids {
-        for (node_id, (role, _, applied_index, match_index)) in &by_node {
-            agentdb_meta::tablet_replicas::upsert(
+        for (node_id, (role, _, _applied_index, _match_index)) in &by_node {
+            agentdb_meta::tablet_replicas::upsert_intent(
                 meta.pool(),
                 *destination_id,
                 node_id,
                 role,
-                "lagging",
-                *applied_index,
-                *match_index,
                 now_ms,
             )
             .await?;
@@ -5157,7 +5258,7 @@ async fn run_tablet_movement_tick(
     let pending = agentdb_meta::tablet_movements::list_pending(meta.pool(), batch_size).await?;
     let mut completed = 0;
     for movement in pending {
-        if tablet_movement_destination_ready(meta, &movement).await?
+        if tablet_movement_destination_ready(meta, &movement, now_ms).await?
             && agentdb_meta::tablet_movements::mark_completed(
                 meta.pool(),
                 &movement.movement_id,
@@ -5255,7 +5356,7 @@ async fn complete_ready_split_cutover(
         return Ok(0);
     }
     for movement in &movements {
-        if !tablet_movement_destination_ready(meta, movement).await? {
+        if !tablet_movement_destination_ready(meta, movement, now_ms).await? {
             return Ok(0);
         }
         let Some(destination) =
@@ -5339,7 +5440,7 @@ async fn complete_ready_merge_cutover(
     }
     let mut old_ranges = Vec::new();
     for movement in &movements {
-        if !tablet_movement_destination_ready(meta, movement).await? {
+        if !tablet_movement_destination_ready(meta, movement, now_ms).await? {
             return Ok(0);
         }
         let Some(source) =
@@ -5436,6 +5537,7 @@ fn next_range_map_epoch(ranges: &[agentdb_meta::tablet_ranges::TabletRange]) -> 
 }
 
 async fn run_local_tablet_movement_executor_tick(
+    operational: &agentdb_api::operational::OperationalRegistry,
     meta: &agentdb_meta::MetaStore,
     runtime: &Arc<agentdb_core::Runtime>,
     movement_snapshot_client: Option<&agentdb_api::internal_raft_http::RaftRsHttpClient>,
@@ -5457,6 +5559,7 @@ async fn run_local_tablet_movement_executor_tick(
                 movement.source_tablet_id,
                 node_id,
                 movement.required_applied_index,
+                now_ms,
             )
             .await?;
         if !source_is_local
@@ -5466,13 +5569,14 @@ async fn run_local_tablet_movement_executor_tick(
                     movement.source_tablet_id,
                     node_id,
                     movement.required_applied_index,
+                    now_ms,
                 )
                 .await?
                 .is_none())
         {
             continue;
         }
-        if local_serving_replica(meta, movement.destination_tablet_id, node_id)
+        if local_serving_replica(meta, movement.destination_tablet_id, node_id, now_ms)
             .await?
             .is_none()
         {
@@ -5526,6 +5630,7 @@ async fn run_local_tablet_movement_executor_tick(
                     movement.source_tablet_id,
                     node_id,
                     movement.required_applied_index,
+                    now_ms,
                 )
                 .await?
             {
@@ -5546,6 +5651,7 @@ async fn run_local_tablet_movement_executor_tick(
                     movement.source_tablet_id,
                     node_id,
                     movement.required_applied_index,
+                    now_ms,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -5599,23 +5705,14 @@ async fn run_local_tablet_movement_executor_tick(
         if installed_count != movements.len() {
             continue;
         }
-        agentdb_meta::tablet_replicas::set_progress(
-            meta.pool(),
+        operational.record_progress(
             destination_tablet_id,
             node_id,
             max_installed_index,
             max_installed_index,
             now_ms,
-        )
-        .await?;
-        agentdb_meta::tablet_replicas::set_health(
-            meta.pool(),
-            destination_tablet_id,
-            node_id,
-            "healthy",
-            now_ms,
-        )
-        .await?;
+        );
+        operational.record_health(destination_tablet_id, node_id, "healthy", now_ms);
         executed += installed_count;
     }
     Ok(executed)
@@ -5625,13 +5722,12 @@ async fn local_serving_replica(
     meta: &agentdb_meta::MetaStore,
     tablet_id: i64,
     node_id: &str,
+    now_ms: i64,
 ) -> agentdb_meta::MetaResult<Option<agentdb_meta::tablet_replicas::TabletReplica>> {
-    Ok(
-        agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id)
-            .await?
-            .into_iter()
-            .find(|replica| replica.node_id == node_id && replica.role != "log_only"),
-    )
+    Ok(merged_replicas_by_tablet(meta, tablet_id, now_ms)
+        .await?
+        .into_iter()
+        .find(|replica| replica.node_id == node_id && replica.role != "log_only"))
 }
 
 async fn local_source_replica_ready(
@@ -5639,8 +5735,9 @@ async fn local_source_replica_ready(
     tablet_id: i64,
     node_id: &str,
     required_applied_index: i64,
+    now_ms: i64,
 ) -> agentdb_meta::MetaResult<bool> {
-    Ok(local_serving_replica(meta, tablet_id, node_id)
+    Ok(local_serving_replica(meta, tablet_id, node_id, now_ms)
         .await?
         .is_some_and(|replica| {
             replica.health == "healthy" && replica.applied_index >= required_applied_index
@@ -5652,8 +5749,9 @@ async fn source_replica_url(
     tablet_id: i64,
     local_node_id: &str,
     required_applied_index: i64,
+    now_ms: i64,
 ) -> anyhow::Result<Option<String>> {
-    for replica in agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await? {
+    for replica in merged_replicas_by_tablet(meta, tablet_id, now_ms).await? {
         if replica.node_id == local_node_id || replica.role == "log_only" {
             continue;
         }
@@ -5674,10 +5772,9 @@ async fn source_replica_url(
 async fn tablet_movement_destination_ready(
     meta: &agentdb_meta::MetaStore,
     movement: &agentdb_meta::tablet_movements::TabletMovement,
+    now_ms: i64,
 ) -> agentdb_meta::MetaResult<bool> {
-    let replicas =
-        agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), movement.destination_tablet_id)
-            .await?;
+    let replicas = merged_replicas_by_tablet(meta, movement.destination_tablet_id, now_ms).await?;
     let mut serving_replicas = 0usize;
     for replica in replicas {
         if replica.role == "log_only" {
@@ -5744,7 +5841,8 @@ fn env_usize(name: &str, default: usize) -> usize {
 mod tests {
     use super::*;
     use agentdb_meta::{
-        nodes, tablet_movements, tablet_ranges, tablet_replicas, tablet_stats, tablets, MetaStore,
+        node_operational, nodes, tablet_movements, tablet_ranges,
+        tablets, MetaStore,
     };
     use agentdb_storage::ReplicatedLog;
 
@@ -6705,7 +6803,7 @@ node_id = "node-a"
         )
         .await
         .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
             .await
             .unwrap();
 
@@ -6834,7 +6932,7 @@ node_id = "node-a"
         tablets::assume_ownership(meta.pool(), 7, 0, "node-b", 2_500)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
             .await
             .unwrap();
 
@@ -6904,7 +7002,7 @@ node_id = "node-a"
         )
         .await
         .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
             .await
             .unwrap();
 
@@ -7056,7 +7154,7 @@ node_id = "node-a"
         let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
         assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
         assert_eq!(tablet.handoff_target_node_id.as_deref(), Some("node-a"));
-        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+        let replicas = node_operational::merged_replica_view_by_tablet(meta.pool(), 7, 0)
             .await
             .unwrap();
         assert!(replicas
@@ -7102,10 +7200,10 @@ node_id = "node-a"
         tablets::mark_for_handoff(meta.pool(), 7, "node-a")
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "learner", "healthy", 10, 10, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "learner", "healthy", 10, 10, 100)
             .await
             .unwrap();
 
@@ -7140,7 +7238,7 @@ node_id = "node-a"
         let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
         assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
         assert_eq!(tablet.handoff_target_node_id, None);
-        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+        let replicas = node_operational::merged_replica_view_by_tablet(meta.pool(), 7, 0)
             .await
             .unwrap();
         assert!(replicas
@@ -7156,7 +7254,7 @@ node_id = "node-a"
         tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 12, 12, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 12, 12, 100)
             .await
             .unwrap();
 
@@ -7194,12 +7292,15 @@ node_id = "node-a"
                 && movement.end_shard == 99
                 && movement.required_applied_index == 12
         }));
-        let destination_replicas = tablet_replicas::list_by_tablet(meta.pool(), 8)
-            .await
-            .unwrap();
+        // Seeding writes placement INTENT; observed health arrives later
+        // via node reports, so a fresh destination replica reads "unknown".
+        let destination_replicas =
+            node_operational::merged_replica_view_by_tablet(meta.pool(), 8, 0)
+                .await
+                .unwrap();
         assert!(destination_replicas
             .iter()
-            .any(|replica| replica.node_id == "node-a" && replica.health == "lagging"));
+            .any(|replica| replica.node_id == "node-a" && replica.health == "unknown"));
     }
 
     #[tokio::test]
@@ -7213,10 +7314,10 @@ node_id = "node-a"
         tablet_ranges::upsert(meta.pool(), "default", 10, 19, 8, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 7, 7, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 7, 7, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 9, 9, 100)
+        node_operational::seed_replica(meta.pool(), 8, "node-a", "voter", "healthy", 9, 9, 100)
             .await
             .unwrap();
 
@@ -7256,12 +7357,26 @@ node_id = "node-a"
         tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 12, 12, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 12, 12, 100)
             .await
             .unwrap();
-        tablet_stats::upsert(meta.pool(), 7, "node-a", 10, 100, 1_500, 1_600, 12, 200)
-            .await
-            .unwrap();
+        node_operational::seed_tablet_stats(
+            meta.pool(),
+            7,
+            "node-a",
+            10,
+            100,
+            1_500,
+            1_600,
+            12,
+            0,
+            0,
+            0,
+            0,
+            200,
+        )
+        .await
+        .unwrap();
 
         let mut config = lifecycle_config(0, 0);
         config.tablet_lifecycle_split_max_storage_bytes = 1_000;
@@ -7286,10 +7401,10 @@ node_id = "node-a"
         tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 20, 20, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 20, 20, 100)
             .await
             .unwrap();
-        tablet_stats::upsert_with_rate(
+        node_operational::seed_tablet_stats(
             meta.pool(),
             7,
             "node-a",
@@ -7323,10 +7438,10 @@ node_id = "node-a"
         tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 20, 20, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 20, 20, 100)
             .await
             .unwrap();
-        tablet_stats::upsert_with_rate(
+        node_operational::seed_tablet_stats(
             meta.pool(),
             7,
             "node-a",
@@ -7364,18 +7479,46 @@ node_id = "node-a"
         tablet_ranges::upsert(meta.pool(), "default", 50, 99, 8, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 7, 7, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 7, 7, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 9, 9, 100)
+        node_operational::seed_replica(meta.pool(), 8, "node-a", "voter", "healthy", 9, 9, 100)
             .await
             .unwrap();
-        tablet_stats::upsert(meta.pool(), 7, "node-a", 3, 30, 300, 330, 7, 200)
-            .await
-            .unwrap();
-        tablet_stats::upsert(meta.pool(), 8, "node-a", 4, 40, 400, 440, 9, 200)
-            .await
-            .unwrap();
+        node_operational::seed_tablet_stats(
+            meta.pool(),
+            7,
+            "node-a",
+            3,
+            30,
+            300,
+            330,
+            7,
+            0,
+            0,
+            0,
+            0,
+            200,
+        )
+        .await
+        .unwrap();
+        node_operational::seed_tablet_stats(
+            meta.pool(),
+            8,
+            "node-a",
+            4,
+            40,
+            400,
+            440,
+            9,
+            0,
+            0,
+            0,
+            0,
+            200,
+        )
+        .await
+        .unwrap();
 
         let mut config = lifecycle_config(0, 0);
         config.tablet_lifecycle_merge_max_storage_bytes = 500;
@@ -7400,12 +7543,26 @@ node_id = "node-a"
         tablet_ranges::upsert(meta.pool(), "default", 0, 99, 8, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 12, 12, 100)
+        node_operational::seed_replica(meta.pool(), 8, "node-a", "voter", "healthy", 12, 12, 100)
             .await
             .unwrap();
-        tablet_stats::upsert(meta.pool(), 8, "node-a", 10, 100, 1_500, 1_600, 12, 200)
-            .await
-            .unwrap();
+        node_operational::seed_tablet_stats(
+            meta.pool(),
+            8,
+            "node-a",
+            10,
+            100,
+            1_500,
+            1_600,
+            12,
+            0,
+            0,
+            0,
+            0,
+            200,
+        )
+        .await
+        .unwrap();
         tablet_movements::upsert_pending(
             meta.pool(),
             "split:7:8",
@@ -7465,10 +7622,10 @@ node_id = "node-a"
         group.elect(leader_id).expect("elect source leader");
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
         registry.register(7, group).unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 10, 10, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 10, 10, 100)
             .await
             .unwrap();
 
@@ -7488,23 +7645,25 @@ node_id = "node-a"
         .unwrap();
 
         assert_eq!(changed, 2);
-        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+        // Retirement removes placement INTENT; stale observations age out
+        // with their reports.
+        let intent = agentdb_meta::tablet_replicas::list_intent_by_tablet(meta.pool(), 7)
             .await
             .unwrap();
-        assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
-        assert!(replicas
+        assert!(!intent.iter().any(|row| row.node_id == "node-b"));
+        assert!(intent
             .iter()
-            .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
+            .any(|row| row.node_id == "node-a" && row.role == "voter"));
     }
 
     #[tokio::test]
     async fn scheduler_rebalance_membership_change_skips_unregistered_group() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "draining", 10, 10, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "draining", 10, 10, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 10, 10, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 10, 10, 100)
             .await
             .unwrap();
 
@@ -7524,14 +7683,14 @@ node_id = "node-a"
         .unwrap();
 
         assert_eq!(changed, 0);
-        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+        let replicas = node_operational::merged_replica_view_by_tablet(meta.pool(), 7, 0)
             .await
             .unwrap();
         assert!(replicas.iter().any(|replica| replica.node_id == "node-b"));
         assert!(replicas.iter().any(|replica| replica.node_id == "node-a"));
 
         assert_eq!(
-            retire_draining_rebalance_raft_replicas(&meta, &registry)
+            retire_draining_rebalance_raft_replicas(&meta, &registry, 2_000)
                 .await
                 .unwrap(),
             0
@@ -7559,15 +7718,16 @@ node_id = "node-a"
         group.elect(leader_id).expect("elect target leader");
         registry.register(7, group).unwrap();
         assert_eq!(
-            retire_draining_rebalance_raft_replicas(&meta, &registry)
+            retire_draining_rebalance_raft_replicas(&meta, &registry, 2_000)
                 .await
                 .unwrap(),
             1
         );
-        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+        // Retirement removes placement INTENT; stale observations age out.
+        let intent = agentdb_meta::tablet_replicas::list_intent_by_tablet(meta.pool(), 7)
             .await
             .unwrap();
-        assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
+        assert!(!intent.iter().any(|row| row.node_id == "node-b"));
     }
 
     #[tokio::test]
@@ -7612,10 +7772,10 @@ node_id = "node-a"
         tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 1_000)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -7693,10 +7853,10 @@ node_id = "node-a"
         tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 30_000)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -7759,7 +7919,7 @@ node_id = "node-a"
         )
         .await
         .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -7818,7 +7978,7 @@ node_id = "node-a"
         tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 2_500)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -7865,10 +8025,10 @@ node_id = "node-a"
         )
         .await
         .unwrap();
-        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 42, 42, 1_010)
+        node_operational::seed_replica(meta.pool(), 8, "node-a", "voter", "healthy", 42, 42, 1_010)
             .await
             .unwrap();
-        tablet_replicas::upsert(
+        node_operational::seed_replica(
             meta.pool(),
             8,
             "node-b",
@@ -7908,10 +8068,10 @@ node_id = "node-a"
         )
         .await
         .unwrap();
-        tablet_replicas::upsert(meta.pool(), 9, "node-a", "voter", "healthy", 42, 42, 1_010)
+        node_operational::seed_replica(meta.pool(), 9, "node-a", "voter", "healthy", 42, 42, 1_010)
             .await
             .unwrap();
-        tablet_replicas::upsert(
+        node_operational::seed_replica(
             meta.pool(),
             9,
             "node-b",
@@ -7944,23 +8104,27 @@ node_id = "node-a"
         tablets::create_with_placement(meta.pool(), 8, scope, "serving", Some("raft/8"), 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 1, 1, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 1, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "healthy", 1, 1, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "learner", "healthy", 1, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 1, 1, 100)
+        node_operational::seed_replica(meta.pool(), 8, "node-a", "voter", "healthy", 1, 1, 100)
             .await
             .unwrap();
 
         assert_eq!(cleanup_tombstoned_tablet_replicas(&meta).await.unwrap(), 2);
-        assert!(tablet_replicas::list_by_tablet(meta.pool(), 7)
-            .await
-            .unwrap()
-            .is_empty());
+        // Placement intent is deleted; lingering observations in other
+        // nodes' reports age out with their heartbeats.
+        assert!(
+            agentdb_meta::tablet_replicas::list_intent_by_tablet(meta.pool(), 7)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            tablet_replicas::list_by_tablet(meta.pool(), 8)
+            node_operational::merged_replica_view_by_tablet(meta.pool(), 8, 0)
                 .await
                 .unwrap()
                 .len(),
@@ -7985,7 +8149,7 @@ node_id = "node-a"
             .await
             .unwrap();
         for tablet_id in [8, 9] {
-            tablet_replicas::upsert(
+            node_operational::seed_replica(
                 meta.pool(),
                 tablet_id,
                 "node-a",
@@ -8085,7 +8249,7 @@ node_id = "node-a"
         tablet_ranges::upsert(meta.pool(), scope, 50, 99, 8, 3, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 9, "node-a", "voter", "healthy", 42, 42, 150)
+        node_operational::seed_replica(meta.pool(), 9, "node-a", "voter", "healthy", 42, 42, 150)
             .await
             .unwrap();
         tablet_movements::upsert_pending(
@@ -8152,10 +8316,10 @@ node_id = "node-a"
     #[tokio::test]
     async fn local_tablet_movement_executor_installs_split_snapshot_and_updates_progress() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 1, 1, 1_000)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 1, 1, 1_000)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 8, "node-a", "learner", "lagging", 0, 0, 1_000)
+        node_operational::seed_replica(meta.pool(), 8, "node-a", "learner", "lagging", 0, 0, 1_000)
             .await
             .unwrap();
         tablet_movements::upsert_pending(
@@ -8210,20 +8374,29 @@ node_id = "node-a"
             .await
             .unwrap();
 
-        let executed =
-            run_local_tablet_movement_executor_tick(&meta, &runtime, None, "node-a", 2_000, 64)
-                .await
-                .unwrap();
+        let operational = agentdb_api::operational::OperationalRegistry::default();
+        let executed = run_local_tablet_movement_executor_tick(
+            &operational,
+            &meta,
+            &runtime,
+            None,
+            "node-a",
+            2_000,
+            64,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(executed, 1);
-        let replica = tablet_replicas::list_by_tablet(meta.pool(), 8)
-            .await
-            .unwrap()
+        // Progress lands in the in-process registry; the heartbeat
+        // serializes it into this node's report.
+        let (_, _, observed) = operational
+            .snapshot(0)
             .into_iter()
-            .find(|replica| replica.node_id == "node-a")
-            .unwrap();
-        assert_eq!(replica.health, "healthy");
-        assert_eq!(replica.applied_index, 1);
+            .find(|(tablet_id, node_id, _)| *tablet_id == 8 && node_id == "node-a")
+            .expect("destination observation");
+        assert_eq!(observed.health, "healthy");
+        assert_eq!(observed.applied_index, 1);
 
         let read_runtime = runtime.clone();
         let moved_tenant = runtime
@@ -8262,21 +8435,23 @@ node_id = "node-a"
         )
         .await
         .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 9, 9, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 9, 9, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 9, 9, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 9, 9, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-c", "voter", "healthy", 10, 10, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-c", "voter", "healthy", 10, 10, 100)
             .await
             .unwrap();
 
-        assert!(!local_source_replica_ready(&meta, 7, "node-a", 10)
+        assert!(!local_source_replica_ready(&meta, 7, "node-a", 10, 2_000)
             .await
             .unwrap());
         assert_eq!(
-            source_replica_url(&meta, 7, "node-a", 10).await.unwrap(),
+            source_replica_url(&meta, 7, "node-a", 10, 2_000)
+                .await
+                .unwrap(),
             Some("http://127.0.0.1:18082".to_string())
         );
     }
@@ -8285,13 +8460,13 @@ node_id = "node-a"
     async fn raft_rs_node_configs_load_from_control_plane_replicas() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "lagging", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "learner", "lagging", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -8310,7 +8485,7 @@ node_id = "node-a"
     async fn raft_rs_node_configs_require_raft_replicas() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -8351,13 +8526,13 @@ node_id = "node-a"
         )
         .await
         .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 8, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 8, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -8382,10 +8557,10 @@ node_id = "node-a"
     async fn raft_rs_registry_bootstrap_skips_log_only_local_replicas() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "log_only", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "log_only", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -8404,10 +8579,10 @@ node_id = "node-a"
     async fn raft_rs_registry_sync_unregisters_removed_local_replicas() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
@@ -8416,7 +8591,7 @@ node_id = "node-a"
             .unwrap();
         assert_eq!(registry.tablet_ids(), vec![7]);
 
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "log_only", "healthy", 0, 0, 200)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "log_only", "healthy", 0, 0, 200)
             .await
             .unwrap();
         let bootstrap = sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
@@ -8435,10 +8610,10 @@ node_id = "node-a"
         tablets::create_with_placement(meta.pool(), 7, scope, "tombstoned", Some("raft/7"), 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -8457,10 +8632,10 @@ node_id = "node-a"
     async fn raft_rs_registry_sync_bootstraps_split_destination_runtime_tablet() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
         let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> =
@@ -8487,10 +8662,10 @@ node_id = "node-a"
         .unwrap();
         assert!(runtime.registered_tablet_ids().contains(&7));
 
-        tablet_replicas::upsert(meta.pool(), 8, "node-a", "learner", "lagging", 0, 0, 200)
+        node_operational::seed_replica(meta.pool(), 8, "node-a", "learner", "lagging", 0, 0, 200)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 8, "node-b", "voter", "healthy", 0, 0, 200)
+        node_operational::seed_replica(meta.pool(), 8, "node-b", "voter", "healthy", 0, 0, 200)
             .await
             .unwrap();
         let bootstrap = sync_raft_rs_registry_and_runtime(
@@ -8527,7 +8702,7 @@ node_id = "node-a"
         tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -8584,10 +8759,10 @@ node_id = "node-a"
         tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "learner", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "learner", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -8786,13 +8961,13 @@ node_id = "node-a"
         )
         .await
         .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "learner", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
             .await
             .unwrap();
 
@@ -8813,10 +8988,10 @@ node_id = "node-a"
     async fn raft_rs_snapshot_tick_marks_progress_and_unreachable_peers() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "unknown", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "unknown", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "learner", "healthy", 0, 0, 100)
             .await
             .unwrap();
         let raft_configs = load_raft_rs_node_configs(&meta, 7, dir.path())
@@ -8858,8 +9033,11 @@ node_id = "node-a"
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
         registry.register(7, group).unwrap();
         let outbox = agentdb_api::internal_raft_http::RaftRsHttpOutbox::new("secret");
+        let operational = agentdb_api::operational::OperationalRegistry::default();
         let sent = run_raft_rs_snapshot_tick(
+            &operational,
             &meta,
+            2_000,
             &registry,
             runtime,
             &outbox,
@@ -8871,20 +9049,18 @@ node_id = "node-a"
         .unwrap();
 
         assert_eq!(sent, 0);
-        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
-            .await
-            .unwrap();
-        let local = replicas
+        let observations = operational.snapshot(0);
+        let (_, _, local) = observations
             .iter()
-            .find(|replica| replica.node_id == "node-a")
-            .unwrap();
+            .find(|(tablet_id, node_id, _)| *tablet_id == 7 && node_id == "node-a")
+            .expect("local observation");
         assert_eq!(local.health, "healthy");
         assert!(local.applied_index > 0);
         assert!(local.match_index > 0);
-        let remote = replicas
+        let (_, _, remote) = observations
             .iter()
-            .find(|replica| replica.node_id == "node-b")
-            .unwrap();
+            .find(|(tablet_id, node_id, _)| *tablet_id == 7 && node_id == "node-b")
+            .expect("remote observation");
         assert_eq!(remote.health, "unreachable");
     }
 
@@ -8976,10 +9152,10 @@ node_id = "node-a"
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 1, 1, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 1, 1, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "lagging", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "learner", "lagging", 0, 0, 100)
             .await
             .unwrap();
         let source_raft_configs = load_raft_rs_node_configs(&meta, 7, source_dir.path())
@@ -9038,32 +9214,37 @@ node_id = "node-a"
         registry.register(7, target_group.clone()).unwrap();
         let runtime = agentdb_core::Runtime::in_memory();
 
-        let installed =
-            run_raft_snapshot_restore_tick(&meta, "node-b", &registry, runtime, &snapshot_store)
-                .await
-                .unwrap();
+        let operational = agentdb_api::operational::OperationalRegistry::default();
+        let installed = run_raft_snapshot_restore_tick(
+            &operational,
+            &meta,
+            "node-b",
+            &registry,
+            runtime,
+            &snapshot_store,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(installed, 1);
         assert_eq!(target_group.status()[0].applied_index, transfer.index);
-        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
-            .await
-            .unwrap();
-        let target = replicas
-            .iter()
-            .find(|replica| replica.node_id == "node-b")
-            .unwrap();
-        assert_eq!(target.health, "healthy");
-        assert_eq!(target.applied_index, transfer.index as i64);
+        let (_, _, observed) = operational
+            .snapshot(0)
+            .into_iter()
+            .find(|(tablet_id, node_id, _)| *tablet_id == 7 && node_id == "node-b")
+            .expect("restored replica observation");
+        assert_eq!(observed.health, "healthy");
+        assert_eq!(observed.applied_index, transfer.index as i64);
     }
 
     #[tokio::test]
     async fn raft_rs_message_outbox_marks_unreachable_and_restores_messages() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+        node_operational::seed_replica(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
             .await
             .unwrap();
         let raft_configs = load_raft_rs_node_configs(&meta, 7, dir.path())
@@ -9083,20 +9264,28 @@ node_id = "node-a"
             .unwrap();
         let outbox = agentdb_api::internal_raft_http::RaftRsHttpOutbox::new("secret");
 
-        let sent = flush_raft_rs_group_messages_with_health(&meta, 7, &group, &outbox, 1_024)
-            .await
-            .unwrap();
+        let operational = agentdb_api::operational::OperationalRegistry::default();
+        let sent = flush_raft_rs_group_messages_with_health(
+            &operational,
+            &meta,
+            7,
+            &group,
+            &outbox,
+            1_024,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(sent, 0);
         assert_eq!(group.take_wire_messages().len(), 1);
-        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
-            .await
-            .unwrap();
-        let remote = replicas
-            .iter()
-            .find(|replica| replica.node_id == "node-b")
-            .unwrap();
-        assert_eq!(remote.health, "unreachable");
+        // Unreachability lands in the in-process registry (the heartbeat
+        // serializes it into this node's report).
+        let observed = operational
+            .snapshot(0)
+            .into_iter()
+            .find(|(tablet_id, node_id, _)| *tablet_id == 7 && node_id == "node-b")
+            .expect("node-b observation");
+        assert_eq!(observed.2.health, "unreachable");
     }
 
     #[tokio::test]

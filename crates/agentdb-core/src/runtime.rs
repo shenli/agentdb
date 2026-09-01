@@ -2064,9 +2064,7 @@ fn enforce_startup_hydration_limits(
     let mut total_bytes = 0_u64;
     for (label, prefix, max_rows) in startup_hydration_categories() {
         if mode == HydrationMode::Lazy
-            && LAZY_HYDRATION_SKIPPED_PREFIXES
-                .iter()
-                .any(|skipped| *skipped == prefix)
+            && LAZY_HYDRATION_SKIPPED_PREFIXES.contains(&prefix)
         {
             continue;
         }
@@ -3885,8 +3883,6 @@ impl Runtime {
             .map_err(kms_error)
     }
 
-    /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
-    /// match a live (non-soft-deleted) tenant.
     // ----- Cache-miss fallback (Stage 1 of KV-authoritative state) --------
     //
     // The in-memory `State` maps are a cache over the durable KV rows, not
@@ -11304,8 +11300,22 @@ impl Runtime {
         let (drained, pending): (Vec<_>, Vec<_>) = mutations
             .into_iter()
             .partition(|mutation| mutation.commit_seq <= floor);
-        p.delete_record_index_mutations(&drained)
-            .map_err(internal)?;
+        // Trimming is a KV WRITE: on a replicated runtime it must go through
+        // the raft leader. Followers skip it silently — the leader trims the
+        // same rows and the deletions replicate down. Any other trim failure
+        // is logged but never blocks the drain (trim is an optimization; the
+        // watermark floor already makes re-scanned rows cheap no-ops).
+        if let Err(error) = p.delete_record_index_mutations(&drained) {
+            let detail = format!("{error:?}");
+            if detail.contains("not leader") {
+                tracing::trace!(
+                    drained = drained.len(),
+                    "skipping record index outbox trim on non-leader"
+                );
+            } else {
+                tracing::warn!(?error, "record index outbox trim failed");
+            }
+        }
 
         let mut applied = 0usize;
         for mutation in pending {
@@ -11501,10 +11511,10 @@ impl Runtime {
                     tracing::warn!(?error, "record index snapshot write failed");
                 }
                 ticks += 1;
-                if ticks % sweep_every == 0 {
+                if ticks.is_multiple_of(sweep_every) {
                     self.sweep_idempotency_retention();
                 }
-                if ticks % cache_sweep_every == 0 {
+                if ticks.is_multiple_of(cache_sweep_every) {
                     self.sweep_metadata_cache().await;
                 }
                 tokio::time::sleep(interval).await;

@@ -23,6 +23,7 @@ pub mod change_notifier;
 pub mod config;
 pub mod error;
 pub mod migrations;
+pub mod node_operational;
 pub mod nodes;
 pub mod placement_scopes;
 pub mod routing;

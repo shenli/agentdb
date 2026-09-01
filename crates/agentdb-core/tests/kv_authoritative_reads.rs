@@ -488,6 +488,7 @@ async fn lazy_runtime_serves_cold_and_eviction_sweep_bounds_the_cache() {
 
     // Chaos: concurrent traffic racing an aggressive sweeper.
     let mut tasks = Vec::new();
+    #[allow(clippy::unnecessary_to_owned)]
     for session_id in session_ids.iter().cloned() {
         let rt = rt.clone();
         let (t, a) = (t.clone(), a.clone());
