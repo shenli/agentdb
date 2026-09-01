@@ -3353,6 +3353,38 @@ impl Runtime {
         )
     }
 
+    /// Build a replicated runtime with an explicit envelope keyring, so a
+    /// clustered deployment can encrypt tenant payloads. The keyring seals both
+    /// durable content (via the runtime) and event/metadata values (via
+    /// Persist) *before* the write reaches the replicated log, so the Raft log
+    /// and any tablet snapshot hold ciphertext, never plaintext. Pass
+    /// `DisabledEnvelopeCrypto` for the plaintext/legacy path.
+    pub fn with_kv_content_keyring_and_replicated_logs(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        keyring: Arc<dyn EnvelopeCrypto>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+    ) -> Arc<Self> {
+        let tablet_router = Arc::new(
+            RuntimeTabletRouterKvStore::new(kv, RUNTIME_PRIMARY_TABLET_ID, logs)
+                .expect("open runtime tablet router"),
+        );
+        let persist = Persist::with_metadata_crypto(
+            tablet_router.clone(),
+            Arc::new(IdentityMetadataCryptoAdapter),
+        )
+        .with_keyring(keyring.clone());
+        Self::from_persist_with_tablet_router_and_mode(
+            persist,
+            content,
+            Arc::new(AllowAllKmsKeyResolver),
+            Arc::new(IdentityContentCryptoAdapter),
+            keyring,
+            Some(tablet_router),
+            None,
+        )
+    }
+
     pub fn with_tablet_store_lifecycle_and_replicated_logs(
         store_lifecycle: Arc<dyn TabletStoreLifecycle>,
         content: Arc<dyn ContentBackend>,

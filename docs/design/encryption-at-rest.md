@@ -115,15 +115,26 @@ to be updated when a later milestone encrypts one of them. Current coverage:
 | Skills | No |
 | Secondary indexes, aliases, idempotency, commit/outbox | No (routing/control; keys stay plaintext for scans) |
 
+**Milestone 5 (landed): encryption precedes the Raft log in the clustered
+path.** `Runtime::with_kv_content_keyring_and_replicated_logs` wires the keyring
+into a replicated runtime — into both Persist (event/metadata) and the runtime
+(content) — so a payload is sealed *before* `write_ops` reaches the replicated
+log. A test (`tests/encryption_raft_ordering.rs`) appends an event on a
+replicated runtime and confirms the plaintext marker is absent from the entire
+KV (which holds both the log entries and the applied state), and that it still
+round-trips through raft apply. This is the design's "verify Raft and snapshot
+ordering" requirement, and it extends the working event/content encryption to
+the production (clustered) deployment shape.
+
 **Not yet done:** agent/session/tenant records, searchable records, and skills
 are still plaintext (records are additionally entangled with the export ledger,
 which keeps a plaintext copy, and the search index, so covering them is its own
-stage). Encryption is not yet verified to occur *before* a tenant payload enters
-a durable Raft log or tablet snapshot (the keyring is not wired into replicated
-constructors yet). Event AAD binds tenant + session + kind (not yet the
-per-event seq). There is still no KMS provider or wrapped-DEK catalog, rotation
-worker, or revocation, and the server does not build a keyring from
-configuration.
+stage). Event AAD binds tenant + session + kind (not yet the per-event seq).
+There is still no KMS provider or wrapped-DEK catalog, rotation worker, or
+revocation, and the server does not yet build a keyring from configuration —
+so encryption is reachable through the runtime constructors and tests but not
+yet flippable via server config (that lands with the real key catalog, since
+the current `LocalKeyProvider` is a dev/single-key source, not BYOK).
 
 The pre-existing seams remain as the integration points those stages build on:
 
