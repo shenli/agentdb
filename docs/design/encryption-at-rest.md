@@ -154,15 +154,26 @@ DEK per node, so cluster envelope encryption needs a shared/replicated catalog
 (a dedicated follow-up). So encryption is now flippable end-to-end for a
 single-node persistent deployment.
 
+**Milestone 8 (landed): KEK rotation (rewrap).** `KeyCatalog::rewrap_all(old,
+new)` rotates the key-encryption key — it unwraps every catalog DEK under the
+old KEK and re-wraps it under the new one. The DEK *bytes* are unchanged, so
+**no tenant data is re-encrypted** (only the wrapping changes). It skips DEKs
+already under the new KEK, so a re-run after a crash mid-rewrap is idempotent,
+and it fails closed if a DEK cannot be unwrapped under the old KEK. A test seals
+data under KEK v1, rewraps the catalog v1→v2, and confirms the same ciphertext
+opens under v2 while v1 alone no longer serves it. This is the design's "KMS
+material rotation under one logical KEK." (Online *DEK* rotation — minting a new
+DEK version and re-encrypting data v1→v2 — is separate and still to come.)
+
 **Not yet done:** cluster (multi-node) envelope encryption needs a shared key
-catalog; the online DEK rotation worker and admin API/CLI are not built; and the
+catalog; the online DEK rotation worker (new DEK version + data re-encryption
+walk) and the admin API/CLI to drive rewrap/rotation are not built; and the
 `LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
-Agent/session/tenant records, searchable records, and skills
-searchable records, and skills are still plaintext (records are additionally
-entangled with the export ledger + search index). Event AAD binds tenant +
-session + kind (not yet the per-event seq). Two-phase revocation/crypto-shred
-beyond the catalog `status` field, and dedicated-domain placement enforcement,
-remain.
+Agent/session/tenant records, searchable records, and skills are still plaintext
+(records are additionally entangled with the export ledger + search index).
+Event AAD binds tenant + session + kind (not yet the per-event seq). Two-phase
+revocation/crypto-shred beyond the catalog `status` field, and dedicated-domain
+placement enforcement, remain.
 
 The pre-existing seams remain as the integration points those stages build on:
 
