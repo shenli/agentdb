@@ -14,6 +14,7 @@ pub mod routes;
 pub mod routing_http;
 pub mod state;
 pub mod sysmeta;
+pub mod transport_faults;
 
 pub use errors::ApiError;
 pub use state::AppState;

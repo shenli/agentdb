@@ -469,6 +469,17 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         tracing::warn!(?error, "system tenant bootstrap deferred");
     }
 
+    // Deterministic transport fault injection (test-only): exists only
+    // when explicitly enabled, so production pays a single Option check.
+    let transport_faults = if std::env::var("AGENTDB_TRANSPORT_FAULTS").as_deref() == Ok("1") {
+        tracing::warn!(
+            "transport fault injection ENABLED (AGENTDB_TRANSPORT_FAULTS=1); this is a test-only mode"
+        );
+        Some(Arc::new(agentdb_api::transport_faults::FaultTable::new()))
+    } else {
+        None
+    };
+
     let mut state = agentdb_api::AppState::new(runtime.clone())
         .with_auth_meta(auth_meta)
         .with_proxy_policy(agentdb_api::state::ProxyPolicy {
@@ -476,6 +487,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             max_response_bytes: config.route_proxy_max_response_bytes,
         })
         .with_tablet_store_status(tablet_store_status(&config));
+    state.transport_faults = transport_faults.clone();
     if let Some(token) = config.api_auth_token.clone() {
         state = state.with_api_auth_token(token);
     }
@@ -696,6 +708,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         outbox.clone(),
                         Duration::from_millis(raft_outbox_interval_ms),
                         raft_outbox_max_messages_per_tick,
+                        transport_faults.clone(),
                     );
                     campaign_owned_raft_tablets(
                         &startup.meta,
@@ -3150,6 +3163,7 @@ fn spawn_raft_rs_message_outbox_worker(
     outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     interval: Duration,
     max_messages_per_tick: usize,
+    transport_faults: Option<Arc<agentdb_api::transport_faults::FaultTable>>,
 ) {
     let interval = interval.max(Duration::from_millis(100));
     let max_messages_per_tick = max_messages_per_tick.max(1);
@@ -3163,6 +3177,7 @@ fn spawn_raft_rs_message_outbox_worker(
                 &registry,
                 &outbox,
                 max_messages_per_tick,
+                transport_faults.as_deref(),
             )
             .await
             {
@@ -3178,6 +3193,7 @@ async fn run_raft_rs_message_outbox_tick(
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     max_messages_per_tick: usize,
+    transport_faults: Option<&agentdb_api::transport_faults::FaultTable>,
 ) -> anyhow::Result<usize> {
     // Peer URLs are seeded at startup and kept fresh by the dedicated
     // change-notified refresher; re-resolving them via SQL on every send
@@ -3195,6 +3211,7 @@ async fn run_raft_rs_message_outbox_tick(
             &group,
             outbox,
             remaining_budget,
+            transport_faults,
         )
         .await
         {
@@ -3214,6 +3231,7 @@ async fn flush_raft_rs_group_messages_with_health(
     group: &agentdb_storage::RaftRsSharedGroup,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     max_messages: usize,
+    transport_faults: Option<&agentdb_api::transport_faults::FaultTable>,
 ) -> anyhow::Result<usize> {
     let messages = group.take_wire_messages();
     let send_limit = messages.len().min(max_messages.max(1));
@@ -3229,6 +3247,34 @@ async fn flush_raft_rs_group_messages_with_health(
     // sends -> more retransmits -> more health updates).
     let mut peer_health: BTreeMap<u64, &'static str> = BTreeMap::new();
     for (index, message) in messages.iter().take(send_limit).cloned().enumerate() {
+        // Deterministic fault injection at the production send boundary.
+        if let Some(faults) = transport_faults {
+            use agentdb_api::transport_faults::FaultVerdict;
+            match faults.evaluate(tablet_id, message.from, message.to, true, &message) {
+                FaultVerdict::Pass => {}
+                FaultVerdict::Drop => {
+                    // Vanishes like network loss: counted as sent, never
+                    // restored.
+                    sent += 1;
+                    continue;
+                }
+                FaultVerdict::Held { .. } => {
+                    // Parked in the fault table; release re-injects it.
+                    continue;
+                }
+                FaultVerdict::Delay { ms } => {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                FaultVerdict::Reject => {
+                    peer_health.insert(message.to, "unreachable");
+                    if first_send_error.is_none() {
+                        first_send_error = Some("fault injection: reject".to_string());
+                    }
+                    failed.push(messages[index].clone());
+                    continue;
+                }
+            }
+        }
         match outbox.send_message_to_peer(&message).await {
             Ok(()) => {
                 peer_health.insert(message.to, "healthy");
@@ -9354,6 +9400,7 @@ node_id = "node-a"
             &group,
             &outbox,
             1_024,
+            None,
         )
         .await
         .unwrap();
