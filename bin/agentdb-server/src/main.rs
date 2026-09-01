@@ -298,6 +298,32 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let config = ResolvedServeConfig::from_serve_opts(opts)?;
     if !config.in_memory {
         std::fs::create_dir_all(&config.data_dir)?;
+        // Fail closed on a data directory that belongs to another node or
+        // cluster, or whose identity marker is corrupt. This runs before
+        // any store opens and long before the listener binds, so a
+        // misconfiguration surfaces as a clean startup error rather than
+        // silent cross-node corruption. See
+        // docs/design/distributed-safety-hardening.md §3.
+        let expected = agentdb_storage::store_identity::ExpectedIdentity {
+            node_id: config
+                .route_node_id
+                .clone()
+                .unwrap_or_else(|| "single-node".to_string()),
+            cell_id: config.route_cell_id.clone(),
+            cluster_id: config.cluster_id.clone(),
+        };
+        let identity = agentdb_storage::store_identity::load_or_init(
+            &config.data_dir,
+            &expected,
+            now_ms_u64(),
+        )
+        .map_err(|error| anyhow::anyhow!("store identity check failed: {error}"))?;
+        tracing::info!(
+            cluster_id = %identity.cluster_id,
+            node_id = %identity.node_id,
+            store_incarnation = %identity.store_incarnation,
+            "verified store identity"
+        );
     }
     let route_location = config
         .route_region
@@ -879,6 +905,10 @@ struct ResolvedServeConfig {
     object_store: Option<ResolvedObjectStoreConfig>,
     in_memory: bool,
     route_node_id: Option<String>,
+    /// Cluster identity for the store-identity fail-closed check. `None`
+    /// mints one into the identity file on first boot; when set (via
+    /// `AGENTDB_CLUSTER_ID`), a mismatch refuses startup.
+    cluster_id: Option<String>,
     route_shard_count: i64,
     route_default_tablet_id: i64,
     route_region: Option<String>,
@@ -1197,6 +1227,7 @@ impl ResolvedServeConfig {
             object_store,
             in_memory,
             route_node_id,
+            cluster_id: std::env::var("AGENTDB_CLUSTER_ID").ok(),
             route_shard_count: opts
                 .route_shard_count
                 .or(file.routing.shard_count)
@@ -1353,6 +1384,7 @@ impl ResolvedServeConfig {
             object_store,
             in_memory,
             route_node_id,
+            cluster_id: std::env::var("AGENTDB_CLUSTER_ID").ok(),
             route_shard_count: file
                 .routing
                 .shard_count
@@ -5952,6 +5984,13 @@ fn now_ms_i64() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn now_ms_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
 }
 

@@ -15,6 +15,7 @@ pub mod raft_rs_log;
 pub mod recovery;
 pub mod replicated_log;
 pub mod rocks;
+pub mod store_identity;
 pub mod tablet_store;
 
 pub use content::{
