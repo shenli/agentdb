@@ -308,6 +308,14 @@ pub struct AppState {
     pub api_json_response_profile: Option<Arc<ApiJsonResponseProfile>>,
     pub auth_cache: Arc<crate::auth::AuthTokenCache>,
     pub operational: Arc<crate::operational::OperationalRegistry>,
+    /// Deterministic transport fault injection (test-only). `Some` only
+    /// when the server started with `AGENTDB_TRANSPORT_FAULTS=1`.
+    pub transport_faults: Option<Arc<crate::transport_faults::FaultTable>>,
+    /// Linearizable-read barrier timeout. `Some` enables the Raft
+    /// ReadIndex barrier on local reads of replicated tablets; `None`
+    /// (single-node, or the `AGENTDB_READ_BARRIER=off` kill switch)
+    /// serves reads without it.
+    pub read_barrier_timeout: Option<std::time::Duration>,
 }
 
 impl AppState {
@@ -333,6 +341,8 @@ impl AppState {
             api_json_response_profile: ApiJsonResponseProfile::from_env().map(Arc::new),
             auth_cache: Arc::new(crate::auth::AuthTokenCache::from_env()),
             operational: Arc::new(crate::operational::OperationalRegistry::default()),
+            transport_faults: None,
+            read_barrier_timeout: None,
         }
     }
 

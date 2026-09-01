@@ -395,6 +395,67 @@ impl RaftRsSharedGroup {
             .expire_leader_lease(node_id)
     }
 
+    /// Linearizable read barrier (ReadIndex). Confirms this node still
+    /// holds leadership against a quorum and waits until the local state
+    /// machine has applied at least the confirmed read index, then returns
+    /// that index. A partitioned or stepped-down former leader never gets
+    /// quorum confirmation, so this returns a typed timeout error rather
+    /// than ever falling back to a local read.
+    ///
+    /// The commit-side note in `append` applies here too: the wait can
+    /// block a tokio worker, so we hand off with `block_in_place` on the
+    /// multi-thread runtime.
+    pub fn read_barrier(&self, node_id: u64, timeout: Duration) -> Result<u64> {
+        let run = || -> Result<u64> {
+            let ctx = {
+                let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
+                let ctx = group.submit_read_index(node_id)?;
+                group.drive_until_idle()?;
+                ctx
+            };
+            let started_at = Instant::now();
+            loop {
+                let satisfied = {
+                    let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
+                    group.drive_until_idle()?;
+                    group.take_satisfied_read_index(node_id, &ctx)?
+                };
+                if let Some(index) = satisfied {
+                    return Ok(index);
+                }
+                if started_at.elapsed() >= timeout {
+                    // Drop the parked read state so a slow-but-alive barrier
+                    // does not leak entries into pending_reads. Read the
+                    // tablet id from the held guard — self.tablet_id() would
+                    // re-lock this non-reentrant Mutex and deadlock.
+                    let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
+                    let tablet_id = group.tablet_id;
+                    if let Ok(node) = group.node_mut(node_id) {
+                        node.pending_reads.remove(&ctx);
+                    }
+                    return Err(Error::Other(format!(
+                        "raft-rs read barrier for tablet {tablet_id} did not confirm leadership \
+                         within timeout (node may be partitioned or no longer leader)"
+                    )));
+                }
+                thread::sleep(APPEND_WAIT_POLL);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(run)
+            }
+            _ => run(),
+        }
+    }
+
+    pub fn tablet_id(&self) -> i64 {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .tablet_id
+    }
+
     pub fn flush_wire_messages_to(&self, transport: &dyn RaftRsTransport) -> Result<usize> {
         self.inner
             .lock()
@@ -536,6 +597,10 @@ struct RaftRsGroup {
     messages: VecDeque<Message>,
     wire_messages: VecDeque<RaftRsWireMessage>,
     pending_conf_change: bool,
+    /// Monotonic source for unique ReadIndex request contexts. A plain
+    /// counter (not a clock/random) keeps the barrier deterministic under
+    /// test replay.
+    read_counter: u64,
 }
 
 impl RaftRsGroup {
@@ -558,6 +623,7 @@ impl RaftRsGroup {
             messages: VecDeque::new(),
             wire_messages: VecDeque::new(),
             pending_conf_change: false,
+            read_counter: 0,
         };
         group.drive_until_idle()?;
         Ok(group)
@@ -596,6 +662,45 @@ impl RaftRsGroup {
 
     fn is_leader(&self, node_id: u64) -> Result<bool> {
         Ok(self.node(node_id)?.raw.status().ss.raft_state == StateRole::Leader)
+    }
+
+    /// Submit a ReadIndex request and return the context bytes it can be
+    /// collected under. The caller must be leader — raft-rs `Safe`
+    /// ReadIndex confirms leadership against a quorum before yielding a
+    /// read state, which is the whole point: an isolated former leader
+    /// never gets the quorum confirmation, so its read state never arrives.
+    fn submit_read_index(&mut self, node_id: u64) -> Result<Vec<u8>> {
+        if !self.is_leader(node_id)? {
+            return Err(Error::Other(format!(
+                "raft-rs local node {node_id} is not leader for tablet {}; \
+                 linearizable read requires the leader",
+                self.tablet_id
+            )));
+        }
+        self.read_counter += 1;
+        let mut ctx = Vec::with_capacity(16);
+        ctx.extend_from_slice(&self.tablet_id.to_be_bytes());
+        ctx.extend_from_slice(&self.read_counter.to_be_bytes());
+        self.node_mut(node_id)?.raw.read_index(ctx.clone());
+        Ok(ctx)
+    }
+
+    /// Collect a previously submitted read index if its quorum confirmation
+    /// has landed AND the local state machine has applied up to it. Returns
+    /// `Ok(Some(index))` when the barrier is satisfied, `Ok(None)` while
+    /// still waiting. Re-parks the read state if the index is confirmed but
+    /// not yet applied.
+    fn take_satisfied_read_index(&mut self, node_id: u64, ctx: &[u8]) -> Result<Option<u64>> {
+        let last_applied = self.node(node_id)?.last_applied_index;
+        let node = self.node_mut(node_id)?;
+        match node.pending_reads.remove(ctx) {
+            Some(index) if last_applied >= index => Ok(Some(index)),
+            Some(index) => {
+                node.pending_reads.insert(ctx.to_vec(), index);
+                Ok(None)
+            }
+            None => Ok(None),
+        }
     }
 
     fn find_committed_after(
@@ -988,6 +1093,13 @@ impl RaftRsGroup {
         }
 
         let mut ready = node.raw.ready();
+        // Capture ReadIndex results before advancing: read_barrier waits on
+        // these, and a dropped read state hangs the barrier forever.
+        let read_states: Vec<(Vec<u8>, u64)> = ready
+            .read_states()
+            .iter()
+            .map(|state| (state.request_ctx.clone(), state.index))
+            .collect();
         let entries = ready.entries().clone();
         let hard_state = ready.hs().cloned();
         node.persist_ready(&entries, hard_state.as_ref(), ready.must_sync())?;
@@ -1014,6 +1126,9 @@ impl RaftRsGroup {
                 .last_applied_index
                 .clamp(raft_applied_index, committed_index);
             node.raw.advance_apply_to(node.last_applied_index);
+        }
+        for (ctx, index) in read_states {
+            node.pending_reads.insert(ctx, index);
         }
         if applied_conf_change {
             self.pending_conf_change = false;
@@ -1043,6 +1158,12 @@ struct RaftRsNode {
     engine: RaftEngine,
     committed: Vec<LogEntry>,
     last_applied_index: u64,
+    /// ReadIndex results keyed by the request context we submitted:
+    /// `ctx -> committed read index`. Populated when `process_ready`
+    /// observes a `ReadState`; drained by `read_barrier`. Without this the
+    /// read states raft-rs produces would be dropped and every barrier
+    /// would hang (see event-driven-state-stuck footgun).
+    pending_reads: std::collections::HashMap<Vec<u8>, u64>,
 }
 
 impl RaftRsNode {
@@ -1068,6 +1189,7 @@ impl RaftRsNode {
             engine,
             committed: replay.committed_entries,
             last_applied_index: replay.last_applied_index,
+            pending_reads: std::collections::HashMap::new(),
         })
     }
 
@@ -1235,7 +1357,16 @@ fn raft_node_config(node_id: u64, applied: u64) -> Config {
         applied,
         max_size_per_msg: u64::MAX,
         max_inflight_msgs: 256,
-        check_quorum: false,
+        // check_quorum is required for correct linearizable ReadIndex.
+        // Without it raft-rs never resets per-peer `recent_active`, so an
+        // isolated leader believes its peers are still reachable forever
+        // and keeps confirming ReadIndex against a quorum that no longer
+        // exists (it serves stale reads). With check_quorum the leader
+        // clears recent_active each election timeout and steps down when it
+        // cannot re-confirm a quorum, after which the read barrier fails
+        // closed. Paired with pre_vote (already on) so a stepped-down or
+        // isolated node cannot win an election without a reachable quorum.
+        check_quorum: true,
         pre_vote: true,
         ..Default::default()
     }
@@ -1576,6 +1707,41 @@ mod tests {
         logs[2].compact(7, current.index).unwrap();
 
         group.campaign(3).unwrap();
+    }
+
+    #[test]
+    fn read_barrier_confirms_on_healthy_leader_and_times_out_when_isolated() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        // Commit something so applied advances past the empty log.
+        logs[0].append(7, b"before-barrier".to_vec()).unwrap();
+
+        // Healthy leader: the barrier confirms and returns an index at or
+        // above the committed entry.
+        let index = group
+            .read_barrier(1, Duration::from_secs(5))
+            .expect("healthy leader confirms read barrier");
+        assert!(index >= 1, "read index {index} should cover the commit");
+
+        // A non-leader cannot serve a linearizable read.
+        assert!(group.read_barrier(2, Duration::from_millis(200)).is_err());
+
+        // Isolate the leader from both followers: ReadIndex can no longer
+        // confirm leadership against a quorum, so the barrier must time out
+        // rather than fall back to a local read.
+        group.mark_unavailable(2).unwrap();
+        group.mark_unavailable(3).unwrap();
+        let started = Instant::now();
+        let result = group.read_barrier(1, Duration::from_millis(500));
+        assert!(
+            result.is_err(),
+            "isolated leader must not confirm a read barrier"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "barrier should wait out its timeout before failing"
+        );
     }
 
     #[test]

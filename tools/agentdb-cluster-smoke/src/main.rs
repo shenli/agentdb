@@ -101,6 +101,14 @@ struct Args {
     #[arg(long)]
     full_hardening: bool,
 
+    /// Deterministic transport fault injection scenario (S22): isolate a
+    /// live leader from its followers via the fault API — a partition the
+    /// process-kill scenarios cannot produce — and assert the surviving
+    /// quorum keeps committing. Requires nodes started with
+    /// AGENTDB_TRANSPORT_FAULTS=1 (this tool sets it for --fault-injection).
+    #[arg(long)]
+    fault_injection: bool,
+
     /// Verify idempotent append, gap-free session order, and replica convergence.
     #[arg(long)]
     consistency: bool,
@@ -187,6 +195,9 @@ async fn main() -> Result<()> {
         bail!(
             "--failover and --chaos are separate scenarios; run them as separate smoke invocations"
         );
+    }
+    if args.fault_injection && (args.chaos || args.failover) {
+        bail!("--fault-injection is a separate scenario; run it as its own smoke invocation");
     }
     if !args.server_bin.exists() {
         bail!(
@@ -584,6 +595,10 @@ fn spawn_node(args: &Args, node: &NodeSpec) -> Result<Child> {
         .env("AGENTDB_TABLET_MOVEMENT_BATCH_SIZE", "0")
         .env("AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS", "0")
         .env("AWS_EC2_METADATA_DISABLED", "true")
+        .envs(
+            args.fault_injection
+                .then_some(("AGENTDB_TRANSPORT_FAULTS", "1")),
+        )
         .env(
             "RUST_LOG",
             env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
@@ -910,6 +925,23 @@ async fn run_smoke(
             nodes,
             children,
             ChaosSession {
+                tenant_id: &tenant_id,
+                agent_id: &agent_id,
+                session_id: &session_id,
+                next_seq,
+            },
+        )
+        .await?;
+    }
+
+    if args.fault_injection {
+        eprintln!("fault-injection: waiting for post-setup raft convergence");
+        wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
+        run_fault_injection(
+            args,
+            client,
+            nodes,
+            FaultSession {
                 tenant_id: &tenant_id,
                 agent_id: &agent_id,
                 session_id: &session_id,
@@ -3447,6 +3479,324 @@ async fn get_json(client: &Client, base: &str, path: &str) -> Result<Value> {
     Ok(serde_json::from_str(&text)?)
 }
 
+struct FaultSession<'a> {
+    tenant_id: &'a str,
+    agent_id: &'a str,
+    session_id: &'a str,
+    next_seq: u64,
+}
+
+/// Raft view of a tablet: which live node believes it is leader, its raft
+/// id and term, and the raft ids of the other configured replicas.
+struct RaftLeaderView {
+    leader: NodeSpec,
+    leader_raft_id: u64,
+    term: u64,
+    follower_raft_ids: Vec<u64>,
+}
+
+async fn raft_leader_view(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+) -> Result<Option<RaftLeaderView>> {
+    for node in nodes {
+        let Ok(raft) = get_json(client, &node.url, "/api/admin/raft").await else {
+            continue;
+        };
+        let Some(tablet) = raft["tablets"].as_array().and_then(|tablets| {
+            tablets
+                .iter()
+                .find(|tablet| tablet["tablet_id"].as_i64() == Some(tablet_id))
+        }) else {
+            continue;
+        };
+        let local = tablet["replicas"].as_array().and_then(|replicas| {
+            replicas
+                .iter()
+                .find(|replica| replica["role"].as_str() == Some("Leader"))
+        });
+        let Some(local) = local else {
+            continue;
+        };
+        let leader_raft_id = local["node_id"].as_u64().unwrap_or_default();
+        let term = local["term"].as_u64().unwrap_or_default();
+        let follower_raft_ids = tablet["configured_replicas"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|replica| replica["raft_node_id"].as_u64())
+            .filter(|raft_id| *raft_id != leader_raft_id)
+            .collect();
+        return Ok(Some(RaftLeaderView {
+            leader: node.clone(),
+            leader_raft_id,
+            term,
+            follower_raft_ids,
+        }));
+    }
+    Ok(None)
+}
+
+async fn wait_raft_leader_view(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    timeout: Duration,
+) -> Result<RaftLeaderView> {
+    let start = tokio::time::Instant::now();
+    loop {
+        if let Some(view) = raft_leader_view(client, nodes, tablet_id).await? {
+            return Ok(view);
+        }
+        if start.elapsed() > timeout {
+            bail!("no raft leader for tablet {tablet_id} within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn fault_put_rules(client: &Client, base: &str, token: &str, rules: Value) -> Result<Value> {
+    let response = client
+        .put(format!("{base}/api/internal/raft/faults"))
+        .header("X-AgentDB-Internal-Token", token)
+        .json(&json!({ "rules": rules }))
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("fault PUT HTTP {status} for {base}: {text}");
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
+async fn fault_snapshot(client: &Client, base: &str, token: &str) -> Result<Value> {
+    let response = client
+        .get(format!("{base}/api/internal/raft/faults"))
+        .header("X-AgentDB-Internal-Token", token)
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("fault GET HTTP {status} for {base}: {text}");
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
+async fn fault_clear(client: &Client, base: &str, token: &str) -> Result<()> {
+    let response = client
+        .delete(format!("{base}/api/internal/raft/faults"))
+        .header("X-AgentDB-Internal-Token", token)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await?;
+        bail!("fault DELETE HTTP {status} for {base}: {text}");
+    }
+    Ok(())
+}
+
+/// S22: a live-but-partitioned leader. Process-kill scenarios cannot make
+/// this shape — a killed node loses its HTTP surface too. Here we isolate
+/// the raft leader from its followers via the fault API while it keeps
+/// serving HTTP, then assert the honest consequences in today's system:
+///   1. the fault mechanism actually fired (snapshot counters advance),
+///   2. the isolated leader can no longer commit a write (lost quorum),
+///   3. the surviving majority elects a new leader at a higher term,
+///   4. healing the partition reconverges every replica.
+///
+/// The stale-READ half of Goal 1 (an isolated former leader must not serve
+/// a linearizable read) is asserted once the read barrier lands (P0-2);
+/// today reads route by SQL lease and never consult raft, so this scenario
+/// deliberately does not claim it.
+async fn run_fault_injection(
+    args: &Args,
+    client: &Client,
+    nodes: &[NodeSpec],
+    session: FaultSession<'_>,
+) -> Result<()> {
+    let token = &args.internal_auth_token;
+    let tablet_id = PRIMARY_TABLET_ID;
+
+    let view = wait_raft_leader_view(client, nodes, tablet_id, Duration::from_secs(30)).await?;
+    eprintln!(
+        "fault-injection: tablet {tablet_id} leader is {} (raft id {}, term {}), isolating from {} followers",
+        view.leader.id,
+        view.leader_raft_id,
+        view.term,
+        view.follower_raft_ids.len()
+    );
+    if view.follower_raft_ids.is_empty() {
+        bail!("fault-injection: leader has no followers to isolate from");
+    }
+
+    // Install on the leader node a both-directions drop against every
+    // follower link. One node's fault table is enough: it blocks the
+    // leader's outbound sends AND the inbound messages it would step.
+    let rules: Vec<Value> = view
+        .follower_raft_ids
+        .iter()
+        .flat_map(|raft_id| {
+            [
+                json!({
+                    "key": format!("isolate-out-{raft_id}"),
+                    "tablet_id": tablet_id,
+                    "to": raft_id,
+                    "direction": "send",
+                    "action": "drop"
+                }),
+                json!({
+                    "key": format!("isolate-in-{raft_id}"),
+                    "tablet_id": tablet_id,
+                    "from": raft_id,
+                    "direction": "recv",
+                    "action": "drop"
+                }),
+            ]
+        })
+        .collect();
+    fault_put_rules(client, &view.leader.url, token, json!(rules)).await?;
+    eprintln!(
+        "fault-injection: installed {} isolation rules on {}",
+        rules.len(),
+        view.leader.id
+    );
+
+    // 3. A new leader must emerge on the majority at a higher term. Look
+    //    only among the followers — the isolated leader may still report
+    //    itself leader for a while at the old term.
+    let followers: Vec<NodeSpec> = nodes
+        .iter()
+        .filter(|node| node.id != view.leader.id)
+        .cloned()
+        .collect();
+    let new_view = wait_raft_leader_view(client, &followers, tablet_id, Duration::from_secs(30))
+        .await
+        .context("majority did not elect a new leader while old leader was isolated")?;
+    if new_view.term <= view.term {
+        bail!(
+            "fault-injection: new leader term {} did not advance past isolated leader term {}",
+            new_view.term,
+            view.term
+        );
+    }
+    eprintln!(
+        "fault-injection: majority elected {} at term {} (was {} at term {})",
+        new_view.leader.id, new_view.term, view.leader.id, view.term
+    );
+
+    // 1. The mechanism fired: the isolated leader's fault table counted
+    //    matched messages (it kept trying to reach its followers).
+    let snapshot = fault_snapshot(client, &view.leader.url, token).await?;
+    let total_matched: u64 = snapshot["matched"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, value)| value.as_u64())
+        .sum();
+    if total_matched == 0 {
+        bail!("fault-injection: no messages matched the isolation rules; mechanism did not fire");
+    }
+    eprintln!("fault-injection: isolation rules matched {total_matched} messages");
+
+    // 2. The isolated leader cannot commit a write (no quorum). Route
+    //    directly at it and require a convergence/timeout error.
+    let isolated_append = post_json_with_idempotency_key(
+        client,
+        &view.leader.url,
+        &format!(
+            "/api/tenants/{}/sessions/{}/events",
+            session.tenant_id, session.session_id
+        ),
+        json!({
+            "agent_id": session.agent_id,
+            "kind": "message",
+            "payload": {"seq": session.next_seq, "source": "fault-injection-isolated"},
+            "artifact_refs": [],
+            "source_refs": []
+        }),
+        &format!("fault-injection-isolated-{}", session.next_seq),
+    )
+    .await;
+    match isolated_append {
+        Err(error) if is_retryable_cluster_convergence_error(&error) => {
+            eprintln!("fault-injection: isolated leader correctly failed to commit: {error}");
+        }
+        Err(error) => {
+            eprintln!("fault-injection: isolated leader rejected the write (acceptable): {error}");
+        }
+        Ok(event) => {
+            bail!(
+                "fault-injection: isolated leader committed a write it had no quorum for: {event}"
+            );
+        }
+    }
+
+    // 2b. No stale linearizable reads: with check_quorum the isolated
+    //     leader must STEP DOWN (it cannot re-confirm a quorum) and, with
+    //     pre_vote, cannot win another election while isolated — so it
+    //     never resumes raft leadership and can never self-confirm a stale
+    //     local read. We verify it leaves the Leader role within a settle
+    //     window and stays out of it. (Reads to the former leader then
+    //     either refuse locally, while it is still the routed owner, or
+    //     forward to the healthy leader once ownership moves — both correct,
+    //     neither a stale local serve. The barrier's local-serve refusal is
+    //     pinned deterministically by the storage unit test
+    //     read_barrier_confirms_on_healthy_leader_and_times_out_when_isolated.)
+    let stepdown_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let is_leader = raft_leader_view(client, std::slice::from_ref(&view.leader), tablet_id)
+            .await?
+            .is_some();
+        if !is_leader {
+            eprintln!(
+                "fault-injection: isolated node {} stepped down from leader (check_quorum)",
+                view.leader.id
+            );
+            break;
+        }
+        if tokio::time::Instant::now() >= stepdown_deadline {
+            bail!(
+                "fault-injection: isolated node {} stayed raft leader for 20s; check_quorum did \
+                 not step it down, so it could serve stale linearizable reads",
+                view.leader.id
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // It must STAY stepped down while partitioned (pre_vote blocks an
+    // isolated re-election); a flap back to leader would reopen the window.
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if raft_leader_view(client, std::slice::from_ref(&view.leader), tablet_id)
+            .await?
+            .is_some()
+        {
+            bail!(
+                "fault-injection: isolated node {} flapped back to raft leader while still \
+                 partitioned",
+                view.leader.id
+            );
+        }
+    }
+    eprintln!(
+        "fault-injection: isolated node {} stays non-leader while partitioned; no stale reads",
+        view.leader.id
+    );
+
+    // 4. Heal and reconverge.
+    fault_clear(client, &view.leader.url, token).await?;
+    eprintln!("fault-injection: cleared isolation rules; waiting for reconvergence");
+    wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
+    eprintln!(
+        "fault-injection: PASS — mechanism, quorum-loss, no-stale-reads (step-down), election, and heal all held"
+    );
+    Ok(())
+}
+
 async fn create_record_with_commit(
     client: &Client,
     base: &str,
@@ -3712,7 +4062,7 @@ async fn wait_record_index_watermark(
         if start.elapsed() > timeout {
             bail!(
                 "record indexes did not reach commit_seq {commit_seq} within {timeout:?}; last={}",
-                last.unwrap_or_else(|| json!(null))
+                last.unwrap_or(Value::Null)
             );
         }
         match get_json(client, base, "/api/admin/indexes/records").await {

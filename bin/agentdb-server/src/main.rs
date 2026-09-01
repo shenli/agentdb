@@ -298,6 +298,32 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let config = ResolvedServeConfig::from_serve_opts(opts)?;
     if !config.in_memory {
         std::fs::create_dir_all(&config.data_dir)?;
+        // Fail closed on a data directory that belongs to another node or
+        // cluster, or whose identity marker is corrupt. This runs before
+        // any store opens and long before the listener binds, so a
+        // misconfiguration surfaces as a clean startup error rather than
+        // silent cross-node corruption. See
+        // docs/design/distributed-safety-hardening.md §3.
+        let expected = agentdb_storage::store_identity::ExpectedIdentity {
+            node_id: config
+                .route_node_id
+                .clone()
+                .unwrap_or_else(|| "single-node".to_string()),
+            cell_id: config.route_cell_id.clone(),
+            cluster_id: config.cluster_id.clone(),
+        };
+        let identity = agentdb_storage::store_identity::load_or_init(
+            &config.data_dir,
+            &expected,
+            now_ms_u64(),
+        )
+        .map_err(|error| anyhow::anyhow!("store identity check failed: {error}"))?;
+        tracing::info!(
+            cluster_id = %identity.cluster_id,
+            node_id = %identity.node_id,
+            store_incarnation = %identity.store_incarnation,
+            "verified store identity"
+        );
     }
     let route_location = config
         .route_region
@@ -469,6 +495,17 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         tracing::warn!(?error, "system tenant bootstrap deferred");
     }
 
+    // Deterministic transport fault injection (test-only): exists only
+    // when explicitly enabled, so production pays a single Option check.
+    let transport_faults = if std::env::var("AGENTDB_TRANSPORT_FAULTS").as_deref() == Ok("1") {
+        tracing::warn!(
+            "transport fault injection ENABLED (AGENTDB_TRANSPORT_FAULTS=1); this is a test-only mode"
+        );
+        Some(Arc::new(agentdb_api::transport_faults::FaultTable::new()))
+    } else {
+        None
+    };
+
     let mut state = agentdb_api::AppState::new(runtime.clone())
         .with_auth_meta(auth_meta)
         .with_proxy_policy(agentdb_api::state::ProxyPolicy {
@@ -476,6 +513,21 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             max_response_bytes: config.route_proxy_max_response_bytes,
         })
         .with_tablet_store_status(tablet_store_status(&config));
+    state.transport_faults = transport_faults.clone();
+    // Linearizable read barrier: on by default, disabled by
+    // AGENTDB_READ_BARRIER=off. It only engages on replicated tablets
+    // (a raft registry must be present), so single-node runs never pay it
+    // regardless of this setting.
+    state.read_barrier_timeout = if std::env::var("AGENTDB_READ_BARRIER").as_deref() == Ok("off") {
+        tracing::warn!(
+            "linearizable read barrier DISABLED (AGENTDB_READ_BARRIER=off); routed reads may serve stale data"
+        );
+        None
+    } else {
+        Some(Duration::from_millis(
+            env_u64("AGENTDB_READ_BARRIER_TIMEOUT_MS", 5_000).max(1),
+        ))
+    };
     if let Some(token) = config.api_auth_token.clone() {
         state = state.with_api_auth_token(token);
     }
@@ -696,6 +748,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         outbox.clone(),
                         Duration::from_millis(raft_outbox_interval_ms),
                         raft_outbox_max_messages_per_tick,
+                        transport_faults.clone(),
                     );
                     campaign_owned_raft_tablets(
                         &startup.meta,
@@ -852,6 +905,10 @@ struct ResolvedServeConfig {
     object_store: Option<ResolvedObjectStoreConfig>,
     in_memory: bool,
     route_node_id: Option<String>,
+    /// Cluster identity for the store-identity fail-closed check. `None`
+    /// mints one into the identity file on first boot; when set (via
+    /// `AGENTDB_CLUSTER_ID`), a mismatch refuses startup.
+    cluster_id: Option<String>,
     route_shard_count: i64,
     route_default_tablet_id: i64,
     route_region: Option<String>,
@@ -1170,6 +1227,7 @@ impl ResolvedServeConfig {
             object_store,
             in_memory,
             route_node_id,
+            cluster_id: std::env::var("AGENTDB_CLUSTER_ID").ok(),
             route_shard_count: opts
                 .route_shard_count
                 .or(file.routing.shard_count)
@@ -1326,6 +1384,7 @@ impl ResolvedServeConfig {
             object_store,
             in_memory,
             route_node_id,
+            cluster_id: std::env::var("AGENTDB_CLUSTER_ID").ok(),
             route_shard_count: file
                 .routing
                 .shard_count
@@ -3150,6 +3209,7 @@ fn spawn_raft_rs_message_outbox_worker(
     outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     interval: Duration,
     max_messages_per_tick: usize,
+    transport_faults: Option<Arc<agentdb_api::transport_faults::FaultTable>>,
 ) {
     let interval = interval.max(Duration::from_millis(100));
     let max_messages_per_tick = max_messages_per_tick.max(1);
@@ -3163,6 +3223,7 @@ fn spawn_raft_rs_message_outbox_worker(
                 &registry,
                 &outbox,
                 max_messages_per_tick,
+                transport_faults.as_deref(),
             )
             .await
             {
@@ -3178,6 +3239,7 @@ async fn run_raft_rs_message_outbox_tick(
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     max_messages_per_tick: usize,
+    transport_faults: Option<&agentdb_api::transport_faults::FaultTable>,
 ) -> anyhow::Result<usize> {
     // Peer URLs are seeded at startup and kept fresh by the dedicated
     // change-notified refresher; re-resolving them via SQL on every send
@@ -3195,6 +3257,7 @@ async fn run_raft_rs_message_outbox_tick(
             &group,
             outbox,
             remaining_budget,
+            transport_faults,
         )
         .await
         {
@@ -3214,6 +3277,7 @@ async fn flush_raft_rs_group_messages_with_health(
     group: &agentdb_storage::RaftRsSharedGroup,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     max_messages: usize,
+    transport_faults: Option<&agentdb_api::transport_faults::FaultTable>,
 ) -> anyhow::Result<usize> {
     let messages = group.take_wire_messages();
     let send_limit = messages.len().min(max_messages.max(1));
@@ -3229,6 +3293,34 @@ async fn flush_raft_rs_group_messages_with_health(
     // sends -> more retransmits -> more health updates).
     let mut peer_health: BTreeMap<u64, &'static str> = BTreeMap::new();
     for (index, message) in messages.iter().take(send_limit).cloned().enumerate() {
+        // Deterministic fault injection at the production send boundary.
+        if let Some(faults) = transport_faults {
+            use agentdb_api::transport_faults::FaultVerdict;
+            match faults.evaluate(tablet_id, message.from, message.to, true, &message) {
+                FaultVerdict::Pass => {}
+                FaultVerdict::Drop => {
+                    // Vanishes like network loss: counted as sent, never
+                    // restored.
+                    sent += 1;
+                    continue;
+                }
+                FaultVerdict::Held { .. } => {
+                    // Parked in the fault table; release re-injects it.
+                    continue;
+                }
+                FaultVerdict::Delay { ms } => {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                FaultVerdict::Reject => {
+                    peer_health.insert(message.to, "unreachable");
+                    if first_send_error.is_none() {
+                        first_send_error = Some("fault injection: reject".to_string());
+                    }
+                    failed.push(messages[index].clone());
+                    continue;
+                }
+            }
+        }
         match outbox.send_message_to_peer(&message).await {
             Ok(()) => {
                 peer_health.insert(message.to, "healthy");
@@ -5892,6 +5984,13 @@ fn now_ms_i64() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn now_ms_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
 }
 
@@ -9354,6 +9453,7 @@ node_id = "node-a"
             &group,
             &outbox,
             1_024,
+            None,
         )
         .await
         .unwrap();

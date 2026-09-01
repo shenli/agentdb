@@ -93,6 +93,16 @@ pub fn routes() -> Router<AppState> {
             post(post_internal_raft_snapshot),
         )
         .route(
+            "/api/internal/raft/faults",
+            get(get_internal_raft_faults)
+                .put(put_internal_raft_faults)
+                .delete(delete_internal_raft_faults),
+        )
+        .route(
+            "/api/internal/raft/faults/release",
+            post(post_internal_raft_faults_release),
+        )
+        .route(
             "/api/internal/tablet-movements/snapshot/export",
             post(post_internal_tablet_movement_snapshot_export),
         )
@@ -1291,12 +1301,45 @@ async fn post_internal_raft_message(
     {
         return response;
     }
-    match ingress.step_wire_message(agentdb_storage::RaftRsWireMessage {
+    let wire_message = agentdb_storage::RaftRsWireMessage {
         tablet_id: body.tablet_id,
         from: body.from,
         to: body.to,
         payload,
-    }) {
+    };
+    // Deterministic fault injection sits AFTER auth + peer validation and
+    // BEFORE step: a faulted message exercised the full production receive
+    // framing first.
+    if let Some(faults) = s.transport_faults.as_ref() {
+        use crate::transport_faults::FaultVerdict;
+        match faults.evaluate(body.tablet_id, body.from, body.to, false, &wire_message) {
+            FaultVerdict::Pass => {}
+            FaultVerdict::Drop | FaultVerdict::Held { .. } => {
+                // Acknowledged-then-lost (or parked): the sender saw 202.
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(InternalRaftAccepted {
+                        status: "accepted",
+                        tablet_id: body.tablet_id,
+                        from: body.from,
+                        to: body.to,
+                    }),
+                )
+                    .into_response();
+            }
+            FaultVerdict::Delay { ms } => {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            FaultVerdict::Reject => {
+                return internal_raft_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "FAULT_INJECTED",
+                    "transport fault injection rejected this message",
+                );
+            }
+        }
+    }
+    match ingress.step_wire_message(wire_message) {
         Ok(()) => {
             if let Some(registry) = s.raft_registry.as_ref() {
                 if let Ok(statuses) = registry.status_for(body.tablet_id) {
@@ -1332,6 +1375,121 @@ async fn post_internal_raft_message(
             err.to_string(),
         ),
     }
+}
+
+/// Shared guard for the fault-injection control plane: internal token
+/// required, and the table only exists when the server started with
+/// `AGENTDB_TRANSPORT_FAULTS=1`.
+#[allow(clippy::result_large_err)]
+fn transport_faults_or_error(
+    s: &AppState,
+    headers: &HeaderMap,
+) -> Result<Arc<crate::transport_faults::FaultTable>, Response> {
+    validate_internal_raft_request(s, headers)?;
+    s.transport_faults.clone().ok_or_else(|| {
+        internal_raft_error(
+            StatusCode::NOT_FOUND,
+            "FAULTS_DISABLED",
+            "transport fault injection is not enabled; start the server with AGENTDB_TRANSPORT_FAULTS=1",
+        )
+    })
+}
+
+async fn get_internal_raft_faults(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    match transport_faults_or_error(&s, &headers) {
+        Ok(faults) => Json(faults.snapshot()).into_response(),
+        Err(response) => response,
+    }
+}
+
+#[derive(Deserialize)]
+struct InternalRaftFaultsBody {
+    rules: Vec<crate::transport_faults::FaultRule>,
+}
+
+async fn put_internal_raft_faults(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InternalRaftFaultsBody>,
+) -> Response {
+    match transport_faults_or_error(&s, &headers) {
+        Ok(faults) => {
+            faults.replace(body.rules);
+            Json(faults.snapshot()).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+async fn delete_internal_raft_faults(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    match transport_faults_or_error(&s, &headers) {
+        Ok(faults) => {
+            let discarded = faults.clear();
+            Json(serde_json::json!({ "cleared": true, "discarded_held": discarded }))
+                .into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+#[derive(Deserialize)]
+struct InternalRaftFaultsReleaseBody {
+    key: String,
+}
+
+/// Re-inject messages parked by a `hold` rule, in arrival order.
+/// Send-held messages return to their group's outbox (the outbox worker
+/// re-sends them through the production path); recv-held messages are
+/// stepped into the local ingress.
+async fn post_internal_raft_faults_release(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InternalRaftFaultsReleaseBody>,
+) -> Response {
+    let faults = match transport_faults_or_error(&s, &headers) {
+        Ok(faults) => faults,
+        Err(response) => return response,
+    };
+    let held = faults.release(&body.key);
+    let mut resent = 0usize;
+    let mut stepped = 0usize;
+    let mut errors = Vec::new();
+    for entry in held {
+        if entry.send_side {
+            let Some(registry) = s.raft_registry.as_ref() else {
+                errors.push("raft registry unavailable for send-held release".to_string());
+                continue;
+            };
+            let tablet_id = entry.message.tablet_id;
+            match registry
+                .groups_snapshot()
+                .into_iter()
+                .find(|(id, _)| *id == tablet_id)
+            {
+                Some((_, group)) => match group.restore_wire_messages(vec![entry.message]) {
+                    Ok(()) => resent += 1,
+                    Err(err) => errors.push(format!("restore tablet {tablet_id}: {err}")),
+                },
+                None => errors.push(format!("no local group for tablet {tablet_id}")),
+            }
+        } else {
+            let Some(ingress) = s.raft_ingress.as_ref() else {
+                errors.push("raft ingress unavailable for recv-held release".to_string());
+                continue;
+            };
+            match ingress.step_wire_message(entry.message) {
+                Ok(()) => stepped += 1,
+                Err(err) => errors.push(format!("step: {err}")),
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "key": body.key,
+        "resent": resent,
+        "stepped": stepped,
+        "errors": errors,
+    }))
+    .into_response()
 }
 
 async fn post_internal_raft_snapshot(
@@ -5658,6 +5816,9 @@ async fn get_session(
             Ok(headers) => headers,
             Err(response) => return Ok(response),
         };
+    if let Err(response) = enforce_read_barrier(&s, &route_headers).await {
+        return Ok(response);
+    }
     let runtime = s.runtime.clone();
     let session = with_route_tablet_context(runtime.clone(), &route_headers, async move {
         runtime.get_session(&tid, &sid).await
@@ -6045,6 +6206,9 @@ async fn fetch_events(
             Ok(headers) => headers,
             Err(response) => return Ok(response),
         };
+    if let Err(response) = enforce_read_barrier(&s, &route_headers).await {
+        return Ok(response);
+    }
     let runtime = s.runtime.clone();
     let events = with_route_tablet_context(runtime.clone(), &route_headers, async move {
         if q.latest {
@@ -7404,6 +7568,51 @@ where
             Err(execute_forward(state, forward, method, body.map(|build| build())).await)
         }
         RouteGuardOutcome::Reject(rejection) => Err(route_rejection_response(&rejection)),
+    }
+}
+
+/// Enforce a linearizable read barrier before serving a routed read
+/// locally. No-op unless the runtime is replicated (a raft registry is
+/// present), the barrier is enabled, and the route resolved to a local
+/// tablet. Returns a typed retryable error if the local replica cannot
+/// confirm current Raft leadership — it never falls back to a local read.
+/// See docs/design/read-semantics.md.
+async fn enforce_read_barrier(state: &AppState, route_headers: &HeaderMap) -> Result<(), Response> {
+    let Some(timeout) = state.read_barrier_timeout else {
+        tracing::debug!("read barrier skipped: disabled");
+        return Ok(());
+    };
+    let Some(registry) = state.raft_registry.clone() else {
+        tracing::debug!("read barrier skipped: no raft registry (single-node)");
+        return Ok(());
+    };
+    let Some(tablet_id) = route_tablet_id(route_headers) else {
+        // No tablet context: nothing routed, nothing to confirm.
+        return Ok(());
+    };
+    let local_raft_node_id = match agentdb_storage::stable_raft_node_id(state.drain.node_id()) {
+        Ok(id) => id,
+        Err(error) => {
+            return Err(internal_raft_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "READ_BARRIER_NODE_ID",
+                format!("could not derive local raft node id: {error}"),
+            ));
+        }
+    };
+    // read_barrier internally hands off with block_in_place, so call it
+    // directly from this async context. Do NOT wrap in spawn_blocking:
+    // block_in_place must run on a runtime worker, not a blocking thread.
+    match registry.read_barrier(tablet_id, local_raft_node_id, timeout) {
+        Ok(read_index) => {
+            tracing::debug!(tablet_id, read_index, "read barrier confirmed");
+            Ok(())
+        }
+        Err(error) => Err(internal_raft_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "READ_BARRIER_UNCONFIRMED",
+            format!("linearizable read could not confirm raft leadership: {error}"),
+        )),
     }
 }
 
