@@ -3564,6 +3564,13 @@ async fn run_raft_rs_snapshot_tick(
         if target_nodes.is_empty() {
             continue;
         }
+        // Baseline measurement for the manifest-based-attachment evaluation
+        // (hardening §7): today a replacement/placement copies the tablet's
+        // FULL runtime state as one snapshot payload. Record its size and the
+        // export time so S9 and real replacements quantify the movement cost
+        // that a manifest+lazy-block attach would aim to cut down to the
+        // recent tail. See docs/design/tablet-attachment-evaluation.md.
+        let export_started = std::time::Instant::now();
         let application_snapshot = match runtime.export_tablet_snapshot_payload(tablet_id) {
             Ok(payload) => payload,
             Err(error) => {
@@ -3575,6 +3582,12 @@ async fn run_raft_rs_snapshot_tick(
                 continue;
             }
         };
+        tracing::info!(
+            tablet_id,
+            snapshot_bytes = application_snapshot.len(),
+            export_ms = export_started.elapsed().as_millis() as u64,
+            "movement snapshot: full tablet state export (§7 baseline)"
+        );
         let mut compact_through = 0u64;
         for (to, node_id) in target_nodes {
             let transfer = group.build_snapshot_transfer(
