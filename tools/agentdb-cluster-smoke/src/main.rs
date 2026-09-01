@@ -109,6 +109,13 @@ struct Args {
     #[arg(long)]
     fault_injection: bool,
 
+    /// Store-incarnation admission scenario (S23): retire a node's
+    /// incarnation via the control plane, restart it against the same data
+    /// directory, and assert it FAILS to boot (a retired disk must not
+    /// rejoin). Leaves that node down; run as its own invocation.
+    #[arg(long)]
+    store_admission: bool,
+
     /// Verify idempotent append, gap-free session order, and replica convergence.
     #[arg(long)]
     consistency: bool,
@@ -198,6 +205,9 @@ async fn main() -> Result<()> {
     }
     if args.fault_injection && (args.chaos || args.failover) {
         bail!("--fault-injection is a separate scenario; run it as its own smoke invocation");
+    }
+    if args.store_admission && (args.chaos || args.failover || args.fault_injection) {
+        bail!("--store-admission is a separate scenario; run it as its own smoke invocation");
     }
     if !args.server_bin.exists() {
         bail!(
@@ -953,6 +963,10 @@ async fn run_smoke(
             },
         )
         .await?;
+    }
+
+    if args.store_admission {
+        run_store_admission(args, client, nodes, children).await?;
     }
 
     let mut active_nodes = nodes.to_vec();
@@ -3798,6 +3812,120 @@ async fn run_fault_injection(
     eprintln!(
         "fault-injection: PASS — mechanism, quorum-loss, no-stale-reads (step-down), election, and heal all held"
     );
+    Ok(())
+}
+
+/// S23: retire a node's store incarnation via the control plane, then
+/// restart that node against the same data directory and assert it FAILS
+/// to boot. A retired disk must not rejoin — this is the control-plane
+/// half of the store-identity check that the local IDENTITY.json cannot
+/// enforce on its own.
+async fn run_store_admission(
+    args: &Args,
+    client: &Client,
+    nodes: &[NodeSpec],
+    children: &mut [Child],
+) -> Result<()> {
+    // Pick the last node as the victim and a different surviving node to
+    // serve the admin retire call (any node reaches the shared control
+    // plane).
+    let victim_index = nodes.len() - 1;
+    let victim = &nodes[victim_index];
+    let admin = &nodes[0];
+    eprintln!(
+        "store-admission: retiring incarnation of {} via {}",
+        victim.id, admin.id
+    );
+    post_json(
+        client,
+        &admin.url,
+        &format!("/api/admin/cluster/stores/{}/retire", victim.id),
+        json!({}),
+    )
+    .await
+    .context("retire victim incarnation")?;
+
+    // Confirm the registry now shows it retired.
+    let listing = get_json(
+        client,
+        &admin.url,
+        &format!("/api/admin/cluster/stores/{}", victim.id),
+    )
+    .await?;
+    let retired = listing["incarnations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|inc| inc["state"].as_str() == Some("retired"));
+    if !retired {
+        bail!("store-admission: victim incarnation was not marked retired: {listing}");
+    }
+
+    // Restart the victim against the SAME data directory (same
+    // IDENTITY.json → same incarnation). Admission must fail closed, so
+    // the process must EXIT rather than become healthy.
+    eprintln!(
+        "store-admission: restarting {} against its retired data dir (must fail closed)",
+        victim.id
+    );
+    children[victim_index].kill().ok();
+    children[victim_index].wait().ok();
+    children[victim_index] = spawn_node(args, victim)?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match children[victim_index].try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    bail!(
+                        "store-admission: {} exited 0 after readmission attempt; a retired disk \
+                         must fail closed, not exit cleanly",
+                        victim.id
+                    );
+                }
+                eprintln!(
+                    "store-admission: {} correctly refused to boot ({status})",
+                    victim.id
+                );
+                break;
+            }
+            Ok(None) => {
+                // Still running — must NOT have become healthy.
+                if client
+                    .get(format!("{}/health/ready", victim.url))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+                {
+                    bail!(
+                        "store-admission: {} became healthy after readmission; a retired disk \
+                         must fail closed",
+                        victim.id
+                    );
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    bail!(
+                        "store-admission: {} neither exited nor refused within 30s",
+                        victim.id
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => bail!("store-admission: waiting on {} failed: {error}", victim.id),
+        }
+    }
+
+    // The failure must be the admission check, not something else.
+    let log = std::fs::read_to_string(&victim.log_path).unwrap_or_default();
+    if !log.contains("store incarnation admission failed") && !log.contains("was retired") {
+        bail!(
+            "store-admission: {} exited but its log does not show the admission failure",
+            victim.id
+        );
+    }
+    eprintln!("store-admission: PASS — a retired disk is refused readmission by the control plane");
     Ok(())
 }
 
