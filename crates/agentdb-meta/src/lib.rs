@@ -19,6 +19,7 @@
 pub mod cells;
 pub mod change_notifier;
 pub mod cluster_root;
+pub mod dek_catalog;
 pub mod config;
 pub mod error;
 pub mod migrations;

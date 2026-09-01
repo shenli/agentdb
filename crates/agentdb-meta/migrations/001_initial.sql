@@ -176,3 +176,20 @@ INSERT OR IGNORE INTO cells
 VALUES
     ('default', NULL, 'standard', 'single_az_cluster', 'stable',
      'shared_logical', 'serving', 'default', 'default', 0, 0, 0);
+
+-- Wrapped-DEK key catalog (encryption-at-rest, cluster-shared). One row per
+-- (tenant_id, purpose, version) holding a DEK wrapped under the KEK; never
+-- plaintext key material. Shared across nodes so every node serves the same
+-- per-tenant key; INSERT ... ON CONFLICT DO NOTHING coordinates the
+-- provisioning race across nodes.
+CREATE TABLE IF NOT EXISTS dek_catalog (
+    tenant_id        TEXT NOT NULL,
+    purpose          TEXT NOT NULL,           -- metadata|content|index|export|snapshot
+    version          INTEGER NOT NULL,
+    wrapping_key_ref TEXT NOT NULL,
+    nonce            BLOB NOT NULL,
+    ciphertext       BLOB NOT NULL,
+    status           TEXT NOT NULL,           -- active|read_only|retired|revoked
+    created_at_ms    BIGINT NOT NULL,
+    PRIMARY KEY (tenant_id, purpose, version)
+);
