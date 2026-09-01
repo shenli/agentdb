@@ -206,10 +206,20 @@ over one shared catalog (two nodes) seal/open under the same DEK** after the
 follower refreshes; and a restarted provider re-warms from the catalog and opens
 prior ciphertext.
 
-**Not yet done:** the final cluster wiring — call `provision_tenant` from
-`create_tenant`, build the provider + keyring for the replicated layout in the
-server, lift the replicated-layout fail-closed, hook `refresh` to the metadata
-change-notifier, and add a real multi-node test. The online DEK rotation worker
+**Milestone 12 (landed): the runtime provisions tenant keys at creation.** A
+`TenantKeyProvisioner` trait (async) and an optional runtime hook: `create_tenant`
+calls it right after the tenant is durably created, so the tenant's DEKs are
+minted (on the leader) before any of its data can be written — exactly what the
+read-only cluster serve path needs. `Runtime::with_kv_content_keyring_provisioner_and_replicated_logs`
+wires a keyring + provisioner for the cluster shape, and `MetaCatalogKeyProvider`
+implements the trait. A test confirms `create_tenant` provisions the tenant's
+keys; the serve path stays unchanged when no provisioner is set (single-node).
+
+**Not yet done:** the last server wiring — build the provider + keyring for the
+replicated layout in the server startup (using the new constructor), lift the
+replicated-layout fail-closed from M7, hook `refresh` to the metadata
+change-notifier so followers pick up new keys, and add a real multi-node test.
+The online DEK rotation worker
 (new DEK version + data
 re-encryption walk) and the admin API/CLI to drive rewrap and rotation are not
 built; and the
