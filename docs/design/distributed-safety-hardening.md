@@ -285,6 +285,11 @@ Operator-visible backpressure should include:
 - retry-after guidance
 - time since the resource last drained
 
+The first credit (the object-store upload backlog) is implemented; the
+knobs, the `GET /api/admin/content-mirror` fields, and the measurement
+recipe are documented in
+[`../operations/storage-backpressure.md`](../operations/storage-backpressure.md).
+
 ## 6. Testing-Evidence Contract
 
 The repository should keep a short, enforceable contract for correctness tests:

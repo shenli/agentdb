@@ -93,9 +93,10 @@ impl RecoveryManifestHeader {
 /// logical snapshot share an id. The `entries_digest` is a rolling hash of
 /// the serialized entry lines (see `export_recovery_manifest`).
 fn change_id_of(node_id: Option<&str>, entry_count: u64, payload_bytes: u64) -> String {
-    // Kept in sync with `export_recovery_manifest`, which additionally folds
-    // the entry digest in via `change_id_with_entries`. This node/count/bytes
-    // form is the fallback used when re-deriving a v1 header's id.
+    // `export_recovery_manifest` computes the primary id by additionally
+    // folding in a digest of the entries. This node/count/bytes-only form is
+    // the fallback for re-deriving a v1 header's id from the header alone
+    // (the entries aren't available from a header read).
     let mut hasher = Sha256::new();
     hasher.update(node_id.unwrap_or("").as_bytes());
     hasher.update([0]);
@@ -613,5 +614,60 @@ mod tests {
 
         let history = recovery.path("history/manifest-100.jsonl");
         assert!(store.head(&history).await.is_ok());
+    }
+
+    /// §4 crash matrix: a publish writes the history object first, then the
+    /// latest pointer. A crash BETWEEN those two writes (history present,
+    /// pointer not advanced) must leave the previously-published manifest
+    /// intact — a reader never sees a broken or half-advanced latest — and a
+    /// retry must complete the transition. We simulate the crash by writing
+    /// only the history object out of band, leaving the pointer untouched.
+    #[tokio::test]
+    async fn interrupted_publish_leaves_previous_latest_intact() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let recovery = RecoveryObjectStore::new(store.clone(), "agentdb");
+        let src = seeded_store();
+
+        // Publish v1 fully.
+        let v1 = export_recovery_manifest(src.clone(), Some("n"), 100, u64::MAX).unwrap();
+        let h1 = read_recovery_manifest_header(&v1).unwrap();
+        recovery.publish_latest(&v1, &h1).await.unwrap();
+        let v1_change = h1.effective_change_id();
+
+        // Prepare a different v2 and simulate a crash mid-publish: only its
+        // history object lands; the latest pointer is never advanced.
+        let other = InMemoryKvStore::default();
+        other.put(b"tenant/ten_2", b"{}").unwrap();
+        let v2 = export_recovery_manifest(Arc::new(other), Some("n"), 200, u64::MAX).unwrap();
+        let h2 = read_recovery_manifest_header(&v2).unwrap();
+        store
+            .put(
+                &recovery.path("history/manifest-200.jsonl"),
+                v2.clone().into(),
+            )
+            .await
+            .unwrap();
+
+        // The authoritative latest is still v1 — no dangling/half-applied
+        // pointer.
+        let summary = recovery.read_latest_summary().await.unwrap().unwrap();
+        assert_eq!(summary.change_id, v1_change);
+        assert_eq!(summary.watermark, 100);
+
+        // A retry completes the transition to v2 (the stray history object is
+        // simply overwritten, and the pointer advances).
+        assert!(matches!(
+            recovery.publish_latest(&v2, &h2).await.unwrap(),
+            PublishOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            recovery
+                .read_latest_summary()
+                .await
+                .unwrap()
+                .unwrap()
+                .watermark,
+            200
+        );
     }
 }
