@@ -757,18 +757,22 @@ manifests.
 
 ## Tenant-Scoped Encryption
 
-Dedicated tablets simplify encryption and deletion. AgentDB can use a
-tenant-scoped key hierarchy without mixing encryption domains inside the same
-Raft log, LSM file, snapshot, or sealed segment.
+Tenant-scoped envelope encryption is compatible with shared tablets and shared
+RocksDB domains: values are encrypted under the tenant's DEK before they enter
+the shared LSM. Dedicated placement is an additional physical-isolation
+property, not a prerequisite for BYOK, key rotation, or cryptographic deletion.
+
+An exclusive tablet is not automatically an exclusive LSM. When
+`tablets_per_domain` is greater than one, multiple dedicated tablets can still
+share a RocksDB domain and SST files. A policy promising no physical
+co-residency must also require an exclusive RocksDB domain or cell.
 
 ```text
 tenant_kek_id
-  -> tablet_dek_id
-       raft log encryption
-       local LSM encryption
-       tablet snapshot encryption
+  -> metadata_dek_id
+       tenant values before Raft and LSM persistence
 
-  -> segment_dek_id
+  -> content_dek_id
        sealed session segment encryption
        archive bundle encryption
        artifact blob encryption
@@ -783,10 +787,12 @@ Dedicated tablet lifecycle must preserve the encryption boundary:
 - Moving or rebalancing a tablet moves one tenant-owned replica set.
 - Snapshots and sealed objects remain encrypted under the owning tenant's key
   policy.
-- Tenant key rotation and crypto-shredding never need to rewrite or inspect
-  another tenant's data.
+- Tenant key rotation and crypto-shredding select rows by tenant and key
+  version; they do not decrypt another tenant's data.
 
-Shared pool tablets use a different encryption class:
+Shared pool tablets still need infrastructure encryption for disks, snapshots,
+and backups. Tenants without a tenant-envelope policy may use a platform or
+pool-level storage key:
 
 ```text
 shared_pool_kek_id
@@ -796,10 +802,14 @@ shared_pool_kek_id
        shared tablet snapshot encryption
 ```
 
-This is cheaper, but it does not provide the same physical key isolation as a
-dedicated tablet. If a tenant requires per-tenant key rotation,
-crypto-shredding, restore, or export guarantees, the tenant should be promoted
-to dedicated placement.
+This is cheaper, but it does not provide tenant-controlled key lifecycle.
+Enabling tenant envelopes provides per-tenant BYOK and crypto-shredding in the
+shared tier. Promote a tenant to a dedicated RocksDB domain or cell only when
+the policy also requires physical separation, tenant-owned physical backup, or
+immediate byte-level deletion rather than cryptographic deletion.
+
+See [`encryption-at-rest.md`](encryption-at-rest.md) for the complete key
+hierarchy, cache, rotation, revocation, coverage, and rollout contract.
 
 ## Index Placement
 
@@ -1272,4 +1282,6 @@ single-session appends or record writes.
 - Global-index partitioning and repair strategy.
 - Follower-read policy and session read-context routing.
 - Membership change policy and operator controls.
-- KMS integration model, key cache behavior, and key-rotation workflow.
+- KMS provider and AEAD selection, key-cache lease limits, revocation SLO, and
+  key-rotation performance budgets; the architecture is defined in
+  [`encryption-at-rest.md`](encryption-at-rest.md).

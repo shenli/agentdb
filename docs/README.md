@@ -24,6 +24,9 @@ public docs path.
 - [design/distributed-safety-hardening.md](design/distributed-safety-hardening.md)
   - prioritized plan for read consistency, partition testing, cluster/store
   identity, manifest safety, and bounded tenant backpressure
+- [design/encryption-at-rest.md](design/encryption-at-rest.md) - encryption at
+  rest and BYOK threat model, key hierarchy, rotation semantics, code-change
+  map, rollout plan, and validation requirements
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
   - product positioning and value-prop messaging framework
 - [design/codemate-product-note.md](design/codemate-product-note.md)
