@@ -114,7 +114,8 @@ to be updated when a later milestone encrypts one of them. Current coverage:
 | Searchable record primary rows | **Yes** (M17) |
 | Skill primary records | **Yes** (M17) |
 | Export-ledger entries (all object types) | **Yes** (already sealed via `encrypt_metadata`) |
-| Session / tenant primary records | No (follow-up; tenant is bootstrap-sensitive) |
+| Session primary records | **Yes** (M18) |
+| Tenant primary records | **Yes** (M18) |
 | Secondary indexes, aliases, idempotency, commit/outbox | No (routing/control; keys stay plaintext for scans) |
 
 **Milestone 5 (landed): encryption precedes the Raft log in the clustered
@@ -295,16 +296,28 @@ coverage-map tripwires for agent/record/skill are flipped to assert *no* leak,
 and a new test round-trips all three through a fresh runtime that hydrates by
 decrypting.
 
+**Milestone 18 (landed): session and tenant primary-record coverage.** Extends
+M17's pattern to the last two primary-record types, so **every** primary row
+(tenant, agent, session, record, skill) and the export-ledger are now sealed at
+rest. Session rows are written from three paths (create, and two event-append
+paths); a shared `encrypted_session_put_op` helper seals all three identically so
+none can drift into plaintext. The tenant row uses a single-id-segment key
+(`record/tenant/{tenant_id}`), so it gets its own scan decoder
+(`decrypt_tenant_scan_value`) where tenant and object id coincide. Tenant
+encryption is safe because the Metadata DEK is minted before the first
+`put_tenant` (M14 ordering) — for the system tenant too — or auto-generated on
+first seal (single-node). The coverage map gains a tenant-policy tripwire, and
+the hydration round-trip test now also reconstructs the session and tenant.
+
 **Not yet done:** the background DEK re-encryption walk
 (rewriting old-version ciphertext so a rotated-away version can be retired) and a
 rotation/revocation CLI; and the
 `LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
-Session and tenant primary records are still plaintext at rest (tenant is
-bootstrap-sensitive — deferred). Event AAD binds tenant + session + kind (not
-yet the per-event seq). Dedicated-domain placement enforcement remains, as does
-graceful hydration when a tenant's rows are undecryptable after a crypto-shred
-(today a `scan_all_*` decrypt error propagates — a pre-existing behavior shared
-with the already-encrypted artifact path).
+Event AAD binds tenant + session + kind (not yet the per-event seq).
+Dedicated-domain placement enforcement remains, as does graceful hydration when a
+tenant's rows are undecryptable after a crypto-shred (today a `scan_all_*`
+decrypt error propagates — a pre-existing behavior shared with the
+already-encrypted artifact path).
 
 The pre-existing seams remain as the integration points those stages build on:
 

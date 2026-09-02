@@ -53,11 +53,12 @@ async fn raw_storage_marker_coverage_map() {
     const AGENT_MARKER: &str = "COVERAGE-AGENT-3c";
     const RECORD_MARKER: &str = "COVERAGE-RECORD-4d";
     const SKILL_MARKER: &str = "COVERAGE-SKILL-5e";
+    const TENANT_MARKER: &str = "COVERAGE-TENANT-6f";
 
     let t = rt
         .create_tenant(NewTenant {
             external_key: "coverage".into(),
-            policy: serde_json::json!({}),
+            policy: serde_json::json!({ "secret": TENANT_MARKER }),
         })
         .await
         .unwrap();
@@ -157,6 +158,10 @@ async fn raw_storage_marker_coverage_map() {
         !marker_in(&kv_values, SKILL_MARKER),
         "skill manifest leaked into a raw KV value (M17 regression)"
     );
+    assert!(
+        !marker_in(&kv_values, TENANT_MARKER),
+        "tenant policy leaked into a raw KV value (M18 regression)"
+    );
 }
 
 /// The M17 primary-record encryption must round-trip through a *fresh* runtime
@@ -176,7 +181,7 @@ async fn primary_records_round_trip_through_hydration() {
     let t = rt
         .create_tenant(NewTenant {
             external_key: "roundtrip".into(),
-            policy: serde_json::json!({}),
+            policy: serde_json::json!({ "secret": "TENANT-SECRET-payload" }),
         })
         .await
         .unwrap();
@@ -185,6 +190,14 @@ async fn primary_records_round_trip_through_hydration() {
             tenant_id: t.tenant_id.clone(),
             alias: Some("agent".into()),
             config: serde_json::json!({ "secret": "AGENT-SECRET-payload" }),
+        })
+        .await
+        .unwrap();
+    let sess = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: Some("session".into()),
         })
         .await
         .unwrap();
@@ -236,4 +249,12 @@ async fn primary_records_round_trip_through_hydration() {
     let skills = rt2.list_skills(&t.tenant_id).await.unwrap();
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].manifest["secret"], "SKILL-SECRET-payload");
+
+    let sessions = rt2.list_sessions(&t.tenant_id).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, sess.session_id);
+
+    // The tenant primary row also survives hydration (policy decrypts).
+    let tenant = rt2.get_tenant(&t.tenant_id).await.unwrap();
+    assert_eq!(tenant.policy["secret"], "TENANT-SECRET-payload");
 }
