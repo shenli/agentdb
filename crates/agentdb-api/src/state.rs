@@ -291,6 +291,10 @@ pub struct AppState {
     pub runtime: Arc<Runtime>,
     pub meta: Option<MetaStore>,
     pub auth_meta: Option<MetaStore>,
+    /// True when `deployment.mode = "cluster"`. Gates mounting of the cluster /
+    /// distributed control-plane routes (`build_router`) so single-node
+    /// deployments never expose them. Defaults to false (single node).
+    pub cluster_mode: bool,
     pub routing: RouteRuntime,
     pub raft_ingress: Option<Arc<dyn RaftRsIngress>>,
     pub raft_registry: Option<Arc<RaftRsGroupRegistry>>,
@@ -330,6 +334,7 @@ impl AppState {
             runtime,
             meta: None,
             auth_meta: None,
+            cluster_mode: false,
             routing: RouteRuntime::disabled(),
             raft_ingress: None,
             raft_registry: None,
@@ -352,6 +357,14 @@ impl AppState {
             disk_budget_bytes: 0,
             disk_usage_paths: Vec::new(),
         }
+    }
+
+    /// Mark this state as running in cluster deployment mode, which mounts the
+    /// distributed control-plane routes. Single-node deployments leave this
+    /// false so those routes are never registered.
+    pub fn with_cluster_mode(mut self, cluster_mode: bool) -> Self {
+        self.cluster_mode = cluster_mode;
+        self
     }
 
     /// Set the advisory disk budget and the directories that count toward it.

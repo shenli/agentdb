@@ -469,7 +469,11 @@ without a source checkout.
 
 Distributed control-plane behavior is not the current user-facing deployment
 target. The priority is making one node easy to start, inspect, back up, upgrade,
-and maintain.
+and maintain. Accordingly, the cluster / distributed control-plane HTTP routes
+(node, cell, store, tablet, routing, and Raft admin under `/api/admin/*`, plus
+the `/api/internal/*` transport endpoints) and the Raft workers are mounted only
+when `deployment.mode = "cluster"`. Single-node deployments never register them,
+so they return 404 there.
 
 ## Policy And GC
 

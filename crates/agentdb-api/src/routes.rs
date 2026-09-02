@@ -80,40 +80,15 @@ const DEFAULT_ADMIN_TABLET_LEASE_MS: i64 = 30_000;
 const ARTIFACT_BODY_LIMIT_BYTES: usize =
     agentdb_core::policy::ABSOLUTE_MAX_ARTIFACT_BYTES as usize + 1024 * 1024;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
+pub fn routes(cluster_mode: bool) -> Router<AppState> {
+    let mut router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route(
-            "/api/internal/raft/messages",
-            post(post_internal_raft_message),
-        )
-        .route(
-            "/api/internal/raft/snapshots",
-            post(post_internal_raft_snapshot),
-        )
-        .route(
-            "/api/internal/raft/faults",
-            get(get_internal_raft_faults)
-                .put(put_internal_raft_faults)
-                .delete(delete_internal_raft_faults),
-        )
-        .route(
-            "/api/internal/raft/faults/release",
-            post(post_internal_raft_faults_release),
-        )
-        .route(
-            "/api/internal/tablet-movements/snapshot/export",
-            post(post_internal_tablet_movement_snapshot_export),
-        )
-        .route("/api/admin/cluster/health", get(get_cluster_health))
         .route(
             "/api/admin/tokens",
             get(list_admin_tokens).post(mint_admin_token),
         )
         .route("/api/admin/tokens/:token_id", delete(revoke_admin_token))
-        .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
-        .route("/api/admin/scheduler", get(get_admin_scheduler))
         .route("/api/admin/exports", get(get_admin_exports))
         .route(
             "/api/admin/tenants/:tenant_id/rotate-dek",
@@ -132,110 +107,12 @@ pub fn routes() -> Router<AppState> {
             post(retire_tenant_dek_versions),
         )
         .route(
-            "/api/admin/drain",
-            get(get_admin_drain).post(post_admin_drain),
-        )
-        .route(
-            "/api/admin/nodes",
-            get(get_admin_nodes).post(register_admin_node),
-        )
-        .route(
-            "/api/admin/cells",
-            get(get_admin_cells).post(upsert_admin_cell),
-        )
-        .route("/api/admin/nodes/:node_id", delete(delete_admin_node))
-        .route(
-            "/api/admin/nodes/:node_id/maintenance",
-            post(set_admin_node_maintenance),
-        )
-        .route(
-            "/api/admin/cluster/stores/:node_id",
-            get(get_admin_store_incarnations),
-        )
-        .route(
-            "/api/admin/cluster/stores/:node_id/retire",
-            post(retire_admin_store_incarnation),
-        )
-        .route("/api/admin/tablets", get(get_admin_tablets))
-        .route("/api/admin/tablets/create", post(create_admin_tablet))
-        .route("/api/admin/tablet-ranges", get(get_admin_tablet_ranges))
-        .route(
-            "/api/admin/tablet-ranges/replace",
-            post(replace_admin_tablet_ranges),
-        )
-        .route(
-            "/api/admin/tablet-movements",
-            get(get_admin_tablet_movements),
-        )
-        .route("/api/admin/tablet-stats", get(get_admin_tablet_stats))
-        .route(
-            "/api/admin/tablet-store/compact",
-            post(compact_admin_tablet_store),
-        )
-        .route(
-            "/api/admin/tablets/:tablet_id/split/prepare",
-            post(prepare_admin_tablet_split),
-        )
-        .route(
-            "/api/admin/tablets/:tablet_id/split/complete",
-            post(complete_admin_tablet_split),
-        )
-        .route(
-            "/api/admin/tablets/merge/prepare",
-            post(prepare_admin_tablet_merge),
-        )
-        .route(
-            "/api/admin/tablets/merge/complete",
-            post(complete_admin_tablet_merge),
-        )
-        .route(
             "/api/admin/tenant-policies",
             get(get_admin_tenant_policies).post(upsert_admin_tenant_policy),
         )
         .route(
             "/api/admin/tenant-policies/:tenant_id",
             delete(delete_admin_tenant_policy),
-        )
-        .route(
-            "/api/admin/tablets/rebalance",
-            post(rebalance_admin_tablets),
-        )
-        .route(
-            "/api/admin/tablets/:tablet_id/assign",
-            post(assign_admin_tablet),
-        )
-        .route(
-            "/api/admin/tablets/:tablet_id/relinquish",
-            post(relinquish_admin_tablet),
-        )
-        .route(
-            "/api/admin/tablets/:tablet_id/handoff",
-            post(mark_admin_tablet_handoff),
-        )
-        .route(
-            "/api/admin/tablets/:tablet_id/handoff/complete",
-            post(complete_admin_tablet_handoff),
-        )
-        .route(
-            "/api/admin/tablets/:tablet_id/handoff/cancel",
-            post(cancel_admin_tablet_handoff),
-        )
-        .route(
-            "/api/admin/tablets/:tablet_id/replacement/prepare",
-            post(prepare_admin_tablet_replacement),
-        )
-        .route(
-            "/api/admin/tablets/:tablet_id/replacement/complete",
-            post(complete_admin_tablet_replacement),
-        )
-        .route("/api/admin/routing", get(get_routing_status))
-        .route("/api/admin/routing/decision", get(get_routing_decision))
-        .route("/api/admin/raft", get(get_raft_status))
-        .route("/api/admin/raft/catch-up", post(post_raft_catch_up))
-        .route("/api/admin/raft/snapshots", get(get_raft_snapshots))
-        .route(
-            "/api/admin/raft/snapshots/prune",
-            post(post_raft_snapshot_prune),
         )
         .route("/api/admin/indexes/records", get(get_record_index_status))
         .route("/api/admin/content-mirror", get(get_content_mirror_status))
@@ -405,7 +282,145 @@ pub fn routes() -> Router<AppState> {
             "/api/tenants/:tenant_id/policy/gc-sweep",
             post(run_gc_sweep),
         )
-        .route("/api/policy/worker/run", post(run_policy_worker))
+        .route("/api/policy/worker/run", post(run_policy_worker));
+
+    if cluster_mode {
+        router = router.merge(cluster_routes());
+    }
+    router
+}
+
+/// Cluster / distributed control-plane routes (node, cell, store, tablet,
+/// routing, Raft admin, and the `/api/internal/*` transport endpoints).
+///
+/// Mounted only when `deployment.mode = "cluster"`. Single-node deployments
+/// never register these, so they return 404 there rather than exposing the
+/// distributed surface.
+fn cluster_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/internal/raft/messages",
+            post(post_internal_raft_message),
+        )
+        .route(
+            "/api/internal/raft/snapshots",
+            post(post_internal_raft_snapshot),
+        )
+        .route(
+            "/api/internal/raft/faults",
+            get(get_internal_raft_faults)
+                .put(put_internal_raft_faults)
+                .delete(delete_internal_raft_faults),
+        )
+        .route(
+            "/api/internal/raft/faults/release",
+            post(post_internal_raft_faults_release),
+        )
+        .route(
+            "/api/internal/tablet-movements/snapshot/export",
+            post(post_internal_tablet_movement_snapshot_export),
+        )
+        .route("/api/admin/cluster/health", get(get_cluster_health))
+        .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
+        .route("/api/admin/scheduler", get(get_admin_scheduler))
+        .route(
+            "/api/admin/drain",
+            get(get_admin_drain).post(post_admin_drain),
+        )
+        .route(
+            "/api/admin/nodes",
+            get(get_admin_nodes).post(register_admin_node),
+        )
+        .route(
+            "/api/admin/cells",
+            get(get_admin_cells).post(upsert_admin_cell),
+        )
+        .route("/api/admin/nodes/:node_id", delete(delete_admin_node))
+        .route(
+            "/api/admin/nodes/:node_id/maintenance",
+            post(set_admin_node_maintenance),
+        )
+        .route(
+            "/api/admin/cluster/stores/:node_id",
+            get(get_admin_store_incarnations),
+        )
+        .route(
+            "/api/admin/cluster/stores/:node_id/retire",
+            post(retire_admin_store_incarnation),
+        )
+        .route("/api/admin/tablets", get(get_admin_tablets))
+        .route("/api/admin/tablets/create", post(create_admin_tablet))
+        .route("/api/admin/tablet-ranges", get(get_admin_tablet_ranges))
+        .route(
+            "/api/admin/tablet-ranges/replace",
+            post(replace_admin_tablet_ranges),
+        )
+        .route(
+            "/api/admin/tablet-movements",
+            get(get_admin_tablet_movements),
+        )
+        .route("/api/admin/tablet-stats", get(get_admin_tablet_stats))
+        .route(
+            "/api/admin/tablet-store/compact",
+            post(compact_admin_tablet_store),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/split/prepare",
+            post(prepare_admin_tablet_split),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/split/complete",
+            post(complete_admin_tablet_split),
+        )
+        .route(
+            "/api/admin/tablets/merge/prepare",
+            post(prepare_admin_tablet_merge),
+        )
+        .route(
+            "/api/admin/tablets/merge/complete",
+            post(complete_admin_tablet_merge),
+        )
+        .route(
+            "/api/admin/tablets/rebalance",
+            post(rebalance_admin_tablets),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/assign",
+            post(assign_admin_tablet),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/relinquish",
+            post(relinquish_admin_tablet),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/handoff",
+            post(mark_admin_tablet_handoff),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/handoff/complete",
+            post(complete_admin_tablet_handoff),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/handoff/cancel",
+            post(cancel_admin_tablet_handoff),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/replacement/prepare",
+            post(prepare_admin_tablet_replacement),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/replacement/complete",
+            post(complete_admin_tablet_replacement),
+        )
+        .route("/api/admin/routing", get(get_routing_status))
+        .route("/api/admin/routing/decision", get(get_routing_decision))
+        .route("/api/admin/raft", get(get_raft_status))
+        .route("/api/admin/raft/catch-up", post(post_raft_catch_up))
+        .route("/api/admin/raft/snapshots", get(get_raft_snapshots))
+        .route(
+            "/api/admin/raft/snapshots/prune",
+            post(post_raft_snapshot_prune),
+        )
 }
 
 async fn health_live() -> StatusCode {
