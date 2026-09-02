@@ -130,6 +130,7 @@ Use this map to avoid overloading one design doc with every subsystem detail.
 | Current design contract and implementation status | this document |
 | Crate boundaries, request flow, API routes, and runtime implementation map | [`architecture.md`](architecture.md) |
 | Hot storage engine, tablet-local LSM state, Raft commit-before-apply, split/merge, placement classes, and index placement | [`tablet-storage-engine.md`](tablet-storage-engine.md) |
+| S3-native committed tablet-log archival, immutable segment format, recovery checkpoints, archive lag, and bucket-only restore | [`s3-committed-log-archive.md`](s3-committed-log-archive.md) |
 | Cluster storage topology, cells, AZ placement, tenant blast radius, failover, scheduler behavior, and cluster validation | [`cluster-storage-topology.md`](cluster-storage-topology.md) |
 | Encryption at rest, BYOK, key hierarchy, rotation, revocation, storage coverage, and implementation plan | [`encryption-at-rest.md`](encryption-at-rest.md) |
 | Warm/cold/archive/derivative-only lifecycle, sealed segments, archive manifests, artifact byte lifecycle, and restore semantics | [`lifecycle-storage.md`](lifecycle-storage.md) |

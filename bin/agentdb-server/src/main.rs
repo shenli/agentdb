@@ -507,12 +507,6 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     ),
                 },
                 TabletStoreLayoutKind::GroupedRocksDb => {
-                    if cluster_crypto.is_some() {
-                        anyhow::bail!(
-                            "AGENTDB_ENCRYPTION_MODE=envelope is not yet supported with the \
-                             grouped-rocksdb tablet layout; use the prefix-scoped layout"
-                        );
-                    }
                     std::fs::create_dir_all(&config.tablet_store_root_dir)?;
                     let rocks_config = agentdb_storage::RocksKvStoreConfig {
                         write_buffer_size_bytes: config.tablet_store_domain_write_buffer_size_mib
@@ -543,12 +537,26 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         domain_max_open_files = config.tablet_store_domain_max_open_files,
                         "opened grouped RocksDB tablet-store lifecycle"
                     );
-                    agentdb_core::Runtime::with_tablet_store_lifecycle_and_replicated_logs_for_default_tablet(
-                        lifecycle,
-                        content,
-                        logs,
-                        config.route_default_tablet_id,
-                    )
+                    match cluster_crypto {
+                        Some((keyring, provisioner)) => {
+                            agentdb_core::Runtime::with_tablet_store_lifecycle_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
+                                lifecycle,
+                                content,
+                                keyring,
+                                provisioner,
+                                logs,
+                                config.route_default_tablet_id,
+                            )
+                        }
+                        None => {
+                            agentdb_core::Runtime::with_tablet_store_lifecycle_and_replicated_logs_for_default_tablet(
+                                lifecycle,
+                                content,
+                                logs,
+                                config.route_default_tablet_id,
+                            )
+                        }
+                    }
                 }
             };
             (runtime, content_mirror)
@@ -2057,6 +2065,28 @@ async fn build_cluster_keyring_and_provisioner(
             .await
             .map_err(|e| anyhow::anyhow!("load cluster key catalog: {e}"))?,
     );
+    // Periodically reload the key catalog so a follower — or a node that becomes
+    // leader — picks up tenants provisioned after its startup (a tenant's DEK is
+    // minted once, on the node that creates it). Bounded eventual consistency;
+    // 0 disables.
+    let refresh_ms = std::env::var("AGENTDB_ENCRYPTION_REFRESH_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30_000);
+    if refresh_ms > 0 {
+        let refresher = provider.clone();
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_millis(refresh_ms));
+            ticker.tick().await; // the first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                if let Err(error) = refresher.refresh().await {
+                    tracing::warn!(%error, "cluster key catalog refresh failed");
+                }
+            }
+        });
+    }
     let keyring: Arc<dyn agentdb_storage::EnvelopeCrypto> =
         Arc::new(agentdb_storage::AeadTenantKeyring::new(
             provider.clone(),
