@@ -68,7 +68,6 @@ export type {
   Event,
   ModelMessageOptions,
   SessionOptions,
-  SubscribeOptions,
   ToolCallOptions,
   ToolResultOptions,
   TenantId,
@@ -92,10 +91,6 @@ export {
   Misdirected,
   RateLimited,
   ServerError,
-  SubscriptionClosed,
   fromResponse,
 } from "./errors.js";
 export type { ServerErrorBody, AgentDBErrorOptions } from "./errors.js";
-
-export { parseBlock, parseSse } from "./sse.js";
-export type { SseFrame } from "./sse.js";

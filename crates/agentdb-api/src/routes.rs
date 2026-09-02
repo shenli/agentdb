@@ -33,7 +33,7 @@ use agentdb_core::{
     runtime::{
         AckExportConsumerRequest, AppendRequest, ClaimExportConsumerRequest, ContextInclude,
         ContextRequest, CreateExportConsumerRequest, ExportFeedItem, ExportWatchRequest,
-        FetchRequest, ForkSessionRequest, NewRecordEdge, RecordUpdate, RewindExportConsumerRequest,
+        FetchRequest, ForkSessionRequest, RecordUpdate, RewindExportConsumerRequest,
         SearchRequest, WatchRequest, WatchScope,
     },
     Agent, Artifact, ChangefeedItem, ErrorCode, Id, IdKind,
@@ -46,7 +46,7 @@ use agentdb_meta::{
 
 use crate::dto::{
     AckExportConsumerBody, AppendAndFetchBody, AppendBody, ClaimExportConsumerBody,
-    ContextBody, CreateAgentBody, CreateExportConsumerBody, CreateRecordBody, CreateRecordEdgeBody,
+    ContextBody, CreateAgentBody, CreateExportConsumerBody, CreateRecordBody,
     CreateSessionBody, CreateTenantBody, ExportBackfillBody,
     ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
     ExportWatchResponse, FetchQuery, ForkSessionBody, IncludeDeletedQuery,
@@ -181,10 +181,6 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
             post(materialize_replay_prefix),
         )
         .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/subscribe",
-            get(subscribe_session),
-        )
-        .route(
             "/api/tenants/:tenant_id/sessions/:session_id/context",
             post(build_context),
         )
@@ -249,14 +245,6 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
             "/api/tenants/:tenant_id/records/upsert",
             post(upsert_record),
         )
-        .route(
-            "/api/tenants/:tenant_id/records/edges",
-            post(create_record_edge),
-        )
-        .route(
-            "/api/tenants/:tenant_id/records/edges/:edge_id",
-            delete(delete_record_edge),
-        )
         .route("/api/tenants/:tenant_id/records", post(create_record))
         .route(
             "/api/tenants/:tenant_id/records/:record_id",
@@ -265,10 +253,6 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
         .route(
             "/api/tenants/:tenant_id/records/:record_id/touch",
             post(touch_record),
-        )
-        .route(
-            "/api/tenants/:tenant_id/records/:record_id/edges",
-            get(list_record_edges),
         )
         .route(
             "/api/tenants/:tenant_id/meta/:key",
@@ -6608,40 +6592,6 @@ async fn materialize_replay_prefix(
     Ok(with_headers(Json(replay).into_response(), route_headers))
 }
 
-async fn subscribe_session(
-    State(s): State<AppState>,
-    Path((tenant_id, session_id)): Path<(String, String)>,
-    OriginalUri(original_uri): OriginalUri,
-    headers: HeaderMap,
-    Query(q): Query<FetchQuery>,
-) -> Result<Response, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
-    let route_headers =
-        match guard_session_request(&s, &tid, &sid, &original_uri, &headers, Method::GET, None)
-            .await
-        {
-            Ok(headers) => headers,
-            Err(response) => return Ok(response),
-        };
-    let runtime = s.runtime.clone();
-    let events = with_route_tablet_context(runtime.clone(), &route_headers, async move {
-        runtime
-            .fetch_from_seq(FetchRequest {
-                tenant_id: tid,
-                session_id: sid,
-                from_seq: q.from_seq,
-                limit: q.limit.clamp(1, 1000),
-            })
-            .await
-    })
-    .await?;
-    Ok(with_headers(
-        sse_response(events.into_iter().map(|event| ("event", event))),
-        route_headers,
-    ))
-}
-
 async fn build_context(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
@@ -8178,56 +8128,6 @@ async fn touch_record(
     Ok(Json(s.runtime.touch_record(&tid, &rid).await?))
 }
 
-async fn create_record_edge(
-    State(s): State<AppState>,
-    Path(tenant_id): Path<String>,
-    Json(body): Json<CreateRecordEdgeBody>,
-) -> Result<(StatusCode, Json<agentdb_core::RecordEdge>), ApiError> {
-    reject_if_draining(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let source_record_id = parse_id_or(
-        &body.source_record_id,
-        IdKind::Record,
-        ErrorCode::RecordNotFound,
-    )?;
-    let target_record_id = parse_id_or(
-        &body.target_record_id,
-        IdKind::Record,
-        ErrorCode::RecordNotFound,
-    )?;
-    let edge = s
-        .runtime
-        .create_record_edge(NewRecordEdge {
-            tenant_id: tid,
-            source_record_id,
-            target_record_id,
-            edge_type: body.edge_type,
-            metadata: body.metadata,
-        })
-        .await?;
-    Ok((StatusCode::CREATED, Json(edge)))
-}
-
-async fn list_record_edges(
-    State(s): State<AppState>,
-    Path((tenant_id, record_id)): Path<(String, String)>,
-) -> Result<Json<Vec<agentdb_core::RecordEdge>>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let rid = parse_id_or(&record_id, IdKind::Record, ErrorCode::RecordNotFound)?;
-    Ok(Json(s.runtime.record_edges(&tid, &rid).await?))
-}
-
-async fn delete_record_edge(
-    State(s): State<AppState>,
-    Path((tenant_id, edge_id)): Path<(String, String)>,
-) -> Result<StatusCode, ApiError> {
-    reject_if_draining(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let eid = parse_id_or(&edge_id, IdKind::RecordEdge, ErrorCode::RecordNotFound)?;
-    s.runtime.delete_record_edge(&tid, &eid).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn set_tenant_meta(
     State(s): State<AppState>,
     Path((tenant_id, key)): Path<(String, String)>,
@@ -8581,26 +8481,6 @@ fn parse_context_includes(raw: &[String]) -> Vec<ContextInclude> {
         out.push(ContextInclude::RecentEvents);
     }
     out
-}
-
-fn sse_response<T: Serialize>(events: impl Iterator<Item = (&'static str, T)>) -> Response {
-    let mut body = String::new();
-    for (event, data) in events {
-        body.push_str("event: ");
-        body.push_str(event);
-        body.push('\n');
-        body.push_str("data: ");
-        body.push_str(&serde_json::to_string(&data).expect("sse payload serializes"));
-        body.push_str("\n\n");
-    }
-    (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
-        )],
-        body,
-    )
-        .into_response()
 }
 
 /// Parse an optional id string into an Id of the given kind. Bad parses

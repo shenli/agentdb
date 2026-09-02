@@ -10,7 +10,6 @@ pub enum IdKind {
     Segment,
     Artifact,
     Record,
-    RecordEdge,
     Policy,
     Snapshot,
 }
@@ -25,7 +24,6 @@ impl IdKind {
             IdKind::Segment => "seg",
             IdKind::Artifact => "art",
             IdKind::Record => "rec",
-            IdKind::RecordEdge => "edg",
             IdKind::Policy => "pol",
             IdKind::Snapshot => "snp",
         }
@@ -40,7 +38,6 @@ impl IdKind {
             "seg" => IdKind::Segment,
             "art" => IdKind::Artifact,
             "rec" => IdKind::Record,
-            "edg" => IdKind::RecordEdge,
             "pol" => IdKind::Policy,
             "snp" => IdKind::Snapshot,
             _ => return None,

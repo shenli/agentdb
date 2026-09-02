@@ -9,7 +9,7 @@ For the conceptual motivation and positioning, see
 ## Implemented
 
 - Native runtime objects: tenants, agents, sessions, events, artifacts, records,
-  policies, tenant metadata, and record graph edges.
+  policies, and tenant metadata.
 - Per-session append semantics: serialized append, contiguous session-local
   sequence numbers, append-and-fetch, idempotency, and backpressure reporting.
 - Native tenant-scoped HTTP API plus maintained Python and TypeScript SDKs;
@@ -27,12 +27,12 @@ For the conceptual motivation and positioning, see
 - Sandbox snapshot references: `SnapshotRef` / `SnapshotLayer` metadata on
   sessions, resume resolution across fork chains, dangling/expired ref fallback
   semantics, and the external sandbox-service contract.
-- Watch and export feeds: session subscribe, tenant/agent/session `watch`,
+- Watch and export feeds: tenant/agent/session `watch`,
   frontier cursors, fork-edge control items, commit-ordered durable
   `export_watch`, export backfill, and managed export consumers with validated
   retained cursors plus claim/ack/rewind.
 - Record retrieval substrate: durable base records, source refs, local/global
-  indexes, commit-sequence visibility repair, metadata filters, record edges,
+  indexes, commit-sequence visibility repair, metadata filters,
   and SDK commit-sequence propagation.
 - Policy, lifecycle, and cleanup: quota/backpressure, warm/cold/archive
   lifecycle, archive restore, retention, legal hold, derivative-only artifact

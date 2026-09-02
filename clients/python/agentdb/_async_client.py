@@ -14,7 +14,6 @@ except ImportError as e:
         "(or `pip install httpx` if you want to manage the dependency yourself.)"
     ) from e
 
-from ._sse import parse_lines_async
 from ._secrets import validate_no_raw_secret_fields
 from .client import (
     AgentId,
@@ -26,7 +25,7 @@ from .client import (
     TenantId,
     WatchItem,
 )
-from .errors import AgentDBError, SubscriptionClosed, from_response
+from .errors import AgentDBError, from_response
 
 TokenProvider = Callable[[], Union[str, Awaitable[str]]]
 _RECORD_COMMIT_SEQ_HEADER = "X-AgentDB-Record-Commit-Seq"
@@ -392,24 +391,6 @@ class AsyncSession:
     async def fetch_recent(self, *, last_n: int = 10) -> List[Event]:
         events = await self.fetch(from_seq=0, limit=1000)
         return [] if last_n <= 0 else events[-last_n:]
-
-    async def subscribe(self, *, from_seq: int = 0, limit: int = 100) -> AsyncIterator[Event]:
-        path = f"/api/tenants/{_quote(self.tenant_id)}/sessions/{_quote(self.session_id)}/subscribe"
-        kwargs = {
-            "params": {"from_seq": str(from_seq), "limit": str(limit)},
-            "headers": {"Accept": "text/event-stream"},
-            "timeout": httpx.Timeout(self._client.timeout, read=None),
-        }
-        async for resp in self._client._stream("GET", path, **kwargs):
-            if resp.status_code != 200:
-                await resp.aread()
-                raise from_response(resp.status_code, _response_body(resp))
-            async for frame in parse_lines_async(resp.aiter_lines()):
-                if frame.event == "error":
-                    body = jsonlib.loads(frame.data) if frame.data else {}
-                    raise SubscriptionClosed(body.get("error", "unknown"), last_seq=body.get("last_seq"))
-                if frame.data:
-                    yield Event.from_dict(jsonlib.loads(frame.data))
 
     async def context(
         self,

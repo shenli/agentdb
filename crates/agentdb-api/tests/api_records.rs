@@ -681,68 +681,9 @@ async fn record_patch_version_status_search_filters_and_touch() {
 }
 
 #[tokio::test]
-async fn record_edges_and_tenant_meta_routes_round_trip() {
+async fn tenant_meta_routes_round_trip() {
     let app = spawn_app().await;
     let (tid, _, _) = bootstrap_session(&app).await;
-
-    let mut ids = Vec::new();
-    for label in ["old", "new"] {
-        let record: serde_json::Value = app
-            .client
-            .post(format!("{}/api/tenants/{tid}/records", app.base))
-            .json(&json!({
-                "namespace": ["memory"],
-                "text": label,
-                "policy": {"mode": "summary_only", "fields": [], "vector_allowed": false}
-            }))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        ids.push(record["record_id"].as_str().unwrap().to_string());
-    }
-
-    let edge: serde_json::Value = app
-        .client
-        .post(format!("{}/api/tenants/{tid}/records/edges", app.base))
-        .json(&json!({
-            "source_record_id": ids[1],
-            "target_record_id": ids[0],
-            "edge_type": "supersedes",
-            "metadata": {"reason": "replacement"}
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let edge_id = edge["edge_id"].as_str().unwrap().to_string();
-    assert!(edge_id.starts_with("edg_"));
-    assert_eq!(edge["edge_type"], "supersedes");
-
-    let edges: serde_json::Value = app
-        .client
-        .get(format!(
-            "{}/api/tenants/{tid}/records/{}/edges",
-            app.base, ids[0]
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(edges.as_array().unwrap().len(), 1);
-    assert_eq!(edges[0]["edge_id"], edge_id);
 
     let meta: serde_json::Value = app
         .client
@@ -770,33 +711,6 @@ async fn record_edges_and_tenant_meta_routes_round_trip() {
         .await
         .unwrap();
     assert_eq!(got_meta["value"], json!({"offset": 7}));
-
-    let delete = app
-        .client
-        .delete(format!(
-            "{}/api/tenants/{tid}/records/edges/{edge_id}",
-            app.base
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(delete.status().as_u16(), 204);
-
-    let edges_after_delete: serde_json::Value = app
-        .client
-        .get(format!(
-            "{}/api/tenants/{tid}/records/{}/edges",
-            app.base, ids[0]
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(edges_after_delete.as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

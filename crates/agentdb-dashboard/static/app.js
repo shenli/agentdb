@@ -98,7 +98,6 @@ function dispatch(action) {
     sessions: loadSessions,
     load: loadTimeline,
     replay: replaySession,
-    subscribe: subscribeSession,
     watch: watchScope,
     context: buildContext,
     storage: loadSessionStorage,
@@ -394,25 +393,6 @@ async function replaySession() {
       state.forks = data.lineage;
       renderForkTree();
     }
-  } catch (err) {
-    fail(err);
-  }
-}
-
-async function subscribeSession() {
-  try {
-    const cfg = readConfig();
-    const params = new URLSearchParams({ from_seq: String(cfg.fromSeq), limit: String(cfg.limit) });
-    const url = `/api/tenants/${enc(cfg.tenantId)}/sessions/${enc(cfg.sessionId)}/subscribe?${params}`;
-    const headers = new Headers({ Accept: "text/event-stream" });
-    applyAuth(headers, cfg);
-    const resp = await fetch(url, { headers });
-    const text = await resp.text();
-    if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}: ${text.slice(0, 500)}`);
-    state.events = parseSse(text);
-    setConnection("sse snapshot");
-    setRaw(state.events);
-    renderTimeline();
   } catch (err) {
     fail(err);
   }
@@ -891,20 +871,6 @@ function upsertEvent(event) {
   if (idx >= 0) state.events[idx] = event;
   else state.events.push(event);
   if (!state.selectedEventId) state.selectedEventId = event.event_id;
-}
-
-function parseSse(text) {
-  const out = [];
-  let data = "";
-  text.split(/\r?\n/).forEach((line) => {
-    if (line.startsWith("data:")) data += line.slice(5).trimStart();
-    if (line === "" && data) {
-      out.push(JSON.parse(data));
-      data = "";
-    }
-  });
-  if (data) out.push(JSON.parse(data));
-  return out;
 }
 
 function applyAuth(headers, cfg) {

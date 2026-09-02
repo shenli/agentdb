@@ -138,15 +138,6 @@ class FakeSession:
     def replay(self, *, from_seq: int = 0, limit: int = 100) -> list[FakeEvent]:
         return [event for event in self._events if event.seq >= from_seq][:limit]
 
-    def subscribe(self, *, from_seq: int = 0, limit: int = 100):
-        count = 0
-        for event in self._events:
-            if event.seq >= from_seq:
-                yield event
-                count += 1
-                if count >= limit:
-                    return
-
 
 def test_session_first_demo_replays_recovers_and_validates() -> None:
     result = run_demo(AgentDB(_client=FakeClient()), tenant_key="offline-demo")

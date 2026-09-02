@@ -610,7 +610,7 @@ Before AgentDB advertises tenant BYOK, every durable byte path should be listed
 and classified as tenant payload, derived tenant data, operational metadata, or
 intentionally plaintext. The inventory must include:
 
-- tenants, sessions, events, records, record edges, policies, and
+- tenants, sessions, events, records, policies, and
   tenant metadata;
 - artifact metadata and artifact content;
 - sealed event segments, archives, and replay-prefix materializations;

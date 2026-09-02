@@ -96,47 +96,6 @@ class ServerError(AgentDBError):
     """
 
 
-class SubscriptionClosed(AgentDBError):
-    """Raised when the server emits a terminal `event: error` frame on
-    a `subscribe()` stream.
-
-    The body of those frames carries `{"error": "<code>", "last_seq":
-    <int?>}`. The `error` field is what the client uses to decide
-    whether to reconnect:
-
-    - `jwt_expired`: the auto-refresh path swallows this and
-      reconnects with `from_seq = last_seq + 1`. Callers never see
-      it unless they passed no token provider.
-    - `lag_too_far` / `catchup_failed`: surfaced as-is. The caller
-      can choose to reconnect with a fresher `from_seq` or give up.
-
-    `last_seq`, when present, is the sequence number of the last
-    event the server actually delivered before closing — use it to
-    pick a gap-free resume point.
-
-    Subscriptions don't carry an HTTP status (the close is mid-
-    stream, so the original 200 still stands); we set
-    `status_code=0` to make that explicit.
-    """
-
-    def __init__(
-        self,
-        error_code: str,
-        *,
-        last_seq: Optional[int] = None,
-        message: Optional[str] = None,
-    ) -> None:
-        super().__init__(
-            message or f"subscription closed: {error_code}",
-            status_code=0,
-            code=error_code,
-            kind=None,
-            body={"error": error_code, "last_seq": last_seq},
-        )
-        self.error_code = error_code
-        self.last_seq = last_seq
-
-
 _CODE_FOR_STATUS: dict[int, type[AgentDBError]] = {
     400: BadRequest,
     401: Unauthorized,

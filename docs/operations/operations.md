@@ -150,7 +150,6 @@ default total scanned key/value budget is 512 MiB. Row defaults are:
 | `AGENTDB_STARTUP_MAX_SESSIONS` | 250,000 | sessions and session aliases |
 | `AGENTDB_STARTUP_MAX_ARTIFACTS` | 250,000 | artifact metadata |
 | `AGENTDB_STARTUP_MAX_RECORDS` | 100,000 | records, index outbox, and index commits |
-| `AGENTDB_STARTUP_MAX_RECORD_EDGES` | 500,000 | record graph edges |
 | `AGENTDB_STARTUP_MAX_EXPORT_CONSUMERS` | 10,000 | managed export consumers |
 | `AGENTDB_STARTUP_MAX_TENANT_META` | 500,000 | tenant metadata rows |
 | `AGENTDB_STARTUP_MAX_IDEMPOTENCY` | 1,000,000 | retained idempotency results |

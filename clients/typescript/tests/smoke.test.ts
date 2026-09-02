@@ -231,13 +231,6 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
       { kind: SessionEventKind.AgentStatus }
     );
     assert.equal(resumed.seq, lastSeqBeforeCrash + 1);
-
-    const seen: string[] = [];
-    for await (const event of recovered.subscribe({ fromSeq: lastSeqBeforeCrash + 1 })) {
-      seen.push(event.kind);
-      break;
-    }
-    assert.deepEqual(seen, ["agent_status"]);
   });
 
   await t.test("fetchRecent on empty session returns empty array", async () => {

@@ -120,10 +120,7 @@ def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
         last_seen_seq=last_seq_before_recovery,
     )
 
-    resumed_events = []
-    for event in recovered.subscribe(from_seq=last_seq_before_recovery + 1, limit=1):
-        resumed_events.append(event)
-        break
+    resumed_events = recovered.replay(from_seq=last_seq_before_recovery + 1, limit=1)
 
     validated_events = recovered.replay(from_seq=0, limit=100)
     warnings = validate_adapter_events(validated_events)

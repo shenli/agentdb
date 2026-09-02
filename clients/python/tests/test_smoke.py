@@ -209,12 +209,6 @@ def test_harness_recovers_session_from_ids(server):
     )
     assert resumed.seq == last_seq_before_crash + 1
 
-    seen = []
-    for event in recovered.subscribe(from_seq=last_seq_before_crash + 1):
-        seen.append(event)
-        break
-    assert [event.kind for event in seen] == ["agent_status"]
-
 
 def test_health_ready_probe(server):
     client = Client(server)

@@ -59,7 +59,7 @@ use crate::artifact::Artifact;
 use crate::event::EventEnvelope;
 use crate::idempotency::IdempotencyRecord;
 use crate::record::SearchableRecord;
-use crate::runtime::{ExportConsumer, ExportLedgerItem, RecordEdge, TenantMetaEntry};
+use crate::runtime::{ExportConsumer, ExportLedgerItem, TenantMetaEntry};
 use crate::segment::SessionSegment;
 use crate::session::Session;
 use crate::tenant::Tenant;
@@ -165,10 +165,6 @@ fn export_ledger_high_watermark_key(tenant_id: &str) -> String {
 
 fn export_ledger_sequence_key(tenant_id: &str) -> String {
     format!("export_ledger_sequence/{tenant_id}")
-}
-
-fn record_edge_key(tenant_id: &str, edge_id: &str) -> String {
-    format!("record/searchable_edge/{tenant_id}/{edge_id}")
 }
 
 fn tenant_meta_key(tenant_id: &str, key: &str) -> String {
@@ -3178,24 +3174,6 @@ impl Persist {
             let mutation: RecordIndexMutation =
                 serde_json::from_slice(&v).expect("record index mutation decodes");
             out.push(mutation);
-        }
-        Ok(out)
-    }
-
-    pub fn put_record_edge(&self, edge: &RecordEdge) -> KvResult<()> {
-        self.write_ops(vec![WriteOp::Put {
-            key: record_edge_key(edge.tenant_id.as_str(), edge.edge_id.as_str()).into_bytes(),
-            value: serde_json::to_vec(edge).expect("record edge serializes"),
-        }])
-    }
-
-    pub fn scan_all_record_edges(&self) -> KvResult<Vec<RecordEdge>> {
-        let iter = self.kv.scan_prefix(b"record/searchable_edge/")?;
-        let mut out = Vec::new();
-        for res in iter {
-            let (_k, v) = res?;
-            let edge: RecordEdge = serde_json::from_slice(&v).expect("record edge decodes");
-            out.push(edge);
         }
         Ok(out)
     }

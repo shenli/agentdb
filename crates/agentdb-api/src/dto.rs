@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use agentdb_core::record::{IndexingPolicy, RecordStatus};
 use agentdb_core::runtime::{MetadataFilter, RecordSearchMatch};
-use agentdb_core::{ArtifactRef, CredentialRef, RecordEdgeType, SourceRef};
+use agentdb_core::{ArtifactRef, CredentialRef, SourceRef};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateTenantBody {
@@ -413,15 +413,6 @@ pub struct UpdateRecordBody {
     pub status: Option<RecordStatus>,
     #[serde(default)]
     pub expires_at_ms: Option<Option<u64>>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CreateRecordEdgeBody {
-    pub source_record_id: String,
-    pub target_record_id: String,
-    pub edge_type: RecordEdgeType,
-    #[serde(default = "default_policy")]
-    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

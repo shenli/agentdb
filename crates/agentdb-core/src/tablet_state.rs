@@ -898,7 +898,6 @@ fn classify_snapshot_entry(key: &[u8], value: &[u8]) -> StorageResult<SnapshotEn
         "record/artifact/",
         "record/artifact_by_sha256/",
         "record/searchable/",
-        "record/searchable_edge/",
         "record/searchable_by_namespace/",
         "record/searchable_commit/",
         "record/searchable_index_outbox/",
