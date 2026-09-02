@@ -386,10 +386,40 @@ enum Command {
         #[command(subcommand)]
         command: ExportCommand,
     },
+    /// Tenant data-encryption-key (DEK) lifecycle operations.
+    Encryption {
+        #[command(subcommand)]
+        command: EncryptionCommand,
+    },
     /// Low-level escape hatch for endpoints not yet modeled by the CLI.
     Raw {
         #[command(subcommand)]
         command: RawCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EncryptionCommand {
+    /// Rotate a tenant's DEKs: mint a new active version, demote the old to
+    /// read-only. Existing data stays readable; new writes use the new key.
+    Rotate {
+        #[arg(long)]
+        tenant_id: String,
+    },
+    /// Revoke — or crypto-shred (`--destroy`) — a tenant's DEKs. A soft revoke is
+    /// reversible; `--destroy` deletes the wrapped key material irreversibly.
+    Revoke {
+        #[arg(long)]
+        tenant_id: String,
+        /// Crypto-shred: destroy the wrapped key material (irreversible).
+        #[arg(long)]
+        destroy: bool,
+    },
+    /// Re-encrypt a tenant's data (metadata + content) under the active DEK
+    /// version, so a rotated-away version can be retired. Idempotent.
+    Reencrypt {
+        #[arg(long)]
+        tenant_id: String,
     },
 }
 
@@ -1181,6 +1211,32 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
             }
         },
         Command::Export { command } => export(api, command).await,
+        Command::Encryption { command } => match command {
+            EncryptionCommand::Rotate { tenant_id } => {
+                let tenant_id = require_non_empty_cli_arg("--tenant-id", tenant_id)?;
+                api.post(
+                    &format!("/api/admin/tenants/{tenant_id}/rotate-dek"),
+                    json!({}),
+                )
+                .await
+            }
+            EncryptionCommand::Revoke { tenant_id, destroy } => {
+                let tenant_id = require_non_empty_cli_arg("--tenant-id", tenant_id)?;
+                api.post(
+                    &format!("/api/admin/tenants/{tenant_id}/revoke-dek?destroy={destroy}"),
+                    json!({}),
+                )
+                .await
+            }
+            EncryptionCommand::Reencrypt { tenant_id } => {
+                let tenant_id = require_non_empty_cli_arg("--tenant-id", tenant_id)?;
+                api.post(
+                    &format!("/api/admin/tenants/{tenant_id}/reencrypt-dek"),
+                    json!({}),
+                )
+                .await
+            }
+        },
         Command::Raw { command } => match command {
             RawCommand::Get { path } => api.get(&path).await,
             RawCommand::Post { path, body } => {
