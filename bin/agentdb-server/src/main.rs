@@ -92,10 +92,37 @@ enum Cmd {
     Doctor(DoctorOpts),
     /// Write a starter single-node config file.
     InitConfig(InitConfigOpts),
+    /// Install/uninstall AgentDB as a per-user background service (launchd on
+    /// macOS, systemd --user on Linux) so the server runs whenever you log in.
+    Service(ServiceOpts),
     /// Rebuild an empty runtime data directory from the newest recovery
     /// manifest in the configured object store.
     #[command(name = "restore-from-bucket")]
     RestoreFromBucket(RestoreFromBucketOpts),
+}
+
+#[derive(Parser, Debug)]
+struct ServiceOpts {
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ServiceCommand {
+    /// Write a user service unit that runs `agentdb serve`, then enable and
+    /// start it. Idempotent: re-running rewrites the unit.
+    Install {
+        /// `host:port` for the served unit. Defaults to 127.0.0.1:7878.
+        #[arg(long)]
+        bind: Option<SocketAddr>,
+        /// Write the unit but do not enable/start it.
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Stop, disable, and remove the user service unit.
+    Uninstall,
+    /// Show the installed unit's path and whether it is loaded/running.
+    Status,
 }
 
 #[derive(Parser, Debug)]
@@ -296,6 +323,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Dev(opts) => dev(opts).await,
         Cmd::Doctor(opts) => doctor(opts),
         Cmd::InitConfig(opts) => init_config(opts),
+        Cmd::Service(opts) => service(opts),
         Cmd::RestoreFromBucket(opts) => restore_from_bucket(opts).await,
     }
 }
@@ -2937,6 +2965,206 @@ async fn restore_from_bucket(opts: RestoreFromBucketOpts) -> anyhow::Result<()> 
     );
     println!("artifact content is fetched from the object-store mirror on first read.");
     Ok(())
+}
+
+const SERVICE_LABEL: &str = "com.agentdb.server";
+const SYSTEMD_UNIT: &str = "agentdb.service";
+
+fn home_dir_required() -> anyhow::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("cannot locate the home directory (HOME is unset)"))
+}
+
+/// Path to the installed service unit for this platform.
+fn service_unit_path() -> anyhow::Result<PathBuf> {
+    let home = home_dir_required()?;
+    if cfg!(target_os = "macos") {
+        Ok(home
+            .join("Library/LaunchAgents")
+            .join(format!("{SERVICE_LABEL}.plist")))
+    } else if cfg!(target_os = "linux") {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        Ok(base.join("systemd/user").join(SYSTEMD_UNIT))
+    } else {
+        anyhow::bail!("`agentdb service` supports macOS (launchd) and Linux (systemd --user) only")
+    }
+}
+
+/// Run a command silently, returning whether it exited successfully (never
+/// errors on a non-zero exit — used for best-effort load/unload steps, so a
+/// tool's own diagnostics for an expected no-op are suppressed).
+fn run_ok(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn service(opts: ServiceOpts) -> anyhow::Result<()> {
+    match opts.command {
+        ServiceCommand::Install { bind, no_start } => service_install(bind, no_start),
+        ServiceCommand::Uninstall => service_uninstall(),
+        ServiceCommand::Status => service_status(),
+    }
+}
+
+fn service_install(bind: Option<SocketAddr>, no_start: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let exe_str = exe.to_string_lossy().into_owned();
+    let bind_str = bind.map(|b| b.to_string());
+    let unit_path = service_unit_path()?;
+    if let Some(parent) = unit_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Logs live under the machine-scoped home so they are found predictably.
+    let log_dir = agentdb_home().join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+
+    if cfg!(target_os = "macos") {
+        let mut args = format!(
+            "    <string>{}</string>\n    <string>serve</string>\n",
+            xml_escape(&exe_str)
+        );
+        if let Some(b) = &bind_str {
+            args.push_str(&format!(
+                "    <string>--bind</string>\n    <string>{}</string>\n",
+                xml_escape(b)
+            ));
+        }
+        let out_log = log_dir.join("agentdb.out.log");
+        let err_log = log_dir.join("agentdb.err.log");
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+{args}  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{out}</string>
+  <key>StandardErrorPath</key>
+  <string>{err}</string>
+</dict>
+</plist>
+"#,
+            label = SERVICE_LABEL,
+            args = args,
+            out = xml_escape(&out_log.to_string_lossy()),
+            err = xml_escape(&err_log.to_string_lossy()),
+        );
+        std::fs::write(&unit_path, plist)?;
+        println!("Wrote launchd agent {}", unit_path.display());
+        if no_start {
+            println!("Not started (--no-start). Load it with:");
+            println!("  launchctl load -w {}", unit_path.display());
+        } else {
+            let path = unit_path.to_string_lossy();
+            run_ok("launchctl", &["unload", &path]); // best-effort: ignore if not loaded
+            if run_ok("launchctl", &["load", "-w", &path]) {
+                println!("Loaded and started. AgentDB will run at login.");
+            } else {
+                println!("Wrote the agent, but `launchctl load` failed; load it manually:");
+                println!("  launchctl load -w {path}");
+            }
+        }
+    } else if cfg!(target_os = "linux") {
+        let exec_start = match &bind_str {
+            Some(b) => format!("{exe_str} serve --bind {b}"),
+            None => format!("{exe_str} serve"),
+        };
+        let unit = format!(
+            "[Unit]\n\
+             Description=AgentDB durable session log for AI agents\n\
+             After=network.target\n\
+             \n\
+             [Service]\n\
+             ExecStart={exec_start}\n\
+             Restart=on-failure\n\
+             RestartSec=2\n\
+             \n\
+             [Install]\n\
+             WantedBy=default.target\n"
+        );
+        std::fs::write(&unit_path, unit)?;
+        println!("Wrote systemd user unit {}", unit_path.display());
+        run_ok("systemctl", &["--user", "daemon-reload"]);
+        if no_start {
+            println!("Not started (--no-start). Enable it with:");
+            println!("  systemctl --user enable --now {SYSTEMD_UNIT}");
+        } else if run_ok("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT]) {
+            println!("Enabled and started. AgentDB will run at login.");
+            println!("(For it to run while logged out: `loginctl enable-linger $USER`.)");
+        } else {
+            println!("Wrote the unit, but `systemctl --user enable --now` failed; enable it manually:");
+            println!("  systemctl --user enable --now {SYSTEMD_UNIT}");
+        }
+    } else {
+        anyhow::bail!("`agentdb service` supports macOS (launchd) and Linux (systemd --user) only");
+    }
+    println!("Data directory: {}", agentdb_home().display());
+    Ok(())
+}
+
+fn service_uninstall() -> anyhow::Result<()> {
+    let unit_path = service_unit_path()?;
+    if cfg!(target_os = "macos") {
+        run_ok("launchctl", &["unload", "-w", &unit_path.to_string_lossy()]);
+    } else if cfg!(target_os = "linux") {
+        run_ok("systemctl", &["--user", "disable", "--now", SYSTEMD_UNIT]);
+    }
+    if unit_path.exists() {
+        std::fs::remove_file(&unit_path)?;
+        println!("Removed {}", unit_path.display());
+    } else {
+        println!("No service unit at {} (nothing to remove)", unit_path.display());
+    }
+    if cfg!(target_os = "linux") {
+        run_ok("systemctl", &["--user", "daemon-reload"]);
+    }
+    Ok(())
+}
+
+fn service_status() -> anyhow::Result<()> {
+    let unit_path = service_unit_path()?;
+    println!("Unit path: {}", unit_path.display());
+    println!(
+        "Installed: {}",
+        if unit_path.exists() { "yes" } else { "no" }
+    );
+    if cfg!(target_os = "macos") {
+        println!("Runtime state (`launchctl list | grep {SERVICE_LABEL}`):");
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("launchctl list | grep {SERVICE_LABEL} || echo '  not loaded'"))
+            .status();
+    } else if cfg!(target_os = "linux") {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "--no-pager", "status", SYSTEMD_UNIT])
+            .status();
+    }
+    Ok(())
+}
+
+/// Minimal XML entity escaping for launchd plist string values.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn init_config(opts: InitConfigOpts) -> anyhow::Result<()> {
@@ -6712,6 +6940,15 @@ mod tests {
         let file: FileConfig = toml::from_str(text).expect("cluster example config parses");
         assert_eq!(file.deployment.mode.as_deref(), Some("cluster"));
         assert!(file.storage.object_store.is_some());
+    }
+
+    #[test]
+    fn xml_escape_escapes_plist_special_chars() {
+        assert_eq!(
+            super::xml_escape("/opt/a & b/<agentdb>"),
+            "/opt/a &amp; b/&lt;agentdb&gt;"
+        );
+        assert_eq!(super::xml_escape("/usr/local/bin/agentdb"), "/usr/local/bin/agentdb");
     }
 
     #[test]
