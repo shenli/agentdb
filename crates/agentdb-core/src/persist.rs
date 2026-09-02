@@ -188,10 +188,22 @@ fn last_path_segment(key: &[u8]) -> Option<&str> {
     std::str::from_utf8(key).ok()?.rsplit('/').next()
 }
 
-/// The session id (third segment) of an event key `event/{tenant}/{session}/{seq}`
-/// — the object id an event row is sealed under.
+/// The session id (third segment) of an event key `event/{tenant}/{session}/{seq}`.
 fn event_session_from_key(key: &[u8]) -> Option<&str> {
     std::str::from_utf8(key).ok()?.split('/').nth(2)
+}
+
+/// The seq (fourth segment) of an event key `event/{tenant}/{session}/{seq}`.
+fn event_seq_from_key(key: &[u8]) -> Option<u64> {
+    std::str::from_utf8(key).ok()?.split('/').nth(3)?.parse().ok()
+}
+
+/// The AAD object id an individual event row is sealed under: `{session}:{seq}`.
+/// Binding the sequence means a ciphertext cannot be replayed at a different
+/// position within the same session (the session-level append-log batches, which
+/// have no single seq, stay bound to the session id alone).
+fn event_object_id(session_id: &str, seq: u64) -> String {
+    format!("{session_id}:{seq}")
 }
 
 fn export_ledger_object_id_from_key(key: &[u8]) -> Option<&str> {
@@ -1203,21 +1215,14 @@ impl Persist {
         }
     }
 
-    fn event_context<'a>(&self, e: &'a EventEnvelope) -> MetadataCryptoContext<'a> {
-        let key = key_from_parts(&e.metadata_key_id, &e.metadata_key_version);
-        MetadataCryptoContext {
-            tenant_id: e.tenant_id.as_str(),
-            object_kind: MetadataObjectKind::Event,
-            object_id: e.session_id.as_str(),
-            key,
-        }
-    }
-
-    fn event_context_from_key<'a>(
+    /// The session-level AAD context for an append-log **batch** (a group of
+    /// events written under one append-log key). Batches have no single event
+    /// seq, so they stay bound to the session id — unlike an individual event
+    /// row, which binds `{session}:{seq}` (see [`event_object_id`]).
+    fn append_batch_context<'a>(
         &self,
         tenant_id: &'a str,
         session_id: &'a str,
-        _seq: u64,
     ) -> MetadataCryptoContext<'a> {
         MetadataCryptoContext {
             tenant_id,
@@ -1225,6 +1230,43 @@ impl Persist {
             object_id: session_id,
             key: None,
         }
+    }
+
+    /// Decrypt an individual event row sealed under the per-event AAD
+    /// (`object_id = {session}:{seq}`), given the event's seq.
+    fn decrypt_event_row_seq(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        seq: u64,
+        value: &[u8],
+    ) -> KvResult<Vec<u8>> {
+        let object_id = event_object_id(session_id, seq);
+        let context = MetadataCryptoContext {
+            tenant_id,
+            object_kind: MetadataObjectKind::Event,
+            object_id: &object_id,
+            key: None,
+        };
+        self.decrypt_metadata(&context, value)
+    }
+
+    /// Decrypt an individual event row, recovering its seq from the event key
+    /// `event/{tenant}/{session}/{seq}` to reconstruct the per-event AAD.
+    fn decrypt_event_row(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> KvResult<Vec<u8>> {
+        let seq = event_seq_from_key(key).ok_or_else(|| {
+            StorageError::Other(format!(
+                "event key missing seq: {}",
+                String::from_utf8_lossy(key)
+            ))
+        })?;
+        self.decrypt_event_row_seq(tenant_id, session_id, seq, value)
     }
 
     fn export_ledger_context<'a>(
@@ -1522,8 +1564,7 @@ impl Persist {
         let mut tombstoned_event_ids = BTreeSet::new();
         for res in iter {
             let (k, v) = res?;
-            let context = self.event_context_from_key(tenant_id, session_id, 0);
-            let plaintext = self.decrypt_metadata(&context, &v)?;
+            let plaintext = self.decrypt_event_row(tenant_id, session_id, &k, &v)?;
             let env: EventEnvelope =
                 serde_json::from_slice(&plaintext).expect("event envelope decodes");
             if let Some((reason, deleted_at_ms)) = tombstone {
@@ -1576,8 +1617,7 @@ impl Persist {
         let mut count = 0;
         for res in iter {
             let (k, v) = res?;
-            let context = self.event_context_from_key(tenant_id, session_id, 0);
-            let plaintext = self.decrypt_metadata(&context, &v)?;
+            let plaintext = self.decrypt_event_row(tenant_id, session_id, &k, &v)?;
             let env: EventEnvelope =
                 serde_json::from_slice(&plaintext).expect("event envelope decodes");
             if env.seq < from_seq {
@@ -1785,7 +1825,13 @@ impl Persist {
             event.session_id.as_str(),
             event.seq,
         );
-        let event_context = self.event_context(event);
+        let event_object_id = event_object_id(event.session_id.as_str(), event.seq);
+        let event_context = MetadataCryptoContext {
+            tenant_id: event.tenant_id.as_str(),
+            object_kind: MetadataObjectKind::Event,
+            object_id: &event_object_id,
+            key: key_from_parts(&event.metadata_key_id, &event.metadata_key_version),
+        };
         let event_value = self.encrypt_metadata(
             &event_context,
             &serde_json::to_vec(event).expect("event serializes"),
@@ -1939,7 +1985,7 @@ impl Persist {
         session_id: &str,
         batch: &AppendLogBatch,
     ) -> KvResult<Vec<u8>> {
-        let context = self.event_context_from_key(tenant_id, session_id, 0);
+        let context = self.append_batch_context(tenant_id, session_id);
         self.encrypt_metadata(
             &context,
             &serde_json::to_vec(batch).expect("append log batch serializes"),
@@ -1952,7 +1998,7 @@ impl Persist {
         session_id: &str,
         batch: &AppendLogBatchRefs<'_>,
     ) -> KvResult<Vec<u8>> {
-        let context = self.event_context_from_key(tenant_id, session_id, 0);
+        let context = self.append_batch_context(tenant_id, session_id);
         self.encrypt_metadata(
             &context,
             &serde_json::to_vec(batch).expect("append log batch serializes"),
@@ -1965,7 +2011,7 @@ impl Persist {
         session_id: &str,
         value: &[u8],
     ) -> KvResult<AppendLogBatch> {
-        let context = self.event_context_from_key(tenant_id, session_id, 0);
+        let context = self.append_batch_context(tenant_id, session_id);
         let plaintext = self.decrypt_metadata(&context, value)?;
         Ok(serde_json::from_slice(&plaintext).expect("append log batch decodes"))
     }
@@ -2036,9 +2082,8 @@ impl Persist {
             .kv
             .scan_prefix_from(prefix.as_bytes(), start.as_bytes())?;
         for res in iter {
-            let (_k, v) = res?;
-            let context = self.event_context_from_key(tenant_id, session_id, 0);
-            let plaintext = self.decrypt_metadata(&context, &v)?;
+            let (k, v) = res?;
+            let plaintext = self.decrypt_event_row(tenant_id, session_id, &k, &v)?;
             let env: EventEnvelope =
                 serde_json::from_slice(&plaintext).expect("event envelope decodes");
             if env.seq < from_seq {
@@ -2077,8 +2122,7 @@ impl Persist {
         else {
             return Ok(None);
         };
-        let context = self.event_context_from_key(tenant_id, session_id, 0);
-        let plaintext = self.decrypt_metadata(&context, &value)?;
+        let plaintext = self.decrypt_event_row_seq(tenant_id, session_id, seq, &value)?;
         let event: EventEnvelope =
             serde_json::from_slice(&plaintext).expect("event envelope decodes");
         Ok(Some(event))
@@ -2225,9 +2269,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(prefix.as_bytes())?;
         let mut max_seq: Option<u64> = None;
         for res in iter {
-            let (_k, v) = res?;
-            let context = self.event_context_from_key(tenant_id, session_id, 0);
-            let plaintext = self.decrypt_metadata(&context, &v)?;
+            let (k, v) = res?;
+            let plaintext = self.decrypt_event_row(tenant_id, session_id, &k, &v)?;
             let env: EventEnvelope =
                 serde_json::from_slice(&plaintext).expect("event envelope decodes");
             max_seq = Some(match max_seq {
@@ -2450,13 +2493,15 @@ impl Persist {
             self.reseal_row(&tenant_key, &value, &context, active, &mut ops, &mut report);
         }
 
-        // Session events (object id = session).
+        // Session events (per-event AAD: object id = {session}:{seq}).
         for (key, value) in self.collect_prefix(format!("event/{tenant_id}/").as_bytes())? {
-            let session = event_session_from_key(&key).unwrap_or_default().to_string();
+            let session = event_session_from_key(&key).unwrap_or_default();
+            let seq = event_seq_from_key(&key).unwrap_or(0);
+            let object_id = event_object_id(session, seq);
             let context = MetadataCryptoContext {
                 tenant_id,
                 object_kind: MetadataObjectKind::Event,
-                object_id: &session,
+                object_id: &object_id,
                 key: None,
             };
             self.reseal_row(&key, &value, &context, active, &mut ops, &mut report);

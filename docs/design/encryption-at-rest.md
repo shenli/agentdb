@@ -378,8 +378,17 @@ rotates both DEKs, retires, and confirms the old versions are refused by the
 provider while the data still decrypts. This closes the key-lifecycle loop:
 provision → rotate → re-encrypt → **retire** → (crypto-shred).
 
+**Milestone 24 (landed): per-event AAD.** An individual event row is now sealed
+under `object_id = {session}:{seq}` instead of just the session id, so its
+sequence number is authenticated — a ciphertext cannot be moved to a different
+position within the same session and still decrypt. Every event write and read
+(the append hot path, the session scans, `get`-by-seq, and the re-encryption
+walk) reconstructs the same `{session}:{seq}` from the event key. Append-log
+**batches** (a group of events under one key, with no single seq) stay bound to
+the session id via `append_batch_context`, and the export-ledger event entries —
+already keyed by the unique `event_id` — are unchanged.
+
 **Not yet done:** nothing required for a complete encryption-at-rest system.
-Event AAD binds tenant + session + kind (not yet the per-event seq).
 Dedicated-domain placement enforcement remains, as does graceful hydration when a
 tenant's rows are undecryptable after a crypto-shred (today a `scan_all_*`
 decrypt error propagates — a pre-existing behavior shared with the
