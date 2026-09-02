@@ -32,11 +32,6 @@ public docs path.
   map, rollout plan, and validation requirements
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
   - product positioning and value-prop messaging framework
-- [design/codemate-product-note.md](design/codemate-product-note.md)
-  - research findings and local-first demo plan for CodeMate, a developer app
-  that uses AgentDB to review agent sessions and distill best practices
-- [design/codemate-prd.md](design/codemate-prd.md)
-  - simple PRD for CodeMate as a third-party local web app
 
 ## Run And Operate
 

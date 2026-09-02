@@ -84,13 +84,13 @@ For the conceptual motivation and positioning, see
 - **Framework adapters.** Proofs exist. More adapters should show real recovery:
   crash/restart, idempotent retry, artifact recovery, fork, and watch/export
   consumption in one documented flow.
-- **CodeMate local engineering review.** Product research points to reviewer
-  trust, verification cost, repeated agent mistakes, and uncaptured best
-  practices as stronger wedges than generic agent memory. The proposed demo is a
-  third-party local web app that imports coding-agent session history into
-  AgentDB, then renders PR review packets, identifies common issues, and
-  suggests project guidance or skill updates. See
-  [`design/codemate-product-note.md`](design/codemate-product-note.md).
+- **Session-history demo.** The canonical demo is the developer's own Claude
+  Code and Codex history, imported by `agentdbctl` — real sessions, not a
+  synthetic app — explored through the MCP adapter (replay and search) and the
+  dashboard timeline. The release smoke test is the recovery loop (append,
+  crash, resume, artifact recovery, replay, fork) run against those imported
+  sessions. See
+  [`design/product-simplification-proposal.md`](design/product-simplification-proposal.md).
 - **Distributed/tablet operation.** The codebase has substantial evaluation
   machinery, but the production-default posture is still single-node. The
   distributed story needs a clear OSS/managed boundary, stable operator
