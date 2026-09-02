@@ -20,6 +20,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+mod import;
+
 const DEFAULT_URL: &str = "http://127.0.0.1:7878";
 const CLICKHOUSE_SCHEMA_VERSION: &str = "2026_05_15_clickstack_views";
 const CLICKHOUSE_REQUIRED_OBJECTS: &[&str] = &[
@@ -391,11 +393,39 @@ enum Command {
         #[command(subcommand)]
         command: EncryptionCommand,
     },
+    /// Import coding-agent session logs (one JSONL file = one session) into
+    /// AgentDB over the API. Re-running is safe (idempotent per line).
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
+    },
     /// Low-level escape hatch for endpoints not yet modeled by the CLI.
     Raw {
         #[command(subcommand)]
         command: RawCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ImportCommand {
+    /// Import Claude Code sessions from ~/.claude/projects.
+    ClaudeCode(ImportArgs),
+    /// Import Codex sessions from ~/.codex/sessions.
+    Codex(ImportArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ImportArgs {
+    /// Directory to scan for `*.jsonl` session files. Defaults to the source's
+    /// standard location (`~/.claude/projects` or `~/.codex/sessions`).
+    #[arg(long)]
+    pub(crate) dir: Option<std::path::PathBuf>,
+    /// Keep running, importing newly appended lines as they arrive.
+    #[arg(long)]
+    pub(crate) watch: bool,
+    /// Poll interval for `--watch`, in milliseconds.
+    #[arg(long, default_value_t = 2000)]
+    pub(crate) poll_ms: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1045,7 +1075,7 @@ enum RawCommand {
     },
 }
 
-struct Api {
+pub(crate) struct Api {
     base: String,
     token: Option<String>,
     client: Client,
@@ -1060,23 +1090,49 @@ impl Api {
         }
     }
 
-    async fn get(&self, path: &str) -> Result<Value> {
-        self.request(Method::GET, path, None).await
+    pub(crate) async fn get(&self, path: &str) -> Result<Value> {
+        self.request(Method::GET, path, None, &[]).await
     }
 
-    async fn post(&self, path: &str, body: Value) -> Result<Value> {
-        self.request(Method::POST, path, Some(body)).await
+    pub(crate) async fn post(&self, path: &str, body: Value) -> Result<Value> {
+        self.request(Method::POST, path, Some(body), &[]).await
     }
 
     async fn delete(&self, path: &str) -> Result<Value> {
-        self.request(Method::DELETE, path, None).await
+        self.request(Method::DELETE, path, None, &[]).await
     }
 
-    async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+    /// POST with an `Idempotency-Key` header, so a re-sent request is deduplicated
+    /// server-side.
+    pub(crate) async fn post_idempotent(
+        &self,
+        path: &str,
+        body: Value,
+        idempotency_key: &str,
+    ) -> Result<Value> {
+        self.request(
+            Method::POST,
+            path,
+            Some(body),
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> Result<Value> {
         let url = join_url(&self.base, path);
         let mut request = self.client.request(method, url);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
+        }
+        for (name, value) in headers {
+            request = request.header(*name, *value);
         }
         if let Some(body) = body {
             request = request.json(&body);
@@ -1250,6 +1306,12 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 )
                 .await
             }
+        },
+        Command::Import { command } => match command {
+            ImportCommand::ClaudeCode(args) => {
+                import::run(api, import::Source::ClaudeCode, args).await
+            }
+            ImportCommand::Codex(args) => import::run(api, import::Source::Codex, args).await,
         },
         Command::Raw { command } => match command {
             RawCommand::Get { path } => api.get(&path).await,
