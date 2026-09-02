@@ -24,7 +24,7 @@ use axum::{middleware, Router};
 
 /// Build the V2 router with all runtime routes mounted under `/api/...`.
 pub fn build_router(state: AppState) -> Router {
-    routes::routes()
+    routes::routes(state.cluster_mode)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authorize_external_api,

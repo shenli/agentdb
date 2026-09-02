@@ -861,7 +861,7 @@ async fn session_locator_lifecycle_tracks_fork_delete_and_tenant_delete() {
 
 #[tokio::test]
 async fn admin_routing_status_reports_disabled_mode() {
-    let app = spawn_app().await;
+    let app = spawn_app_with_state(AppState::new(Runtime::in_memory())).await;
 
     let body: serde_json::Value = app
         .client
@@ -992,7 +992,7 @@ async fn admin_content_mirror_reports_async_backlog_stats() {
 
 #[tokio::test]
 async fn admin_raft_status_reports_disabled_mode() {
-    let app = spawn_app().await;
+    let app = spawn_app_with_state(AppState::new(Runtime::in_memory())).await;
 
     let body: serde_json::Value = app
         .client
@@ -1731,7 +1731,7 @@ async fn admin_routing_status_reports_snapshot_metadata() {
 
 #[tokio::test]
 async fn admin_routing_decision_reports_disabled_local_dry_run() {
-    let app = spawn_app().await;
+    let app = spawn_app_with_state(AppState::new(Runtime::in_memory())).await;
 
     let body: serde_json::Value = app
         .client
@@ -1790,7 +1790,9 @@ async fn admin_routing_decision_reports_snapshot_forward_dry_run() {
 
 #[tokio::test]
 async fn admin_cluster_health_reports_single_node_ok() {
-    let app = spawn_app().await;
+    // Cluster control-plane routes are mounted only in cluster mode; the handler
+    // still reports the disabled/single-node state when routing is unconfigured.
+    let app = spawn_app_with_state(AppState::new(Runtime::in_memory())).await;
 
     let body: serde_json::Value = app
         .client
@@ -3295,7 +3297,7 @@ async fn admin_tablet_rebalance_skips_raft_retirement_when_group_is_unregistered
 
 #[tokio::test]
 async fn admin_nodes_returns_503_when_meta_is_missing() {
-    let app = spawn_app().await;
+    let app = spawn_app_with_state(AppState::new(Runtime::in_memory())).await;
 
     let response = app
         .client

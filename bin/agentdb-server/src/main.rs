@@ -369,9 +369,14 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .route_region
         .clone()
         .or(config.route_location.clone());
+    // Raft workers run only in cluster mode. The registry (and therefore the
+    // raft bootstrap, tick, transport, and snapshot workers derived from it)
+    // stays None in single-node deployments even if an internal auth token is
+    // configured, so single-node never spins up the replication machinery.
     let raft_registry = config
         .internal_auth_token
         .as_ref()
+        .filter(|_| matches!(config.deployment_mode, DeploymentMode::Cluster))
         .map(|_| agentdb_api::raft_ingress::RaftRsGroupRegistry::shared());
     let route_startup =
         prepare_route_startup(&config, route_location.clone(), raft_registry.clone()).await?;
@@ -673,6 +678,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     };
 
     let mut state = agentdb_api::AppState::new(runtime.clone())
+        .with_cluster_mode(matches!(config.deployment_mode, DeploymentMode::Cluster))
         .with_auth_meta(auth_meta)
         .with_proxy_policy(agentdb_api::state::ProxyPolicy {
             timeout_ms: config.route_proxy_timeout_ms,
