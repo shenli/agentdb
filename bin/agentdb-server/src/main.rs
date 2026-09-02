@@ -487,9 +487,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     None
                 }
             };
+            // The rotator is the same provider; keep a handle to install on the
+            // runtime after it is built (the admin rotate-DEK path uses it).
+            let cluster_rotator = cluster_crypto.as_ref().map(|(_, _, r)| Arc::clone(r));
             let runtime = match config.tablet_store_layout {
                 TabletStoreLayoutKind::PrefixScoped => match cluster_crypto {
-                    Some((keyring, provisioner)) => {
+                    Some((keyring, provisioner, _rotator)) => {
                         agentdb_core::Runtime::with_kv_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
                             kv,
                             content,
@@ -538,7 +541,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         "opened grouped RocksDB tablet-store lifecycle"
                     );
                     match cluster_crypto {
-                        Some((keyring, provisioner)) => {
+                        Some((keyring, provisioner, _rotator)) => {
                             agentdb_core::Runtime::with_tablet_store_lifecycle_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
                                 lifecycle,
                                 content,
@@ -559,11 +562,17 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     }
                 }
             };
+            if let Some(rotator) = cluster_rotator {
+                runtime.set_key_rotator(rotator);
+            }
             (runtime, content_mirror)
         } else {
             let runtime = match build_encryption_keyring(&kv)? {
-                Some(keyring) => {
-                    agentdb_core::Runtime::with_kv_content_and_keyring(kv, content, keyring)
+                Some((keyring, rotator)) => {
+                    let rt =
+                        agentdb_core::Runtime::with_kv_content_and_keyring(kv, content, keyring);
+                    rt.set_key_rotator(rotator);
+                    rt
                 }
                 None => agentdb_core::Runtime::with_kv(kv, content),
             };
@@ -1944,9 +1953,16 @@ impl RaftSnapshotObjectStore {
 /// lives in `kv` under the reserved control-plane prefix. Fails closed if
 /// envelope mode is requested without a KEK secret, rather than silently storing
 /// plaintext.
+/// The single-node keyring plus its admin-path key rotator, over the KV-backed
+/// wrapped-DEK catalog. Both wrap the one `CatalogKeyProvider`.
+type SingleNodeKeyring = (
+    Arc<dyn agentdb_storage::EnvelopeCrypto>,
+    Arc<dyn agentdb_core::TenantKeyRotator>,
+);
+
 fn build_encryption_keyring(
     kv: &Arc<dyn agentdb_storage::KvStore + Send + Sync>,
-) -> anyhow::Result<Option<Arc<dyn agentdb_storage::EnvelopeCrypto>>> {
+) -> anyhow::Result<Option<SingleNodeKeyring>> {
     let mode = std::env::var("AGENTDB_ENCRYPTION_MODE").unwrap_or_else(|_| "disabled".to_string());
     let secret = std::env::var("AGENTDB_ENCRYPTION_KEK_SECRET").ok();
     let kek_ref =
@@ -1956,15 +1972,15 @@ fn build_encryption_keyring(
 }
 
 /// Pure builder (env-free, so it is unit-testable): turn resolved encryption
-/// settings into a keyring, or `None` when disabled. Fails closed if envelope
-/// mode is requested without a KEK secret.
+/// settings into a keyring + rotator, or `None` when disabled. Fails closed if
+/// envelope mode is requested without a KEK secret.
 fn keyring_from_settings(
     mode: &str,
     secret: Option<&str>,
     kek_ref: &str,
     suite: Option<&str>,
     kv: &Arc<dyn agentdb_storage::KvStore + Send + Sync>,
-) -> anyhow::Result<Option<Arc<dyn agentdb_storage::EnvelopeCrypto>>> {
+) -> anyhow::Result<Option<SingleNodeKeyring>> {
     match mode.trim() {
         "" | "disabled" => Ok(None),
         "envelope" => {
@@ -1991,15 +2007,17 @@ fn keyring_from_settings(
                 kek,
             ));
             let keyring = agentdb_storage::AeadTenantKeyring::new(
-                provider,
+                provider.clone(),
                 suite,
                 agentdb_storage::DekCacheConfig::default(),
             );
+            let rotator: Arc<dyn agentdb_core::TenantKeyRotator> =
+                Arc::new(agentdb_api::dek_provider::CatalogKeyRotator::new(provider));
             tracing::info!(
                 suite = suite.as_str(),
                 "tenant envelope encryption enabled (wrapped-DEK catalog + local KEK)"
             );
-            Ok(Some(Arc::new(keyring)))
+            Ok(Some((Arc::new(keyring), rotator)))
         }
         other => {
             anyhow::bail!("unknown AGENTDB_ENCRYPTION_MODE {other:?} (expected disabled|envelope)")
@@ -2055,6 +2073,7 @@ async fn build_cluster_keyring_and_provisioner(
     Option<(
         Arc<dyn agentdb_storage::EnvelopeCrypto>,
         Arc<dyn agentdb_core::TenantKeyProvisioner>,
+        Arc<dyn agentdb_core::TenantKeyRotator>,
     )>,
 > {
     let Some((kek, suite)) = encryption_kek_and_suite()? else {
@@ -2093,12 +2112,13 @@ async fn build_cluster_keyring_and_provisioner(
             suite,
             agentdb_storage::DekCacheConfig::default(),
         ));
-    let provisioner: Arc<dyn agentdb_core::TenantKeyProvisioner> = provider;
+    let provisioner: Arc<dyn agentdb_core::TenantKeyProvisioner> = provider.clone();
+    let rotator: Arc<dyn agentdb_core::TenantKeyRotator> = provider;
     tracing::info!(
         suite = suite.as_str(),
         "cluster tenant envelope encryption enabled (shared meta-DB key catalog + local KEK)"
     );
-    Ok(Some((keyring, provisioner)))
+    Ok(Some((keyring, provisioner, rotator)))
 }
 
 fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<ContentBackendBundle> {
@@ -6392,10 +6412,11 @@ mod tests {
         // Missing or empty secret fails closed.
         assert!(keyring_from_settings("envelope", None, "local:v1", None, &kv).is_err());
         assert!(keyring_from_settings("envelope", Some(""), "local:v1", None, &kv).is_err());
-        // With a secret, a real (enabled) keyring is built.
-        let kr = keyring_from_settings("envelope", Some("kek-secret"), "local:v1", None, &kv)
-            .unwrap()
-            .expect("keyring built");
+        // With a secret, a real (enabled) keyring + rotator is built.
+        let (kr, _rotator) =
+            keyring_from_settings("envelope", Some("kek-secret"), "local:v1", None, &kv)
+                .unwrap()
+                .expect("keyring built");
         assert!(kr.is_enabled());
     }
 

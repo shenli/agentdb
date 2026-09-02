@@ -116,6 +116,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/scheduler", get(get_admin_scheduler))
         .route("/api/admin/exports", get(get_admin_exports))
         .route(
+            "/api/admin/tenants/:tenant_id/rotate-dek",
+            post(rotate_tenant_dek),
+        )
+        .route(
             "/api/admin/drain",
             get(get_admin_drain).post(post_admin_drain),
         )
@@ -5625,6 +5629,30 @@ async fn list_sessions(
         count: sessions.len(),
         sessions,
     }))
+}
+
+/// Admin: rotate a tenant's data-encryption keys. Mints a new active DEK
+/// version per purpose and demotes the previous one to read-only; existing
+/// ciphertext stays readable (each envelope records its own version) while new
+/// writes seal under the new key. Fails closed (`KEY_UNAVAILABLE`) when
+/// encryption is disabled or no key catalog is configured.
+async fn rotate_tenant_dek(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    // Resolve the tenant first so rotation never mints keys for a ghost tenant.
+    let _ = s.runtime.get_tenant(&tid).await?;
+    s.runtime.rotate_tenant_dek(tid.as_str()).await?;
+    Ok(Json(serde_json::json!({
+        "tenant_id": tid.as_str(),
+        "rotated": true
+    })))
 }
 
 async fn delete_tenant(
