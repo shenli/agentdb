@@ -111,7 +111,6 @@ GET  /api/tenants/{tenant_id}/sessions/{session_id}/events
 POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
 POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
-GET  /api/tenants/{tenant_id}/sessions/{session_id}/subscribe
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 GET  /api/tenants/{tenant_id}/watch
 GET  /api/tenants/{tenant_id}/exports/watch
@@ -221,10 +220,9 @@ conflicts.
 `append-and-fetch` is the hot path for agent loops: write the current turn and
 return recent context in one request.
 
-## Replay, Subscribe, Watch, Context
+## Replay, Watch, Context
 
 - `replay` reconstructs a fork-aware event view.
-- `subscribe` returns an SSE replay snapshot from `from_seq`.
 - `watch` returns generalized tenant/session/agent changefeed items.
 - `context` builds a budgeted pack from recent events, searched records, and
   policy.
@@ -245,8 +243,7 @@ append / lifecycle / record mutation
              dashboard / supervisor / evaluator consumers
 ```
 
-The current subscribe endpoint is deterministic replay-style SSE. Long-held
-live push can be layered onto the same watch cursor model.
+Long-held live push can be layered onto the watch cursor model.
 
 ## Observability Export
 
@@ -394,7 +391,6 @@ indexes during startup. A preflight applies these defaults before hydration:
 | `AGENTDB_STARTUP_MAX_SESSIONS` | 250,000 | Sessions; session aliases |
 | `AGENTDB_STARTUP_MAX_ARTIFACTS` | 250,000 | Artifact metadata |
 | `AGENTDB_STARTUP_MAX_RECORDS` | 100,000 | Records; record-index outbox rows; record commit rows |
-| `AGENTDB_STARTUP_MAX_RECORD_EDGES` | 500,000 | Record edges |
 | `AGENTDB_STARTUP_MAX_EXPORT_CONSUMERS` | 10,000 | Managed export consumers |
 | `AGENTDB_STARTUP_MAX_TENANT_META` | 500,000 | Tenant metadata rows |
 | `AGENTDB_STARTUP_MAX_IDEMPOTENCY` | 1,000,000 | Idempotency rows |

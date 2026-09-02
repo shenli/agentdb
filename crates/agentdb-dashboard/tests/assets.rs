@@ -7,7 +7,6 @@ fn dashboard_targets_v2_session_surface() {
     assert!(index.contains("Session explorer"));
     assert!(app.contains("/events"));
     assert!(app.contains("/replay"));
-    assert!(app.contains("/subscribe"));
     assert!(app.contains("/records/search"));
     assert!(app.contains("/artifacts/"));
     assert!(app.contains("/storage"));

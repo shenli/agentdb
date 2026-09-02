@@ -59,7 +59,7 @@ canonical session ID without exposing `tenantId` to normal app code.
 - `Workspace.artifacts`, `Workspace.records`
 - `AgentHandle.session`, `AgentHandle.sessionById`
 - `SessionHandle.append`, `appendUser`, `modelMessage`, `toolCall`, `toolResult`, `contextPackBuilt`
-- `SessionHandle.fetch`, `fetchRecent`, `replay`, `materializeReplayPrefix`, `fork`, `subscribe`, `context`
+- `SessionHandle.fetch`, `fetchRecent`, `replay`, `materializeReplayPrefix`, `fork`, `context`
 - `SessionHandle.artifacts`, `records`
 - `eventRef`, `artifactRef`
 
@@ -67,7 +67,7 @@ The low-level tenant-scoped API remains available:
 
 - `Client.createTenant`, `createAgent`, `createSession`, `session`
 - `Session.append`, `appendAndFetch`, `fetch`, `fetchRecent`
-- `Session.replay`, `materializeReplayPrefix`, `fork`, `subscribe`, `context`
+- `Session.replay`, `materializeReplayPrefix`, `fork`, `context`
 - `Client.watch`
 - `Client.putArtifact`, `getArtifact`, `getArtifactBlob`
 - `Client.writeRecord`, `searchRecords`
@@ -107,7 +107,7 @@ const context = await session.context({
 
 const result = await session.agentStatus("recovered", { lastSeenSeq });
 
-for await (const event of session.subscribe({ fromSeq: lastSeenSeq + 1 })) {
+for (const event of await session.replay({ fromSeq: lastSeenSeq + 1 })) {
   handle(event);
 }
 ```
@@ -120,7 +120,6 @@ Concept mapping:
 | get events | `session.fetch(...)` |
 | append event | `session.append(...)` |
 | append and fetch | `session.appendAndFetch(...)` |
-| subscribe from sequence | `session.subscribe({ fromSeq })` |
 | fork session | `session.fork(...)` |
 | build context | `session.context(...)` |
 | workspace/session watch | `workspace.watch(...)` |

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use agentdb_core::record::{IndexingMode, IndexingPolicy, NewRecord, RecordStatus};
 use agentdb_core::runtime::{
     AckExportConsumerRequest, AppendRequest, CreateExportConsumerRequest, ExportWatchRequest,
-    NewRecordEdge, RecordEdgeType, RecordUpdate, Runtime, SearchRequest, WatchScope,
+    RecordUpdate, Runtime, SearchRequest, WatchScope,
 };
 use agentdb_core::tenant::NewTenant;
 use agentdb_core::{NewAgent, NewSession, RUNTIME_PRIMARY_TABLET_ID};
@@ -207,7 +207,7 @@ async fn runtime_raft_rs_replicates_record_memory_primitives() {
         })
         .await
         .unwrap();
-    let new = leader_runtime
+    let _new = leader_runtime
         .write_record(NewRecord {
             tenant_id: tenant.tenant_id.clone(),
             external_id: Some("memory-new".into()),
@@ -238,16 +238,6 @@ async fn runtime_raft_rs_replicates_record_memory_primitives() {
             policy: None,
             status: Some(RecordStatus::Superseded),
             expires_at_ms: None,
-        })
-        .await
-        .unwrap();
-    let edge = leader_runtime
-        .create_record_edge(NewRecordEdge {
-            tenant_id: tenant.tenant_id.clone(),
-            source_record_id: new.record_id.clone(),
-            target_record_id: old.record.record_id.clone(),
-            edge_type: RecordEdgeType::Supersedes,
-            metadata: serde_json::json!({"reason": "raft-test"}),
         })
         .await
         .unwrap();
@@ -292,11 +282,6 @@ async fn runtime_raft_rs_replicates_record_memory_primitives() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].record.record_id, old.record.record_id);
 
-    let edges = follower_runtime
-        .record_edges(&tenant.tenant_id, &old.record.record_id)
-        .await
-        .unwrap();
-    assert_eq!(edges, vec![edge]);
     let meta = follower_runtime
         .get_tenant_meta(&tenant.tenant_id, "db0.cursor")
         .await

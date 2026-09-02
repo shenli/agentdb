@@ -66,7 +66,7 @@ asyncio.run(main())
 - `Workspace.artifacts`, `Workspace.records`
 - `AgentHandle.session`, `AgentHandle.session_by_id`
 - `SessionHandle.append`, `append_user`, `model_message`, `tool_call`, `tool_result`, `context_pack_built`
-- `SessionHandle.fetch`, `fetch_recent`, `replay`, `materialize_replay_prefix`, `fork`, `subscribe`, `context`
+- `SessionHandle.fetch`, `fetch_recent`, `replay`, `materialize_replay_prefix`, `fork`, `context`
 - `SessionHandle.artifacts`, `records`
 - `event_ref`, `artifact_ref`
 
@@ -100,7 +100,7 @@ context = session.context(include=["recent_events", "records"])
 
 result = session.agent_status("recovered", last_seen_seq=last_seen_seq)
 
-for event in session.subscribe(from_seq=last_seen_seq + 1):
+for event in session.replay(from_seq=last_seen_seq + 1, limit=100):
     handle(event)
 ```
 
@@ -112,7 +112,6 @@ Concept mapping:
 | get events | `session.fetch(...)` |
 | append event | `session.append(...)` |
 | append and fetch | `session.append_and_fetch(...)` |
-| subscribe from sequence | `session.subscribe(from_seq=...)` |
 | fork session | `session.fork(...)` |
 | build context | `session.context(...)` |
 | workspace/session watch | `workspace.watch(...)` |

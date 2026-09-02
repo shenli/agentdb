@@ -219,7 +219,7 @@ GET    /api/tenants/{tenant_id}/sessions/{session_id}
 DELETE /api/tenants/{tenant_id}/sessions/{session_id}
 ```
 
-Events, replay, fork, subscribe, and context:
+Events, replay, fork, and context:
 
 ```text
 POST /api/tenants/{tenant_id}/sessions/{session_id}/events
@@ -228,7 +228,6 @@ POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
 POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
 POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix
-GET  /api/tenants/{tenant_id}/sessions/{session_id}/subscribe
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 GET  /api/tenants/{tenant_id}/watch
 GET  /api/tenants/{tenant_id}/exports/watch
@@ -435,9 +434,6 @@ POST   /api/tenants/{tenant_id}/records/{record_id}/touch
 DELETE /api/tenants/{tenant_id}/records/{record_id}
 GET    /api/tenants/{tenant_id}/records/search
 POST   /api/tenants/{tenant_id}/records/search
-POST   /api/tenants/{tenant_id}/records/edges
-GET    /api/tenants/{tenant_id}/records/{record_id}/edges
-DELETE /api/tenants/{tenant_id}/records/edges/{edge_id}
 GET    /api/tenants/{tenant_id}/meta/{key}
 PUT    /api/tenants/{tenant_id}/meta/{key}
 ```
@@ -495,8 +491,7 @@ read-after-write visibility. `GET /api/admin/indexes/records` returns
 local/global index watermarks, lag tokens, repair counters, and async apply
 failures.
 
-Record edges connect two records with an `edge_type` of `related`, `derived`,
-`contradicts`, `supports`, or `supersedes` plus optional metadata. Tenant meta
+Tenant meta
 is a small JSON KV surface for adapter cursors and runtime-local configuration,
 not a replacement for application tables.
 
@@ -589,7 +584,6 @@ SessionHandle / Session
   replay(from_seq=None, limit=100)
   materialize_replay_prefix(from_seq=None, limit=100)
   fork(child_session_id=None, at_seq=0, alias=None)
-  subscribe(from_seq=0, limit=100)
   context(max_events=None, max_bytes=None, include=None, record_query=None)
 ```
 
@@ -698,7 +692,6 @@ SessionHandle / Session
   replay(opts?)
   materializeReplayPrefix(opts?)
   fork(opts)
-  subscribe(opts?)
   context(opts?)
 ```
 

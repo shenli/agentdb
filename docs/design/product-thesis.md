@@ -179,7 +179,7 @@ Agent runtime queries cluster into a small set:
 - **Replay**: reconstruct a fork-aware event view.
 - **Scoped search**: find records or observations by tenant, namespace, scope,
   tags, metadata, and text/vector signals.
-- **Watch and subscribe**: follow changes for dashboards, supervisors, or test
+- **Watch**: follow changes for dashboards, supervisors, or test
   harnesses.
 - **Lifecycle and policy scans**: move sessions through retention and cleanup.
 
@@ -471,7 +471,7 @@ The missing pieces are less about bytes and more about semantics:
 3. Fork-aware replay.
 4. Unified tenant policy and cleanup.
 5. Durable artifact references tied to events.
-6. Watch and subscribe behavior for supervisors and dashboards.
+6. Watch behavior for supervisors and dashboards.
 7. SDK ergonomics that make the session path natural.
 
 AgentDB should earn its place by solving these cleanly.

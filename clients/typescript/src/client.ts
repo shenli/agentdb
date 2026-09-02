@@ -1,5 +1,4 @@
-import { AgentDBError, SubscriptionClosed, fromResponse } from "./errors.js";
-import { parseSse } from "./sse.js";
+import { AgentDBError, fromResponse } from "./errors.js";
 import {
   SessionEventKind,
   agentStatus,
@@ -128,11 +127,6 @@ export interface ContextPackBuiltOptions {
 
 export interface SessionOptions {
   agentId?: AgentId;
-}
-
-export interface SubscribeOptions {
-  fromSeq?: number;
-  limit?: number;
 }
 
 export interface ClientSubscribeOptions {
@@ -426,10 +420,6 @@ export class SessionHandle {
     return new SessionHandle(this.workspace, await this.session.fork(opts), this.opts);
   }
 
-  subscribe(opts: SubscribeOptions = {}): AsyncIterable<Event> {
-    return this.session.subscribe(opts);
-  }
-
   async context(opts: { maxEvents?: number; maxBytes?: number; include?: string[]; recordQuery?: Record<string, unknown> } = {}): Promise<Record<string, unknown>> {
     return await this.session.context(opts);
   }
@@ -602,10 +592,6 @@ export class Client {
     if (opts.fromCursor) url.searchParams.set("from_cursor", opts.fromCursor);
     const data = await this._requestAbsolute("GET", url);
     return Array.isArray(data) ? data.map(watchItemFromDict) : [];
-  }
-
-  async *subscribe(_opts: ClientSubscribeOptions = {}): AsyncIterable<Event> {
-    throw new Error("tenant-wide streaming requires watch(tenantId, ...)");
   }
 
   async _request(method: string, path: string, json?: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
@@ -874,24 +860,6 @@ export class Session {
       ...body,
     });
     return new Session(this._client, this.tenantId, String(d.session_id), { agentId: String(d.agent_id) });
-  }
-
-  async *subscribe(opts: SubscribeOptions = {}): AsyncIterable<Event> {
-    const url = new URL(`${this._client.baseUrl}/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/subscribe`);
-    url.searchParams.set("from_seq", String(opts.fromSeq ?? 0));
-    url.searchParams.set("limit", String(opts.limit ?? 100));
-    const resp = await this._client._fetchUrl(url, { headers: { Accept: "text/event-stream" } });
-    if (!resp.ok) throw await errorFrom(resp);
-    if (!resp.body) throw new AgentDBError("subscribe response has no body", { statusCode: resp.status });
-    const reader = resp.body.getReader();
-    try {
-      for await (const frame of parseSse(reader)) {
-        if (frame.event === "error") throw new SubscriptionClosed("error");
-        if (frame.data) yield eventFromDict(JSON.parse(frame.data));
-      }
-    } finally {
-      try { reader.releaseLock(); } catch {}
-    }
   }
 
   async context(opts: { maxEvents?: number; maxBytes?: number; include?: string[]; recordQuery?: Record<string, unknown> } = {}): Promise<Record<string, unknown>> {

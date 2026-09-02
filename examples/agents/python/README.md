@@ -139,8 +139,8 @@ The smoke script runs:
   `source_refs`.
 - **`put_artifact(...)` + `artifact_refs`** — keep large tool outputs
   out of inline event payloads while preserving provenance.
-- **`replay(from_seq=...)` / `subscribe(from_seq=...)`** — recover an
-  agent harness after restart and resume without gaps.
+- **`replay(from_seq=...)`** — recover an agent harness after restart
+  and resume without gaps.
 
 ## Customize
 

@@ -93,7 +93,7 @@ async fn append_payload(
 }
 
 #[tokio::test]
-async fn fork_replay_and_subscribe_snapshot_work_over_http() {
+async fn fork_replay_snapshot_works_over_http() {
     let app = spawn_app().await;
     let (tid, aid, sid) = seed(&app).await;
     append(&app, &tid, &aid, &sid, "parent", 0).await;
@@ -173,25 +173,6 @@ async fn fork_replay_and_subscribe_snapshot_work_over_http() {
         .await
         .unwrap();
     assert_eq!(replay_after_prefix["materialized_prefix"], true);
-
-    let sse = app
-        .client
-        .get(format!(
-            "{}/api/tenants/{tid}/sessions/{sid}/subscribe?from_seq=1",
-            app.base
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(sse.contains("event: event"));
-    assert!(sse.contains("\"seq\":1"));
-    assert!(sse.contains("\"seq\":2"));
-    assert!(!sse.contains("\"seq\":0"));
 }
 
 #[tokio::test]

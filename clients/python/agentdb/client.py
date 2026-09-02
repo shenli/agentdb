@@ -10,7 +10,6 @@ from typing import Any, Callable, Iterator, List, Optional, Sequence
 import requests
 
 from ._secrets import validate_no_raw_secret_fields
-from ._sse import parse_lines
 from .conventions import (
     SessionEventKind,
     agent_status as agent_status_payload,
@@ -20,7 +19,7 @@ from .conventions import (
     tool_result as tool_result_payload,
     user_message as user_message_payload,
 )
-from .errors import AgentDBError, SubscriptionClosed, from_response
+from .errors import AgentDBError, from_response
 
 TenantId = str
 AgentId = str
@@ -541,9 +540,6 @@ class SessionHandle:
     def fork(self, child_session_id: Optional[str] = None, **kwargs: Any) -> "SessionHandle":
         return SessionHandle(self.workspace, self._session.fork(child_session_id, **kwargs), agent=self.agent)
 
-    def subscribe(self, **kwargs: Any) -> Iterator[Event]:
-        return self._session.subscribe(**kwargs)
-
     def context(self, **kwargs: Any) -> dict:
         return self._session.context(**kwargs)
 
@@ -986,26 +982,6 @@ class Session:
     def fetch_recent(self, *, last_n: int = 10) -> List[Event]:
         events = self.fetch(from_seq=0, limit=1000)
         return [] if last_n <= 0 else events[-last_n:]
-
-    def subscribe(self, *, from_seq: int = 0, limit: int = 100) -> Iterator[Event]:
-        resp = self._client._raw_request(
-            "GET",
-            f"/api/tenants/{_quote(self.tenant_id)}/sessions/{_quote(self.session_id)}/subscribe",
-            params={"from_seq": str(from_seq), "limit": str(limit)},
-            stream=True,
-            headers={"Accept": "text/event-stream"},
-        )
-        try:
-            if resp.status_code != 200:
-                raise from_response(resp.status_code, _response_body(resp))
-            for frame in parse_lines(resp.iter_lines(decode_unicode=True)):
-                if frame.event == "error":
-                    body = jsonlib.loads(frame.data) if frame.data else {}
-                    raise SubscriptionClosed(body.get("error", "unknown"), last_seq=body.get("last_seq"))
-                if frame.data:
-                    yield Event.from_dict(jsonlib.loads(frame.data))
-        finally:
-            resp.close()
 
     def context(
         self,

@@ -69,7 +69,7 @@ AgentDB has both the runtime watch surface and the durable export surface:
 - `GET /api/tenants/{tenant_id}/watch` returns `ChangefeedItem` values.
 - Watch supports tenant, agent, and session scope.
 - Watch uses a resume cursor and a result limit.
-- `subscribe` and `replay` cover session-local event recovery.
+- `replay` covers session-local event recovery.
 - Records already have a durable outbox-like path for async global indexing.
 - Architecture docs already treat watch/changefeed cursors as a dashboard and
   supervisor primitive.

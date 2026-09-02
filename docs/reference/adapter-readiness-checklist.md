@@ -78,7 +78,7 @@ Every adapter should include at least one smoke test with this shape:
 11. Simulate harness restart by rebuilding the session handle from IDs.
 12. Replay or fetch durable history.
 13. Append `agent_status: recovered` with `last_seen_seq`.
-14. Subscribe or watch from `last_seen_seq + 1`.
+14. Watch from `last_seen_seq + 1`.
 15. Run `validate_adapter_events` / `validateAdapterEvents` on the recorded
     sequence and require no warnings.
 

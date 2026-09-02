@@ -897,39 +897,6 @@ pub struct RecordUpdate {
     pub expires_at_ms: Option<Option<u64>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordEdgeType {
-    Related,
-    Derived,
-    Contradicts,
-    Supports,
-    Supersedes,
-}
-
-#[derive(Debug, Clone)]
-pub struct NewRecordEdge {
-    pub tenant_id: Id,
-    pub source_record_id: Id,
-    pub target_record_id: Id,
-    pub edge_type: RecordEdgeType,
-    pub metadata: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RecordEdge {
-    pub edge_id: Id,
-    pub tenant_id: Id,
-    pub source_record_id: Id,
-    pub target_record_id: Id,
-    pub edge_type: RecordEdgeType,
-    #[serde(default)]
-    pub metadata: serde_json::Value,
-    pub created_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deleted_at_ms: Option<u64>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TenantMetaEntry {
     pub tenant_id: Id,
@@ -977,8 +944,6 @@ struct State {
     records: BTreeMap<String, SearchableRecord>,
     /// Tenant-local uniqueness map for caller-stable record external ids.
     record_external_ids: BTreeMap<String, String>,
-    /// Record graph edges keyed by edge_id.
-    record_edges: BTreeMap<String, RecordEdge>,
     /// Tenant-scoped small metadata KV, keyed as `{tenant_id}::{key}`.
     tenant_meta: BTreeMap<String, TenantMetaEntry>,
     /// Reverse mapping `DocId -> record_id_str`. Search hits come back
@@ -2227,7 +2192,7 @@ fn movement_scratch_root(
     Ok(root)
 }
 
-fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 14] {
+fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 13] {
     [
         (
             "tenants",
@@ -2278,11 +2243,6 @@ fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 14] 
             "record index commits",
             b"record/searchable_commit/".as_slice(),
             startup_hydration_limit("AGENTDB_STARTUP_MAX_RECORDS", 100_000),
-        ),
-        (
-            "record edges",
-            b"record/searchable_edge/".as_slice(),
-            startup_hydration_limit("AGENTDB_STARTUP_MAX_RECORD_EDGES", 500_000),
         ),
         (
             "managed export consumers",
@@ -2395,16 +2355,6 @@ fn hydrate_runtime_from_persist(
             ),
             consumer,
         );
-    }
-    for edge in persist
-        .scan_all_record_edges()
-        .expect("hydrate record edges")
-    {
-        if edge.deleted_at_ms.is_none() {
-            state
-                .record_edges
-                .insert(edge.edge_id.as_str().to_string(), edge);
-        }
     }
     for entry in persist.scan_all_tenant_meta().expect("hydrate tenant meta") {
         state
@@ -4447,7 +4397,6 @@ impl Runtime {
             return Ok(());
         };
         let consumers = persist.scan_all_export_consumers().map_err(internal)?;
-        let edges = persist.scan_all_record_edges().map_err(internal)?;
         let meta = persist.scan_all_tenant_meta().map_err(internal)?;
         {
             let mut s = self.state.lock().await;
@@ -4470,13 +4419,6 @@ impl Runtime {
                     ),
                     consumer,
                 );
-            }
-            s.record_edges.clear();
-            for edge in edges {
-                if edge.deleted_at_ms.is_none() {
-                    s.record_edges
-                        .insert(edge.edge_id.as_str().to_string(), edge);
-                }
             }
             s.tenant_meta.clear();
             for entry in meta {
@@ -11105,133 +11047,6 @@ impl Runtime {
             .collect())
     }
 
-    pub async fn create_record_edge(&self, req: NewRecordEdge) -> Result<RecordEdge> {
-        self.refresh_replicated_state().await?;
-        self.ensure_tenant_cached(&req.tenant_id).await?;
-        self.ensure_record_cached(&req.tenant_id, &req.source_record_id)
-            .await?;
-        self.ensure_record_cached(&req.tenant_id, &req.target_record_id)
-            .await?;
-        let edge = {
-            let s = self.state.lock().await;
-            let tenant_live = s
-                .tenants
-                .get(req.tenant_id.as_str())
-                .is_some_and(|t| t.deleted_at_ms.is_none());
-            if !tenant_live {
-                return Err(Error::new(
-                    ErrorCode::TenantNotFound,
-                    format!("{}", req.tenant_id),
-                ));
-            }
-            for record_id in [&req.source_record_id, &req.target_record_id] {
-                let live = s.records.get(record_id.as_str()).is_some_and(|r| {
-                    r.tenant_id.as_str() == req.tenant_id.as_str()
-                        && r.deleted_at_ms.is_none()
-                        && !r.is_expired()
-                });
-                if !live {
-                    return Err(Error::new(
-                        ErrorCode::RecordNotFound,
-                        format!("{}", record_id),
-                    ));
-                }
-            }
-            RecordEdge {
-                edge_id: Id::new(IdKind::RecordEdge),
-                tenant_id: req.tenant_id,
-                source_record_id: req.source_record_id,
-                target_record_id: req.target_record_id,
-                edge_type: req.edge_type,
-                metadata: req.metadata,
-                created_at_ms: crate::now_ms(),
-                deleted_at_ms: None,
-            }
-        };
-        if let Some(p) = &self.persist {
-            p.put_record_edge(&edge).map_err(internal)?;
-        }
-        let mut s = self.state.lock().await;
-        s.record_edges
-            .insert(edge.edge_id.as_str().to_string(), edge.clone());
-        Ok(edge)
-    }
-
-    pub async fn record_edges(&self, tenant_id: &Id, record_id: &Id) -> Result<Vec<RecordEdge>> {
-        self.refresh_replicated_state().await?;
-        self.ensure_tenant_cached(tenant_id).await?;
-        self.ensure_record_cached(tenant_id, record_id).await?;
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        if !tenant_live {
-            return Err(Error::new(
-                ErrorCode::TenantNotFound,
-                format!("{}", tenant_id),
-            ));
-        }
-        let record_live = s.records.get(record_id.as_str()).is_some_and(|r| {
-            r.tenant_id.as_str() == tenant_id.as_str()
-                && r.deleted_at_ms.is_none()
-                && !r.is_expired()
-        });
-        if !record_live {
-            return Err(Error::new(
-                ErrorCode::RecordNotFound,
-                format!("{}", record_id),
-            ));
-        }
-        let mut edges = s
-            .record_edges
-            .values()
-            .filter(|edge| {
-                edge.tenant_id.as_str() == tenant_id.as_str()
-                    && edge.deleted_at_ms.is_none()
-                    && (edge.source_record_id.as_str() == record_id.as_str()
-                        || edge.target_record_id.as_str() == record_id.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        edges.sort_by(|a, b| {
-            a.created_at_ms
-                .cmp(&b.created_at_ms)
-                .then_with(|| a.edge_id.as_str().cmp(b.edge_id.as_str()))
-        });
-        Ok(edges)
-    }
-
-    pub async fn delete_record_edge(&self, tenant_id: &Id, edge_id: &Id) -> Result<()> {
-        self.refresh_replicated_state().await?;
-        self.ensure_tenant_cached(tenant_id).await?;
-        let mut s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        if !tenant_live {
-            return Err(Error::new(
-                ErrorCode::TenantNotFound,
-                format!("{}", tenant_id),
-            ));
-        }
-        let mut edge = s
-            .record_edges
-            .get(edge_id.as_str())
-            .filter(|edge| {
-                edge.tenant_id.as_str() == tenant_id.as_str() && edge.deleted_at_ms.is_none()
-            })
-            .cloned()
-            .ok_or_else(|| Error::new(ErrorCode::RecordNotFound, format!("{}", edge_id)))?;
-        edge.deleted_at_ms = Some(crate::now_ms());
-        if let Some(p) = &self.persist {
-            p.put_record_edge(&edge).map_err(internal)?;
-        }
-        s.record_edges.remove(edge_id.as_str());
-        Ok(())
-    }
-
     pub async fn set_tenant_meta(
         &self,
         tenant_id: &Id,
@@ -13554,33 +13369,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_edges_and_tenant_meta_are_persisted() {
+    async fn tenant_meta_is_persisted() {
         let kv = Arc::new(InMemoryKvStore::new());
         let content = Arc::new(InMemoryContentBackend::default());
         let rt = Runtime::with_kv(kv.clone(), content.clone());
         let (tenant, _, _) = rt.bootstrap_test_session().await;
-        let left = rt
-            .write_record(test_record(tenant.tenant_id.clone(), Some("left"), "left"))
-            .await
-            .unwrap();
-        let right = rt
-            .write_record(test_record(
-                tenant.tenant_id.clone(),
-                Some("right"),
-                "right",
-            ))
-            .await
-            .unwrap();
-        let edge = rt
-            .create_record_edge(NewRecordEdge {
-                tenant_id: tenant.tenant_id.clone(),
-                source_record_id: left.record_id.clone(),
-                target_record_id: right.record_id.clone(),
-                edge_type: RecordEdgeType::Supersedes,
-                metadata: serde_json::json!({"reason": "test"}),
-            })
-            .await
-            .unwrap();
         rt.set_tenant_meta(
             &tenant.tenant_id,
             "db0.cursor",
@@ -13590,11 +13383,6 @@ mod tests {
         .unwrap();
 
         let restarted = Runtime::with_kv(kv, content);
-        let edges = restarted
-            .record_edges(&tenant.tenant_id, &left.record_id)
-            .await
-            .unwrap();
-        assert_eq!(edges, vec![edge]);
         let meta = restarted
             .get_tenant_meta(&tenant.tenant_id, "db0.cursor")
             .await

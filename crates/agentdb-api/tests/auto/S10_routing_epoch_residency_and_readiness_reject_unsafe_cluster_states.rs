@@ -7,11 +7,15 @@
 #[path = "../common/mod.rs"]
 mod common;
 
-use common::spawn_app;
+use agentdb_api::AppState;
+use agentdb_core::Runtime;
+use common::spawn_app_with_state;
 
 #[tokio::test]
 async fn routing_epoch_residency_and_readiness_reject_unsafe_cluster_states() {
-    let app = spawn_app().await;
+    // The cluster/health route is mounted only in cluster mode; the handler
+    // still reports the disabled/single-node state when routing is unconfigured.
+    let app = spawn_app_with_state(AppState::new(Runtime::in_memory())).await;
     let ready = app
         .client
         .get(format!("{}/health/ready", app.base))
