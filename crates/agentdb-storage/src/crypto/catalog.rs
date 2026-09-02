@@ -313,6 +313,40 @@ impl CatalogKeyProvider {
         self.catalog.revoke_tenant(tenant_id, destroy)
     }
 
+    /// Retire every **read-only** DEK version of `(tenant, purpose)` whose version
+    /// number is NOT in `versions_in_use`, marking it [`DekStatus::Retired`] so it
+    /// can never decrypt again.
+    ///
+    /// SAFETY: the caller MUST have scanned *all* of this purpose's stored objects
+    /// so `versions_in_use` is the complete set of versions still referenced —
+    /// retiring a version that still has data would make that data unreadable.
+    /// This method only ever touches read-only (already-rotated-away) versions and
+    /// never the active one, and it double-checks `versions_in_use`, so a version
+    /// with any observed reference is left alone. Returns the count retired.
+    pub fn retire_drained_versions(
+        &self,
+        tenant_id: &str,
+        purpose: KeyPurpose,
+        versions_in_use: &[u32],
+    ) -> Result<usize, CryptoError> {
+        let mut count = 0;
+        for mut record in self.catalog.scan_records()? {
+            if record.tenant_id != tenant_id || parse_purpose(&record.purpose)? != purpose {
+                continue;
+            }
+            if record.status != DekStatus::ReadOnly {
+                continue; // only demoted versions are eligible
+            }
+            if versions_in_use.contains(&record.version) {
+                continue; // still referenced — keep it readable
+            }
+            record.status = DekStatus::Retired;
+            self.catalog.put_record(&record)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Rotate the active DEK for `(tenant, purpose)`: mint a fresh key at the
     /// next version, make it active (new writes seal under it), and demote the
     /// previous active version to [`DekStatus::ReadOnly`] so it still decrypts
@@ -791,6 +825,46 @@ mod tests {
         assert!(cat.active_version("ten_a", KeyPurpose::Content).unwrap().is_none());
         // Idempotent: shredding again affects nothing.
         assert_eq!(provider.revoke_tenant("ten_a", true).unwrap(), 0);
+    }
+
+    #[test]
+    fn retire_drained_versions_respects_versions_in_use() {
+        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+        let p = provider(kv.clone());
+        let cat = KeyCatalog::new(kv);
+        // v1 active, then rotate → v2 active, v1 read_only.
+        p.active_dek("ten_a", KeyPurpose::Content).unwrap();
+        p.rotate("ten_a", KeyPurpose::Content).unwrap();
+
+        // v1 is reported still in use → NOT retired.
+        assert_eq!(
+            p.retire_drained_versions("ten_a", KeyPurpose::Content, &[1, 2]).unwrap(),
+            0
+        );
+        assert_eq!(
+            cat.get_record("ten_a", KeyPurpose::Content, 1).unwrap().unwrap().status,
+            DekStatus::ReadOnly
+        );
+
+        // Now only v2 is in use → v1 (drained, read-only) is retired.
+        assert_eq!(
+            p.retire_drained_versions("ten_a", KeyPurpose::Content, &[2]).unwrap(),
+            1
+        );
+        assert_eq!(
+            cat.get_record("ten_a", KeyPurpose::Content, 1).unwrap().unwrap().status,
+            DekStatus::Retired
+        );
+        // The active version is never retired.
+        assert_eq!(
+            cat.get_record("ten_a", KeyPurpose::Content, 2).unwrap().unwrap().status,
+            DekStatus::Active
+        );
+        // Idempotent: nothing left to retire.
+        assert_eq!(
+            p.retire_drained_versions("ten_a", KeyPurpose::Content, &[2]).unwrap(),
+            0
+        );
     }
 
     #[test]
