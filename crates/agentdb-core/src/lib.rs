@@ -52,7 +52,7 @@ pub use runtime::{
     MetadataFilterOp, NewRecordEdge, NewSnapshotRef, PolicyWorkerReport, RecordEdge,
     RecordEdgeType, RecordIndexStats, RecordSearchMatch, RecordSearchScoreComponents, RecordUpdate,
     ReplayResponse, Runtime, SessionStorageSummary, SnapshotResolution, TenantKeyProvisioner,
-    TenantKeyRotator, TenantMetaEntry,
+    TenantKeyRevoker, TenantKeyRotator, TenantMetaEntry,
     TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope, RUNTIME_PRIMARY_TABLET_ID,
     SYSTEM_TENANT_EXTERNAL_KEY, SYSTEM_TENANT_ID,
 };

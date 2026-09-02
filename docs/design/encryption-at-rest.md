@@ -260,15 +260,32 @@ under the active DEK so a retired version can eventually be dropped (crypto-shre
 / key hygiene); it is a separate milestone because it is not needed for rotation
 correctness, only for retiring old keys.
 
+**Milestone 16 (landed): two-phase revocation / crypto-shred.** A tenant's DEKs
+can be revoked on demand, in two strengths. A **soft** revoke marks every
+version `revoked`, so the serve path refuses to unwrap it and the tenant's
+encrypted data is immediately unreadable — but the wrapped bytes remain, so it is
+reversible. A **crypto-shred** (`destroy = true`) deletes the wrapped key
+material outright, so the data can never be decrypted again (irreversible; the
+KEK-independent counterpart to the M6 "lose the KEK" shred, scoped to one
+tenant). Both backends implement it — single-node `CatalogKeyProvider::revoke_tenant`
+(KV catalog) and cluster `MetaCatalogKeyProvider::revoke_tenant` (meta catalog) —
+and the cluster refresh/load now **skips non-readable rows**, so a soft revoke
+stays effective after a reload and the periodic refresh never resurrects a
+revoked key. A `TenantKeyRevoker` runtime hook (installed like the M15 rotator)
+exposes `Runtime::revoke_tenant_dek(tenant, destroy)`, which invalidates the
+keyring cache afterwards; the admin endpoint `POST /api/admin/tenants/{id}/revoke-dek`
+(`?destroy=true` for a shred) drives it. Tests cover soft-revoke-then-shred at
+every layer, including that a freshly-loaded cluster node will not serve a
+revoked key.
+
 **Not yet done:** the background DEK re-encryption walk
-(rewriting old-version ciphertext so a version can be retired) and a rotation
-CLI; and the
+(rewriting old-version ciphertext so a rotated-away version can be retired) and a
+rotation/revocation CLI; and the
 `LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
-Agent/session/tenant records, searchable records, and skills are still plaintext
-(records are additionally entangled with the export ledger + search index).
-Event AAD binds tenant + session + kind (not yet the per-event seq). Two-phase
-revocation/crypto-shred beyond the catalog `status` field, and dedicated-domain
-placement enforcement, remain.
+Agent/session/tenant primary records, searchable records, and skills are still
+plaintext at rest (their export-ledger copies are already encrypted; the search
+index is in-memory, not at rest). Event AAD binds tenant + session + kind (not
+yet the per-event seq). Dedicated-domain placement enforcement remains.
 
 The pre-existing seams remain as the integration points those stages build on:
 

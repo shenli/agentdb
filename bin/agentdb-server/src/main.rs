@@ -487,12 +487,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     None
                 }
             };
-            // The rotator is the same provider; keep a handle to install on the
-            // runtime after it is built (the admin rotate-DEK path uses it).
-            let cluster_rotator = cluster_crypto.as_ref().map(|(_, _, r)| Arc::clone(r));
+            // The rotator/revoker are the same provider; keep handles to install
+            // on the runtime after it is built (the admin key-management paths).
+            let cluster_rotator = cluster_crypto.as_ref().map(|(_, _, r, _)| Arc::clone(r));
+            let cluster_revoker = cluster_crypto.as_ref().map(|(_, _, _, rv)| Arc::clone(rv));
             let runtime = match config.tablet_store_layout {
                 TabletStoreLayoutKind::PrefixScoped => match cluster_crypto {
-                    Some((keyring, provisioner, _rotator)) => {
+                    Some((keyring, provisioner, _rotator, _revoker)) => {
                         agentdb_core::Runtime::with_kv_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
                             kv,
                             content,
@@ -541,7 +542,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         "opened grouped RocksDB tablet-store lifecycle"
                     );
                     match cluster_crypto {
-                        Some((keyring, provisioner, _rotator)) => {
+                        Some((keyring, provisioner, _rotator, _revoker)) => {
                             agentdb_core::Runtime::with_tablet_store_lifecycle_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
                                 lifecycle,
                                 content,
@@ -565,13 +566,17 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             if let Some(rotator) = cluster_rotator {
                 runtime.set_key_rotator(rotator);
             }
+            if let Some(revoker) = cluster_revoker {
+                runtime.set_key_revoker(revoker);
+            }
             (runtime, content_mirror)
         } else {
             let runtime = match build_encryption_keyring(&kv)? {
-                Some((keyring, rotator)) => {
+                Some((keyring, admin)) => {
                     let rt =
                         agentdb_core::Runtime::with_kv_content_and_keyring(kv, content, keyring);
-                    rt.set_key_rotator(rotator);
+                    rt.set_key_rotator(admin.clone());
+                    rt.set_key_revoker(admin);
                     rt
                 }
                 None => agentdb_core::Runtime::with_kv(kv, content),
@@ -1953,11 +1958,13 @@ impl RaftSnapshotObjectStore {
 /// lives in `kv` under the reserved control-plane prefix. Fails closed if
 /// envelope mode is requested without a KEK secret, rather than silently storing
 /// plaintext.
-/// The single-node keyring plus its admin-path key rotator, over the KV-backed
-/// wrapped-DEK catalog. Both wrap the one `CatalogKeyProvider`.
+/// The single-node keyring plus its admin-path key manager (rotate + revoke),
+/// over the KV-backed wrapped-DEK catalog. Both wrap the one
+/// `CatalogKeyProvider`; the `CatalogKeyAdmin` implements both the
+/// `TenantKeyRotator` and `TenantKeyRevoker` hooks.
 type SingleNodeKeyring = (
     Arc<dyn agentdb_storage::EnvelopeCrypto>,
-    Arc<dyn agentdb_core::TenantKeyRotator>,
+    Arc<agentdb_api::dek_provider::CatalogKeyAdmin>,
 );
 
 fn build_encryption_keyring(
@@ -2011,13 +2018,12 @@ fn keyring_from_settings(
                 suite,
                 agentdb_storage::DekCacheConfig::default(),
             );
-            let rotator: Arc<dyn agentdb_core::TenantKeyRotator> =
-                Arc::new(agentdb_api::dek_provider::CatalogKeyRotator::new(provider));
+            let admin = Arc::new(agentdb_api::dek_provider::CatalogKeyAdmin::new(provider));
             tracing::info!(
                 suite = suite.as_str(),
                 "tenant envelope encryption enabled (wrapped-DEK catalog + local KEK)"
             );
-            Ok(Some((Arc::new(keyring), rotator)))
+            Ok(Some((Arc::new(keyring), admin)))
         }
         other => {
             anyhow::bail!("unknown AGENTDB_ENCRYPTION_MODE {other:?} (expected disabled|envelope)")
@@ -2074,6 +2080,7 @@ async fn build_cluster_keyring_and_provisioner(
         Arc<dyn agentdb_storage::EnvelopeCrypto>,
         Arc<dyn agentdb_core::TenantKeyProvisioner>,
         Arc<dyn agentdb_core::TenantKeyRotator>,
+        Arc<dyn agentdb_core::TenantKeyRevoker>,
     )>,
 > {
     let Some((kek, suite)) = encryption_kek_and_suite()? else {
@@ -2113,12 +2120,13 @@ async fn build_cluster_keyring_and_provisioner(
             agentdb_storage::DekCacheConfig::default(),
         ));
     let provisioner: Arc<dyn agentdb_core::TenantKeyProvisioner> = provider.clone();
-    let rotator: Arc<dyn agentdb_core::TenantKeyRotator> = provider;
+    let rotator: Arc<dyn agentdb_core::TenantKeyRotator> = provider.clone();
+    let revoker: Arc<dyn agentdb_core::TenantKeyRevoker> = provider;
     tracing::info!(
         suite = suite.as_str(),
         "cluster tenant envelope encryption enabled (shared meta-DB key catalog + local KEK)"
     );
-    Ok(Some((keyring, provisioner, rotator)))
+    Ok(Some((keyring, provisioner, rotator, revoker)))
 }
 
 fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<ContentBackendBundle> {

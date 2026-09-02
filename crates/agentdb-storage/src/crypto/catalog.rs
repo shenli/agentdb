@@ -175,6 +175,46 @@ impl KeyCatalog {
         Ok(count)
     }
 
+    /// Revoke all of a tenant's DEKs across every purpose and version.
+    ///
+    /// With `destroy = false` this is a **soft** revoke: every version is marked
+    /// [`DekStatus::Revoked`], so the serve path refuses to unwrap it and the
+    /// tenant's data is immediately unreadable — but the wrapped bytes remain, so
+    /// an operator could flip the status back. With `destroy = true` this is a
+    /// **crypto-shred**: every version record and the active-version pointers are
+    /// deleted, destroying the wrapped key material so the tenant's encrypted
+    /// data can never be decrypted again (irreversible). Returns the number of
+    /// DEK versions affected. Idempotent (a re-run on an already-shredded tenant
+    /// affects nothing).
+    pub fn revoke_tenant(&self, tenant_id: &str, destroy: bool) -> Result<usize, CryptoError> {
+        let mut purposes = std::collections::HashSet::new();
+        let mut count = 0;
+        for mut record in self.scan_records()? {
+            if record.tenant_id != tenant_id {
+                continue;
+            }
+            let purpose = parse_purpose(&record.purpose)?;
+            if destroy {
+                self.kv
+                    .delete(&record_key(tenant_id, purpose, record.version))
+                    .map_err(|e| CryptoError::Config(format!("key catalog delete: {e}")))?;
+            } else if record.status != DekStatus::Revoked {
+                record.status = DekStatus::Revoked;
+                self.put_record(&record)?;
+            }
+            purposes.insert(purpose);
+            count += 1;
+        }
+        if destroy {
+            for purpose in purposes {
+                self.kv
+                    .delete(&active_key(tenant_id, purpose))
+                    .map_err(|e| CryptoError::Config(format!("key catalog delete: {e}")))?;
+            }
+        }
+        Ok(count)
+    }
+
     /// Persist a record and, if it is `Active`, point the active version at it.
     fn put_record(&self, record: &DekRecord) -> Result<(), CryptoError> {
         let purpose = parse_purpose(&record.purpose)?;
@@ -265,6 +305,12 @@ impl CatalogKeyProvider {
             }
         }
         Ok(self.generate_active(tenant_id, purpose)?.metadata().clone())
+    }
+
+    /// Revoke (or crypto-shred, when `destroy`) all of a tenant's DEKs. See
+    /// [`KeyCatalog::revoke_tenant`]. Returns the number of versions affected.
+    pub fn revoke_tenant(&self, tenant_id: &str, destroy: bool) -> Result<usize, CryptoError> {
+        self.catalog.revoke_tenant(tenant_id, destroy)
     }
 
     /// Rotate the active DEK for `(tenant, purpose)`: mint a fresh key at the
@@ -686,6 +732,65 @@ mod tests {
                 .version,
             1
         );
+    }
+
+    #[test]
+    fn revoke_tenant_soft_then_shred() {
+        use crate::crypto::{
+            AeadTenantKeyring, CryptoContext, DekCacheConfig, EnvelopeCrypto, Suite,
+        };
+
+        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+        let ctx = CryptoContext {
+            tenant_id: "ten_a",
+            purpose: KeyPurpose::Content,
+            object_kind: "event",
+            object_id: "o1",
+        };
+        let provider = Arc::new(provider(kv.clone()));
+        let keyring = AeadTenantKeyring::new(
+            provider.clone(),
+            Suite::XChaCha20Poly1305,
+            DekCacheConfig::default(),
+        );
+
+        // Seal under v1, rotate to v2 (so there are two versions to revoke).
+        let sealed = keyring.seal(&ctx, b"payload").unwrap();
+        provider.rotate("ten_a", KeyPurpose::Content).unwrap();
+
+        // Soft revoke: both versions marked Revoked; nothing served, old
+        // ciphertext no longer opens — but the records still exist.
+        assert_eq!(provider.revoke_tenant("ten_a", false).unwrap(), 2);
+        assert!(provider.active_dek("ten_a", KeyPurpose::Content).is_err());
+        // A fresh keyring (no cached lease) can no longer open the v1 blob.
+        let keyring2 = AeadTenantKeyring::new(
+            provider.clone(),
+            Suite::XChaCha20Poly1305,
+            DekCacheConfig::default(),
+        );
+        assert!(keyring2.open(&ctx, &sealed).is_err());
+        let cat = KeyCatalog::new(kv.clone());
+        assert_eq!(
+            cat.get_record("ten_a", KeyPurpose::Content, 1)
+                .unwrap()
+                .unwrap()
+                .status,
+            DekStatus::Revoked
+        );
+
+        // Crypto-shred: the version records and active pointer are gone.
+        assert_eq!(provider.revoke_tenant("ten_a", true).unwrap(), 2);
+        assert!(cat
+            .get_record("ten_a", KeyPurpose::Content, 1)
+            .unwrap()
+            .is_none());
+        assert!(cat
+            .get_record("ten_a", KeyPurpose::Content, 2)
+            .unwrap()
+            .is_none());
+        assert!(cat.active_version("ten_a", KeyPurpose::Content).unwrap().is_none());
+        // Idempotent: shredding again affects nothing.
+        assert_eq!(provider.revoke_tenant("ten_a", true).unwrap(), 0);
     }
 
     #[test]

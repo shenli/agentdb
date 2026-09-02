@@ -152,6 +152,28 @@ pub async fn set_status(
     Ok(result.rows_affected() > 0)
 }
 
+/// Revoke every DEK for a tenant across all purposes and versions.
+///
+/// `destroy = false` is a soft revoke: all rows get `status = 'revoked'`, so the
+/// serve path refuses them while the wrapped bytes remain (reversible).
+/// `destroy = true` is a crypto-shred: the rows are deleted, destroying the
+/// wrapped key material so the tenant's encrypted data can never be decrypted
+/// again (irreversible). Returns the number of rows affected.
+pub async fn revoke_tenant(pool: &AnyPool, tenant_id: &str, destroy: bool) -> MetaResult<u64> {
+    let result = if destroy {
+        sqlx::query("DELETE FROM dek_catalog WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .execute(pool)
+            .await?
+    } else {
+        sqlx::query("UPDATE dek_catalog SET status = 'revoked' WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .execute(pool)
+            .await?
+    };
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +235,31 @@ mod tests {
             b"b1"
         );
         assert_eq!(list_all(&pool).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn revoke_tenant_soft_marks_all_then_destroy_deletes() {
+        let pool = pool().await;
+        provision_if_absent(&pool, &row("ten_a", 1, b"a1")).await.unwrap();
+        provision_if_absent(&pool, &row("ten_a", 2, b"a2")).await.unwrap();
+        provision_if_absent(&pool, &row("ten_b", 1, b"b1")).await.unwrap();
+
+        // Soft revoke ten_a: both versions marked revoked, rows still present.
+        assert_eq!(revoke_tenant(&pool, "ten_a", false).await.unwrap(), 2);
+        assert!(get_active(&pool, "ten_a", "content").await.unwrap().is_none());
+        assert_eq!(
+            get_version(&pool, "ten_a", "content", 1).await.unwrap().unwrap().status,
+            "revoked"
+        );
+        // ten_b is untouched.
+        assert!(get_active(&pool, "ten_b", "content").await.unwrap().is_some());
+
+        // Crypto-shred ten_a: the rows are gone.
+        assert_eq!(revoke_tenant(&pool, "ten_a", true).await.unwrap(), 2);
+        assert!(get_version(&pool, "ten_a", "content", 1).await.unwrap().is_none());
+        assert!(get_version(&pool, "ten_a", "content", 2).await.unwrap().is_none());
+        // ten_b still present.
+        assert!(get_version(&pool, "ten_b", "content", 1).await.unwrap().is_some());
     }
 
     #[tokio::test]
