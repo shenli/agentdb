@@ -21,6 +21,14 @@ mod keyring;
 pub use catalog::{CatalogKeyProvider, DekRecord, DekStatus, KeyCatalog};
 pub use config::{CryptoConfig, CryptoMode, DekCacheConfig};
 pub use envelope::{is_envelope_v2, EnvelopeParts};
+
+/// The DEK version recorded in an `AGDB-ENVELOPE-v2` frame, or `None` if `bytes`
+/// is not a valid v2 frame. The re-encryption walk uses this to tell whether a
+/// stored value is sealed under an older DEK version than the active one (and so
+/// needs rewriting) without unwrapping any key material.
+pub fn envelope_dek_version(bytes: &[u8]) -> Option<u32> {
+    envelope::decode(bytes).ok().map(|parts| parts.dek_version)
+}
 pub use kek::{CommandKekProvider, KekProvider, LocalKekProvider, WrappedDek};
 pub use keyring::{
     AeadTenantKeyring, CryptoContext, Dek, DekLease, DisabledEnvelopeCrypto, EnvelopeCrypto,

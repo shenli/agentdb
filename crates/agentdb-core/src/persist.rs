@@ -37,10 +37,22 @@ use agentdb_storage::keys::{
 };
 use agentdb_storage::Error as StorageError;
 use agentdb_storage::{
-    is_envelope_v2, CryptoContext, DisabledEnvelopeCrypto, EnvelopeCrypto, KeyPurpose,
-    KeyResolution, KvStore, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
-    Result as KvResult, WriteOp,
+    envelope_dek_version, is_envelope_v2, CryptoContext, DisabledEnvelopeCrypto, EnvelopeCrypto,
+    KeyPurpose, KeyResolution, KvStore, MetadataCryptoAdapter, MetadataCryptoContext,
+    MetadataObjectKind, Result as KvResult, WriteOp,
 };
+
+/// Report from a metadata re-encryption pass ([`Persist::reencrypt_tenant_metadata`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReencryptReport {
+    /// Envelope-v2 rows inspected under a recognized prefix.
+    pub scanned: usize,
+    /// Rows rewritten from an older DEK version to the active one.
+    pub reencrypted: usize,
+    /// Rows that could not be re-sealed (e.g. a decrypt error) — reported, not
+    /// fatal, so one bad row does not abort the pass.
+    pub errors: usize,
+}
 
 use crate::agent::Agent;
 use crate::artifact::Artifact;
@@ -168,6 +180,18 @@ fn tenant_meta_key(tenant_id: &str, key: &str) -> String {
 
 fn export_ledger_cursor_at_or_before(cursor: &str, from_cursor: Option<&str>) -> bool {
     from_cursor.is_some_and(|from| from.starts_with("ledger:") && cursor <= from)
+}
+
+/// The last `/`-separated segment of a key — the object id for the primary
+/// record prefixes (`record/{kind}/{tenant}/{object_id}`).
+fn last_path_segment(key: &[u8]) -> Option<&str> {
+    std::str::from_utf8(key).ok()?.rsplit('/').next()
+}
+
+/// The session id (third segment) of an event key `event/{tenant}/{session}/{seq}`
+/// — the object id an event row is sealed under.
+fn event_session_from_key(key: &[u8]) -> Option<&str> {
+    std::str::from_utf8(key).ok()?.split('/').nth(2)
 }
 
 fn export_ledger_object_id_from_key(key: &[u8]) -> Option<&str> {
@@ -2366,6 +2390,141 @@ impl Persist {
         serde_json::from_slice(&plaintext).map_err(|err| {
             agentdb_storage::Error::Other(format!("tenant record at {key_str} does not decode: {err}"))
         })
+    }
+
+    /// Re-encrypt a tenant's metadata rows that are sealed under an **older** DEK
+    /// version, rewriting them under the current active version — the data-plane
+    /// half of DEK rotation. Once every row has moved, the old version has no
+    /// remaining references and can be retired (or crypto-shredded). Idempotent:
+    /// rows already at the active version are left untouched, so an interrupted
+    /// pass simply re-runs. A no-op when the keyring is disabled.
+    ///
+    /// Covers every Metadata-DEK-sealed KV row for the tenant — its own record,
+    /// its agent/session/record/skill/artifact primary rows, its session events,
+    /// and its export-ledger entries. Each row is *decrypted under its recorded
+    /// version before being re-sealed*, so a wrong context (a mapping bug) fails
+    /// that single row loudly (counted in `errors`) rather than corrupting it.
+    pub fn reencrypt_tenant_metadata(&self, tenant_id: &str) -> KvResult<ReencryptReport> {
+        let mut report = ReencryptReport::default();
+        if !self.keyring.is_enabled() {
+            return Ok(report);
+        }
+        let active = self
+            .keyring
+            .active_key(tenant_id, KeyPurpose::Metadata)
+            .map_err(|e| StorageError::Other(format!("active metadata DEK for {tenant_id}: {e}")))?
+            .version;
+
+        // Primary-record prefixes whose object id is the last key segment.
+        let record_groups = [
+            (format!("record/agent/{tenant_id}/"), MetadataObjectKind::Agent),
+            (format!("record/session/{tenant_id}/"), MetadataObjectKind::Session),
+            (format!("record/searchable/{tenant_id}/"), MetadataObjectKind::Record),
+            (format!("record/skill/{tenant_id}/"), MetadataObjectKind::Skill),
+            (format!("record/artifact/{tenant_id}/"), MetadataObjectKind::Artifact),
+        ];
+
+        let mut ops: Vec<WriteOp> = Vec::new();
+        for (prefix, kind) in &record_groups {
+            for (key, value) in self.collect_prefix(prefix.as_bytes())? {
+                let object_id = last_path_segment(&key).unwrap_or_default().to_string();
+                let context = MetadataCryptoContext {
+                    tenant_id,
+                    object_kind: *kind,
+                    object_id: &object_id,
+                    key: None,
+                };
+                self.reseal_row(&key, &value, &context, active, &mut ops, &mut report);
+            }
+        }
+
+        // The tenant's own single row.
+        let tenant_key = tenant_record_key(tenant_id).into_bytes();
+        if let Some(value) = self.kv.get(&tenant_key)? {
+            let context = MetadataCryptoContext {
+                tenant_id,
+                object_kind: MetadataObjectKind::Tenant,
+                object_id: tenant_id,
+                key: None,
+            };
+            self.reseal_row(&tenant_key, &value, &context, active, &mut ops, &mut report);
+        }
+
+        // Session events (object id = session).
+        for (key, value) in self.collect_prefix(format!("event/{tenant_id}/").as_bytes())? {
+            let session = event_session_from_key(&key).unwrap_or_default().to_string();
+            let context = MetadataCryptoContext {
+                tenant_id,
+                object_kind: MetadataObjectKind::Event,
+                object_id: &session,
+                key: None,
+            };
+            self.reseal_row(&key, &value, &context, active, &mut ops, &mut report);
+        }
+
+        // Export-ledger entries (object id parsed from the ledger key).
+        for (key, value) in self.collect_prefix(export_ledger_tenant_prefix(tenant_id).as_bytes())? {
+            let Some(object_id) = export_ledger_object_id_from_key(&key).map(str::to_string) else {
+                continue;
+            };
+            let context = self.export_ledger_context(tenant_id, &object_id);
+            self.reseal_row(&key, &value, &context, active, &mut ops, &mut report);
+        }
+
+        if !ops.is_empty() {
+            self.write_ops(ops)?;
+        }
+        Ok(report)
+    }
+
+    /// Drain a prefix scan into memory so the KV iterator is dropped before any
+    /// write (some stores dislike writing under a live iterator).
+    fn collect_prefix(&self, prefix: &[u8]) -> KvResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for res in self.kv.scan_prefix(prefix)? {
+            out.push(res?);
+        }
+        Ok(out)
+    }
+
+    /// Re-seal one row under the active DEK version if it is currently sealed
+    /// under an older one, appending a `Put` to `ops`. Non-envelope (plaintext /
+    /// legacy) values and rows already at the active version are left as-is.
+    fn reseal_row(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        context: &MetadataCryptoContext<'_>,
+        active: u32,
+        ops: &mut Vec<WriteOp>,
+        report: &mut ReencryptReport,
+    ) {
+        if !is_envelope_v2(value) {
+            return; // plaintext / legacy — not sealed under a DEK version
+        }
+        let Some(version) = envelope_dek_version(value) else {
+            return;
+        };
+        report.scanned += 1;
+        if version >= active {
+            return; // already current
+        }
+        match self
+            .decrypt_metadata(context, value)
+            .and_then(|plaintext| self.encrypt_metadata(context, &plaintext))
+        {
+            Ok(resealed) => {
+                ops.push(WriteOp::Put {
+                    key: key.to_vec(),
+                    value: resealed,
+                });
+                report.reencrypted += 1;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "re-encryption skipped a row it could not re-seal");
+                report.errors += 1;
+            }
+        }
     }
 
     // Point reads for the cache-miss fallback path: the in-memory maps are a

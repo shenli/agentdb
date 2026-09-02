@@ -323,9 +323,28 @@ and cluster paths, so BYOK deployments plug in `aws kms`, `vault transit`, or an
 HSM CLI without code changes. A real KMS SDK provider is now just another
 `KekProvider`.
 
-**Not yet done:** the background DEK re-encryption walk
-(rewriting old-version ciphertext so a rotated-away version can be retired) and a
-rotation/revocation CLI.
+**Milestone 20 (landed): the data-plane DEK re-encryption walk.**
+`Persist::reencrypt_tenant_metadata` (exposed as `Runtime::reencrypt_tenant_dek`
+and the admin endpoint `POST /api/admin/tenants/{id}/reencrypt-dek`) rewrites a
+tenant's metadata rows that are sealed under an **older** DEK version so they move
+to the current active version — the data-plane half of rotation, after which the
+old version has no remaining references and can be retired. It covers every
+Metadata-DEK-sealed KV row (the tenant's own record, its agent/session/record/
+skill/artifact primary rows, its session events, and its export-ledger entries),
+deriving each row's AAD context from its key. It is **safe by construction**: each
+row is decrypted under its recorded version *before* being re-sealed, so a
+context-mapping bug fails that single row loudly (counted in the report's
+`errors`) instead of corrupting it. It is **idempotent** — rows already at the
+active version are skipped, so an interrupted pass simply re-runs — and a no-op
+when encryption is disabled. A test rotates a tenant's Metadata DEK, re-encrypts,
+and confirms every one of that tenant's rows moved from v1 to v2 (leaving other
+tenants untouched), the data still decrypts through a fresh runtime, and a second
+pass rewrites nothing.
+
+**Not yet done:** re-encryption of **content** blobs (segments/archives/
+artifacts under the Content DEK — the metadata walk is the bulk; content is a
+parallel follow-up), automatic retirement of a fully-drained version, and a
+rotation/revocation/re-encryption CLI.
 Event AAD binds tenant + session + kind (not yet the per-event seq).
 Dedicated-domain placement enforcement remains, as does graceful hydration when a
 tenant's rows are undecryptable after a crypto-shred (today a `scan_all_*`
