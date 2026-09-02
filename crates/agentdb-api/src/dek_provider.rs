@@ -132,6 +132,83 @@ impl MetaCatalogKeyProvider {
         Ok(meta)
     }
 
+    /// Rotate the active DEK for one `(tenant, purpose)`: mint a fresh key at the
+    /// next version, race it into the shared catalog, demote the previous active
+    /// version to `read_only`, and update this node's maps. Returns the new
+    /// active key's metadata. Leader-coordinated (like [`provision`]); other
+    /// nodes pick up the new active version on their next [`refresh`].
+    ///
+    /// Race-safe across nodes at the storage layer: the new version is written
+    /// with `provision_if_absent`, so two nodes rotating concurrently converge on
+    /// one winning DEK for the new version (the loser adopts the winner's row).
+    pub async fn rotate(
+        &self,
+        tenant_id: &str,
+        purpose: KeyPurpose,
+    ) -> Result<KeyMetadata, CryptoError> {
+        // Determine the version to advance from the authoritative catalog, not
+        // this node's (possibly stale) map.
+        let current = dek_catalog::get_active(&self.pool, tenant_id, purpose.as_str())
+            .await
+            .map_err(|e| CryptoError::Config(format!("key catalog active read: {e}")))?;
+        let Some(current) = current else {
+            // Never provisioned: minting version 1 is the rotation.
+            return self.provision(tenant_id, purpose).await;
+        };
+        let next = current.version + 1;
+
+        let mut dek = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut dek);
+        let wrapped = self.kek.wrap_dek(tenant_id, purpose, &dek)?;
+        dek.fill(0);
+        let candidate = DekCatalogRow {
+            tenant_id: tenant_id.to_string(),
+            purpose: purpose.as_str().to_string(),
+            version: next,
+            wrapping_key_ref: wrapped.wrapping_key_ref,
+            nonce: wrapped.nonce,
+            ciphertext: wrapped.ciphertext,
+            status: "active".to_string(),
+            created_at_ms: now_ms(),
+        };
+        let winner = dek_catalog::provision_if_absent(&self.pool, &candidate)
+            .await
+            .map_err(|e| CryptoError::Config(format!("key catalog rotate: {e}")))?;
+        // Demote the previous active version (idempotent; a racing rotator may
+        // have already done it).
+        dek_catalog::set_status(
+            &self.pool,
+            tenant_id,
+            purpose.as_str(),
+            current.version,
+            "read_only",
+        )
+        .await
+        .map_err(|e| CryptoError::Config(format!("key catalog demote: {e}")))?;
+
+        let lease = self.lease_from_row(&winner, purpose)?;
+        let meta = lease.metadata().clone();
+        self.active
+            .write()
+            .expect("dek map poisoned")
+            .insert((tenant_id.to_string(), purpose), lease.clone());
+        self.by_version.write().expect("dek map poisoned").insert(
+            (tenant_id.to_string(), purpose, winner.version as u32),
+            lease,
+        );
+        Ok(meta)
+    }
+
+    /// Rotate every provisioned purpose for a tenant. Returns the new active
+    /// metadata per purpose.
+    pub async fn rotate_all(&self, tenant_id: &str) -> Result<Vec<KeyMetadata>, CryptoError> {
+        let mut out = Vec::with_capacity(PROVISIONED_PURPOSES.len());
+        for purpose in PROVISIONED_PURPOSES {
+            out.push(self.rotate(tenant_id, purpose).await?);
+        }
+        Ok(out)
+    }
+
     fn lease_from_row(
         &self,
         row: &DekCatalogRow,
@@ -166,6 +243,48 @@ impl agentdb_core::TenantKeyProvisioner for MetaCatalogKeyProvider {
                 format!("tenant key provisioning failed: {e}"),
             )
         })
+    }
+}
+
+/// Lets the runtime rotate a tenant's DEKs on the admin path (cluster shape).
+#[async_trait::async_trait]
+impl agentdb_core::TenantKeyRotator for MetaCatalogKeyProvider {
+    async fn rotate_tenant(&self, tenant_id: &str) -> Result<(), agentdb_core::errors::Error> {
+        self.rotate_all(tenant_id).await.map(|_| ()).map_err(|e| {
+            agentdb_core::errors::Error::new(
+                agentdb_core::errors::ErrorCode::Internal,
+                format!("tenant key rotation failed: {e}"),
+            )
+        })
+    }
+}
+
+/// Single-node key rotator: adapts the storage-crate [`CatalogKeyProvider`]
+/// (whose `rotate` is synchronous) to the runtime's async [`TenantKeyRotator`]
+/// hook. Lives here because the trait is defined in `agentdb-core`, which the
+/// storage crate does not depend on.
+pub struct CatalogKeyRotator {
+    provider: Arc<agentdb_storage::CatalogKeyProvider>,
+}
+
+impl CatalogKeyRotator {
+    pub fn new(provider: Arc<agentdb_storage::CatalogKeyProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait::async_trait]
+impl agentdb_core::TenantKeyRotator for CatalogKeyRotator {
+    async fn rotate_tenant(&self, tenant_id: &str) -> Result<(), agentdb_core::errors::Error> {
+        for purpose in PROVISIONED_PURPOSES {
+            self.provider.rotate(tenant_id, purpose).map_err(|e| {
+                agentdb_core::errors::Error::new(
+                    agentdb_core::errors::ErrorCode::Internal,
+                    format!("tenant key rotation failed: {e}"),
+                )
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -290,6 +409,86 @@ mod tests {
             .open(&ctx, &sealed)
             .unwrap();
         assert_eq!(opened, b"payload");
+    }
+
+    #[tokio::test]
+    async fn rotate_advances_active_and_other_nodes_pick_it_up_after_refresh() {
+        use agentdb_core::TenantKeyRotator;
+
+        let pool = pool().await;
+        let node_a = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
+        let node_b = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
+        let ctx = CryptoContext {
+            tenant_id: "ten_a",
+            purpose: KeyPurpose::Content,
+            object_kind: "event",
+            object_id: "o1",
+        };
+
+        node_a.provision_all("ten_a").await.unwrap();
+        node_b.refresh().await.unwrap();
+        // Seal under v1 on node A.
+        let sealed_v1 = AeadTenantKeyring::new(
+            node_a.clone(),
+            Suite::XChaCha20Poly1305,
+            DekCacheConfig::default(),
+        )
+        .seal(&ctx, b"v1-payload")
+        .unwrap();
+        assert_eq!(
+            node_a
+                .active_dek("ten_a", KeyPurpose::Content)
+                .unwrap()
+                .metadata()
+                .version,
+            1
+        );
+
+        // Rotate on node A (the leader would). Active advances to v2.
+        node_a.rotate_tenant("ten_a").await.unwrap();
+        assert_eq!(
+            node_a
+                .active_dek("ten_a", KeyPurpose::Content)
+                .unwrap()
+                .metadata()
+                .version,
+            2
+        );
+        // The demoted v1 is still fetchable by version for decryption.
+        assert!(node_a.dek_version("ten_a", KeyPurpose::Content, 1).is_ok());
+
+        // A fresh keyring on node A seals under the new active key now (its
+        // provider serves v2), and still opens the v1 blob.
+        let kr_a = AeadTenantKeyring::new(
+            node_a.clone(),
+            Suite::XChaCha20Poly1305,
+            DekCacheConfig::default(),
+        );
+        let sealed_v2 = kr_a.seal(&ctx, b"v2-payload").unwrap();
+        assert_eq!(kr_a.open(&ctx, &sealed_v1).unwrap(), b"v1-payload");
+
+        // Node B still has only v1 until it refreshes.
+        assert_eq!(
+            node_b
+                .active_dek("ten_a", KeyPurpose::Content)
+                .unwrap()
+                .metadata()
+                .version,
+            1
+        );
+        node_b.refresh().await.unwrap();
+        assert_eq!(
+            node_b
+                .active_dek("ten_a", KeyPurpose::Content)
+                .unwrap()
+                .metadata()
+                .version,
+            2
+        );
+        // After refresh node B opens BOTH the v1 and v2 ciphertext.
+        let kr_b = AeadTenantKeyring::new(node_b, Suite::XChaCha20Poly1305, DekCacheConfig::default());
+        assert_eq!(kr_b.open(&ctx, &sealed_v1).unwrap(), b"v1-payload");
+        assert_eq!(kr_b.open(&ctx, &sealed_v2).unwrap(), b"v2-payload");
     }
 
     #[tokio::test]

@@ -1411,6 +1411,20 @@ pub trait TenantKeyProvisioner: Send + Sync {
     async fn provision_tenant(&self, tenant_id: &str) -> Result<()>;
 }
 
+/// Rotates a tenant's data-encryption keys (an admin operation).
+///
+/// Rotation mints a new active DEK version for each provisioned purpose and
+/// demotes the previous version to read-only — old ciphertext stays readable
+/// (each envelope records the version it was sealed under), while new writes
+/// seal under the new key. Implemented by the key catalog / cluster key
+/// provider; unset when encryption is disabled. The runtime invalidates its
+/// keyring cache after a successful rotation so the seal path picks up the new
+/// active key without waiting for the cache TTL.
+#[async_trait::async_trait]
+pub trait TenantKeyRotator: Send + Sync {
+    async fn rotate_tenant(&self, tenant_id: &str) -> Result<()>;
+}
+
 pub struct Runtime {
     state: Mutex<State>,
     hydration_mode: HydrationMode,
@@ -1429,6 +1443,11 @@ pub struct Runtime {
     /// Optional: mints a tenant's DEKs at creation time (cluster key provider).
     /// `None` when the keyring's provider mints on demand.
     key_provisioner: Option<Arc<dyn TenantKeyProvisioner>>,
+    /// Optional: rotates a tenant's DEKs on the admin path. Installed once at
+    /// startup via [`Runtime::set_key_rotator`] (the provider Arc is owned by
+    /// the server wiring), so it is set out-of-band rather than through the many
+    /// runtime constructors. Unset when encryption is disabled.
+    key_rotator: OnceLock<Arc<dyn TenantKeyRotator>>,
     kms: Arc<dyn KmsKeyResolver>,
     /// Per-(tenant, namespace) BM25 text index for V2.2 searchable
     /// records. Wrapped in a `std::sync::Mutex` because
@@ -3170,6 +3189,7 @@ impl Runtime {
             content_crypto: Arc::new(IdentityContentCryptoAdapter),
             keyring: Arc::new(DisabledEnvelopeCrypto),
             key_provisioner: None,
+            key_rotator: OnceLock::new(),
             kms: Arc::new(AllowAllKmsKeyResolver),
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3190,6 +3210,7 @@ impl Runtime {
             content_crypto: Arc::new(IdentityContentCryptoAdapter),
             keyring: Arc::new(DisabledEnvelopeCrypto),
             key_provisioner: None,
+            key_rotator: OnceLock::new(),
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3213,6 +3234,7 @@ impl Runtime {
             content_crypto,
             keyring: Arc::new(DisabledEnvelopeCrypto),
             key_provisioner: None,
+            key_rotator: OnceLock::new(),
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3720,12 +3742,39 @@ impl Runtime {
             content_crypto,
             keyring,
             key_provisioner,
+            key_rotator: OnceLock::new(),
             kms,
             text_index: StdMutex::new(hydration.text_index),
             vector_index: StdMutex::new(hydration.vector_index),
             global_record_index: hydration.global_record_index,
             tablet_router,
         })
+    }
+
+    /// Install the tenant key rotator once at startup. The server owns the key
+    /// provider `Arc` (it is also the keyring's provider and, in a cluster, the
+    /// provisioner), so the rotator is wired in out-of-band rather than through
+    /// every constructor. A second call is ignored (the first install wins).
+    pub fn set_key_rotator(&self, rotator: Arc<dyn TenantKeyRotator>) {
+        let _ = self.key_rotator.set(rotator);
+    }
+
+    /// Rotate a tenant's data-encryption keys (admin operation). Advances each
+    /// provisioned purpose to a new active DEK version and demotes the previous
+    /// one to read-only — existing ciphertext stays readable, new writes seal
+    /// under the new key. Cached DEK leases for the tenant are then dropped so
+    /// the seal path adopts the new active key immediately. Fails closed when no
+    /// rotator is installed (encryption disabled or no key catalog).
+    pub async fn rotate_tenant_dek(&self, tenant_id: &str) -> Result<()> {
+        let rotator = self.key_rotator.get().ok_or_else(|| {
+            Error::new(
+                ErrorCode::KeyUnavailable,
+                "key rotation is unavailable (encryption disabled or no key catalog configured)",
+            )
+        })?;
+        rotator.rotate_tenant(tenant_id).await?;
+        self.keyring.invalidate(tenant_id);
+        Ok(())
     }
 
     pub async fn with_tablet_context<F, T>(&self, tablet_id: i64, future: F) -> T

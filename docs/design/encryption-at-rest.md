@@ -230,15 +230,39 @@ is the shared KEK/suite parser for the single-node and cluster paths.
 layout now has its keyring+provisioner constructor
 (`with_tablet_store_lifecycle_content_keyring_provisioner_and_replicated_logs_for_default_tablet`),
 so both replicated layouts encrypt. A background **refresh loop** reloads each
-node's key cache on an interval (`AGENTDB_ENCRYPTION_REFRESH_MS`, default 5 s),
+node's key cache on an interval (`AGENTDB_ENCRYPTION_REFRESH_MS`, default 30 s),
 so a follower — or a node that becomes leader — picks up a tenant provisioned
 after its startup (bounded eventual consistency, closing the failover gap). With
-this, a real multi-node cluster encrypts tenant events and content end-to-end.
+this, a real multi-node cluster encrypts tenant events and content end-to-end
+(validated by a clean partition-scenario cluster smoke with encryption on).
 
-**Not yet done:** the online DEK rotation worker
-(new DEK version + data
-re-encryption walk) and the admin API/CLI to drive rewrap and rotation are not
-built; and the
+**Milestone 15 (landed): online DEK rotation (control plane).** A tenant's DEK
+can now be rotated on demand: `rotate` mints a fresh key at the *next* version,
+makes it active (new writes seal under it), and demotes the previous version to
+`read_only` — old ciphertext stays readable because every envelope records the
+version it was sealed under, so **no data re-encryption is required for
+correctness**. The new active version is written before the old is demoted, so a
+crash mid-rotation leaves the active pointer aimed at a live record. Both catalog
+backends implement it: the single-node `CatalogKeyProvider::rotate` (KV catalog)
+and the cluster `MetaCatalogKeyProvider::rotate` (meta catalog), the latter
+race-safe across nodes via `provision_if_absent` on the new version and picked up
+by other nodes on their next `refresh`. A `TenantKeyRotator` runtime hook
+(installed once at startup, like the provisioner) exposes it as
+`Runtime::rotate_tenant_dek`, which also **invalidates the keyring's DEK cache**
+for the tenant so the seal path adopts the new key immediately rather than after
+the cache TTL. The admin endpoint `POST /api/admin/tenants/{id}/rotate-dek` drives
+it (resolving the tenant first, so rotation never mints keys for a ghost tenant).
+Tests cover both backends: active advances, old ciphertext still opens, new
+writes use the new key, and a second cluster node adopts the new active version
+after refresh. What remains is the **data-plane re-encryption walk** — a
+rate-limited, checkpointed background job that rewrites old-version ciphertext
+under the active DEK so a retired version can eventually be dropped (crypto-shred
+/ key hygiene); it is a separate milestone because it is not needed for rotation
+correctness, only for retiring old keys.
+
+**Not yet done:** the background DEK re-encryption walk
+(rewriting old-version ciphertext so a version can be retired) and a rotation
+CLI; and the
 `LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
 Agent/session/tenant records, searchable records, and skills are still plaintext
 (records are additionally entangled with the export ledger + search index).

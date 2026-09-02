@@ -267,6 +267,67 @@ impl CatalogKeyProvider {
         Ok(self.generate_active(tenant_id, purpose)?.metadata().clone())
     }
 
+    /// Rotate the active DEK for `(tenant, purpose)`: mint a fresh key at the
+    /// next version, make it active (new writes seal under it), and demote the
+    /// previous active version to [`DekStatus::ReadOnly`] so it still decrypts
+    /// existing ciphertext but is never written under again. Returns the new
+    /// active key's metadata. Each call advances the version by one; callers gate
+    /// how often they rotate.
+    ///
+    /// The new active version is written *before* the old one is demoted, so a
+    /// crash mid-rotation leaves the active pointer aimed at a readable, active
+    /// record — never at a gap. Rotating an unprovisioned `(tenant, purpose)`
+    /// simply mints version 1 (equivalent to first provisioning).
+    pub fn rotate(&self, tenant_id: &str, purpose: KeyPurpose) -> Result<KeyMetadata, CryptoError> {
+        let _guard = self.generate_lock.lock().expect("generate lock poisoned");
+        let Some(current) = self.catalog.active_version(tenant_id, purpose)? else {
+            // Never provisioned: minting the first version *is* the rotation.
+            return Ok(self
+                .mint_active_version(tenant_id, purpose, 1)?
+                .metadata()
+                .clone());
+        };
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| CryptoError::Config("DEK version overflow".into()))?;
+        // Mint + store the new active version first (flips the active pointer).
+        let lease = self.mint_active_version(tenant_id, purpose, next)?;
+        // Demote the previous active version to read-only (still decrypts).
+        if let Some(mut prev) = self.catalog.get_record(tenant_id, purpose, current)? {
+            if prev.status == DekStatus::Active {
+                prev.status = DekStatus::ReadOnly;
+                self.catalog.put_record(&prev)?;
+            }
+        }
+        Ok(lease.metadata().clone())
+    }
+
+    /// Mint a fresh random DEK for `(tenant, purpose)` at `version`, wrap it,
+    /// store it as the active record (which flips the active pointer), and
+    /// return the unwrapped lease. Lock-free: the caller MUST already hold
+    /// `generate_lock` (so two writers cannot mint the same version).
+    fn mint_active_version(
+        &self,
+        tenant_id: &str,
+        purpose: KeyPurpose,
+        version: u32,
+    ) -> Result<DekLease, CryptoError> {
+        let mut dek = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut dek);
+        let wrapped = self.kek.wrap_dek(tenant_id, purpose, &dek)?;
+        dek.zeroize();
+        let record = DekRecord {
+            tenant_id: tenant_id.to_string(),
+            purpose: purpose.as_str().to_string(),
+            version,
+            wrapped,
+            status: DekStatus::Active,
+            created_at_ms: now_ms(),
+        };
+        self.catalog.put_record(&record)?;
+        self.lease_from_record(tenant_id, purpose, &record)
+    }
+
     fn lease_from_record(
         &self,
         tenant_id: &str,
@@ -543,6 +604,88 @@ mod tests {
         // KEK v1 alone can no longer serve it — the catalog references v2, so the
         // old KEK is retired.
         assert!(keyring(kek_v1).open(&ctx, &sealed).is_err());
+    }
+
+    #[test]
+    fn rotate_advances_active_and_keeps_old_ciphertext_readable() {
+        use crate::crypto::{
+            AeadTenantKeyring, CryptoContext, DekCacheConfig, EnvelopeCrypto, Suite,
+        };
+
+        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+        let ctx = CryptoContext {
+            tenant_id: "ten_a",
+            purpose: KeyPurpose::Content,
+            object_kind: "event",
+            object_id: "o1",
+        };
+        let provider = Arc::new(provider(kv.clone()));
+        let keyring = AeadTenantKeyring::new(
+            provider.clone(),
+            Suite::XChaCha20Poly1305,
+            DekCacheConfig::default(),
+        );
+
+        // Seal under v1, then rotate to v2.
+        let sealed_v1 = keyring.seal(&ctx, b"old-payload").unwrap();
+        let meta = provider.rotate("ten_a", KeyPurpose::Content).unwrap();
+        assert_eq!(meta.version, 2);
+        // The active pointer now serves v2 for new writes.
+        assert_eq!(
+            provider
+                .active_dek("ten_a", KeyPurpose::Content)
+                .unwrap()
+                .metadata()
+                .version,
+            2
+        );
+
+        // A fresh keyring (no stale active cache) seals under v2 now...
+        let keyring2 = AeadTenantKeyring::new(
+            provider.clone(),
+            Suite::XChaCha20Poly1305,
+            DekCacheConfig::default(),
+        );
+        let sealed_v2 = keyring2.seal(&ctx, b"new-payload").unwrap();
+        assert_eq!(
+            crate::crypto::envelope::decode(&sealed_v2)
+                .unwrap()
+                .dek_version,
+            2
+        );
+        // ...and the v1 ciphertext still opens (v1 demoted to read-only, not gone).
+        assert_eq!(keyring2.open(&ctx, &sealed_v1).unwrap(), b"old-payload");
+        // v1 is read-only now; v2 is active.
+        let cat = KeyCatalog::new(kv);
+        assert_eq!(
+            cat.get_record("ten_a", KeyPurpose::Content, 1)
+                .unwrap()
+                .unwrap()
+                .status,
+            DekStatus::ReadOnly
+        );
+        assert_eq!(
+            cat.get_record("ten_a", KeyPurpose::Content, 2)
+                .unwrap()
+                .unwrap()
+                .status,
+            DekStatus::Active
+        );
+    }
+
+    #[test]
+    fn rotate_unprovisioned_mints_version_one() {
+        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+        let p = provider(kv);
+        let meta = p.rotate("ten_new", KeyPurpose::Content).unwrap();
+        assert_eq!(meta.version, 1);
+        assert_eq!(
+            p.active_dek("ten_new", KeyPurpose::Content)
+                .unwrap()
+                .metadata()
+                .version,
+            1
+        );
     }
 
     #[test]
