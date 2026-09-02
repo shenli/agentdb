@@ -362,7 +362,23 @@ rotate --tenant-id …`, `… revoke --tenant-id … [--destroy]`, and `… reen
 operator (or an automation) can run the whole lifecycle without hand-crafting
 HTTP calls.
 
-**Not yet done:** automatic retirement of a fully-drained version.
+**Milestone 23 (landed): safe DEK-version retirement.**
+`Runtime::retire_tenant_dek_versions` (admin endpoint `POST
+/api/admin/tenants/{id}/retire-dek-versions`, CLI `agentdbctl encryption retire`)
+is the safe completion of a rotation: once a version's data is fully re-encrypted
+away, the version is marked `retired` so it can never decrypt again (a precursor
+to deleting its wrapped material). It is **safe by construction**: it first
+re-encrypts (idempotent) and *refuses to proceed if any object could not be
+re-sealed*; then it **scans every stored object** of each purpose and retires only
+versions it did **not** observe still in use — never the active version, only
+already-rotated-away read-only ones. Content versions are retired only when the
+content backend can be enumerated (the report's `content_verified`); otherwise
+content drainage is unverifiable and those versions are left untouched. A test
+rotates both DEKs, retires, and confirms the old versions are refused by the
+provider while the data still decrypts. This closes the key-lifecycle loop:
+provision → rotate → re-encrypt → **retire** → (crypto-shred).
+
+**Not yet done:** nothing required for a complete encryption-at-rest system.
 Event AAD binds tenant + session + kind (not yet the per-event seq).
 Dedicated-domain placement enforcement remains, as does graceful hydration when a
 tenant's rows are undecryptable after a crypto-shred (today a `scan_all_*`

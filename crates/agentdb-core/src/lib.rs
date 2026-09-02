@@ -52,8 +52,9 @@ pub use runtime::{
     GcSweepReport, LifecycleCounts, LifecycleSweepReport, MetadataFilter, MetadataFilterCondition,
     MetadataFilterOp, NewRecordEdge, NewSnapshotRef, PolicyWorkerReport, RecordEdge,
     RecordEdgeType, RecordIndexStats, RecordSearchMatch, RecordSearchScoreComponents, RecordUpdate,
-    ReplayResponse, Runtime, SessionStorageSummary, SnapshotResolution, TenantKeyProvisioner,
-    TenantKeyRevoker, TenantKeyRotator, TenantMetaEntry,
+    ReplayResponse, RetireReport, Runtime, SessionStorageSummary, SnapshotResolution,
+    TenantKeyProvisioner,
+    TenantKeyRetirer, TenantKeyRevoker, TenantKeyRotator, TenantMetaEntry,
     TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope, RUNTIME_PRIMARY_TABLET_ID,
     SYSTEM_TENANT_EXTERNAL_KEY, SYSTEM_TENANT_ID,
 };

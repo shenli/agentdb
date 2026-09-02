@@ -128,6 +128,10 @@ pub fn routes() -> Router<AppState> {
             post(reencrypt_tenant_dek),
         )
         .route(
+            "/api/admin/tenants/:tenant_id/retire-dek-versions",
+            post(retire_tenant_dek_versions),
+        )
+        .route(
             "/api/admin/drain",
             get(get_admin_drain).post(post_admin_drain),
         )
@@ -5718,6 +5722,30 @@ async fn reencrypt_tenant_dek(
         "scanned": report.scanned,
         "reencrypted": report.reencrypted,
         "errors": report.errors
+    })))
+}
+
+/// Admin: retire a tenant's drained DEK versions — the safe completion of a
+/// rotation. Re-encrypts first (refusing to proceed on any error), then retires
+/// only versions it observed no longer in use. Content versions are retired only
+/// when the content backend can be enumerated (`content_verified`).
+async fn retire_tenant_dek_versions(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let _ = s.runtime.get_tenant(&tid).await?;
+    let report = s.runtime.retire_tenant_dek_versions(tid.as_str()).await?;
+    Ok(Json(serde_json::json!({
+        "tenant_id": tid.as_str(),
+        "metadata_versions_retired": report.metadata_versions_retired,
+        "content_versions_retired": report.content_versions_retired,
+        "content_verified": report.content_verified
     })))
 }
 

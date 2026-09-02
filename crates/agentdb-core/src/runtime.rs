@@ -1440,6 +1440,37 @@ pub trait TenantKeyRevoker: Send + Sync {
     async fn revoke_tenant(&self, tenant_id: &str, destroy: bool) -> Result<()>;
 }
 
+/// Retires a tenant's drained DEK versions (an admin operation, run after a
+/// clean re-encryption). Marks as `retired` every read-only version of
+/// `(tenant, purpose)` whose version number is NOT in `versions_in_use` — the
+/// complete set of versions the runtime observed still in use after scanning
+/// every stored object of that purpose. Retiring a still-referenced version
+/// would make its data unreadable, so the caller owns that safety guarantee;
+/// this only ever touches already-rotated-away (read-only) versions.
+/// Implemented by the key catalog / cluster key provider; unset when encryption
+/// is disabled.
+#[async_trait::async_trait]
+pub trait TenantKeyRetirer: Send + Sync {
+    async fn retire_drained_versions(
+        &self,
+        tenant_id: &str,
+        purpose: KeyPurpose,
+        versions_in_use: &[u32],
+    ) -> Result<usize>;
+}
+
+/// Outcome of [`Runtime::retire_tenant_dek_versions`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetireReport {
+    /// Metadata DEK versions marked retired.
+    pub metadata_versions_retired: usize,
+    /// Content DEK versions marked retired.
+    pub content_versions_retired: usize,
+    /// `false` when the content backend could not be enumerated, so content
+    /// drainage could not be verified and no content version was retired.
+    pub content_verified: bool,
+}
+
 pub struct Runtime {
     state: Mutex<State>,
     hydration_mode: HydrationMode,
@@ -1467,6 +1498,10 @@ pub struct Runtime {
     /// Installed once at startup via [`Runtime::set_key_revoker`]. Unset when
     /// encryption is disabled.
     key_revoker: OnceLock<Arc<dyn TenantKeyRevoker>>,
+    /// Optional: retires a tenant's drained DEK versions on the admin path.
+    /// Installed once at startup via [`Runtime::set_key_retirer`]. Unset when
+    /// encryption is disabled.
+    key_retirer: OnceLock<Arc<dyn TenantKeyRetirer>>,
     kms: Arc<dyn KmsKeyResolver>,
     /// Per-(tenant, namespace) BM25 text index for V2.2 searchable
     /// records. Wrapped in a `std::sync::Mutex` because
@@ -3210,6 +3245,7 @@ impl Runtime {
             key_provisioner: None,
             key_rotator: OnceLock::new(),
             key_revoker: OnceLock::new(),
+            key_retirer: OnceLock::new(),
             kms: Arc::new(AllowAllKmsKeyResolver),
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3232,6 +3268,7 @@ impl Runtime {
             key_provisioner: None,
             key_rotator: OnceLock::new(),
             key_revoker: OnceLock::new(),
+            key_retirer: OnceLock::new(),
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3257,6 +3294,7 @@ impl Runtime {
             key_provisioner: None,
             key_rotator: OnceLock::new(),
             key_revoker: OnceLock::new(),
+            key_retirer: OnceLock::new(),
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3766,6 +3804,7 @@ impl Runtime {
             key_provisioner,
             key_rotator: OnceLock::new(),
             key_revoker: OnceLock::new(),
+            key_retirer: OnceLock::new(),
             kms,
             text_index: StdMutex::new(hydration.text_index),
             vector_index: StdMutex::new(hydration.vector_index),
@@ -3822,6 +3861,109 @@ impl Runtime {
         revoker.revoke_tenant(tenant_id, destroy).await?;
         self.keyring.invalidate(tenant_id);
         Ok(())
+    }
+
+    /// Install the tenant key retirer once at startup (see [`set_key_rotator`]).
+    ///
+    /// [`set_key_rotator`]: Runtime::set_key_rotator
+    pub fn set_key_retirer(&self, retirer: Arc<dyn TenantKeyRetirer>) {
+        let _ = self.key_retirer.set(retirer);
+    }
+
+    /// Retire a tenant's drained DEK versions (admin operation). This is the safe
+    /// completion of a rotation: after [`reencrypt_tenant_dek`](Self::reencrypt_tenant_dek)
+    /// has moved every object to the active version, the old versions have no
+    /// remaining references and can be marked `retired` (never able to decrypt
+    /// again), so a later crypto-shred or key-material deletion is possible.
+    ///
+    /// It is **safe by construction**: it first re-encrypts (idempotent) and
+    /// refuses to proceed if that pass reported any error; it then *scans every
+    /// stored object* and retires only versions it did **not** observe in use.
+    /// The content backend must be enumerable to verify content drainage — when
+    /// it is not, content versions are left untouched (`content_verified = false`)
+    /// and only metadata versions are retired. Fails closed when no retirer is
+    /// installed (encryption disabled or no key catalog).
+    pub async fn retire_tenant_dek_versions(&self, tenant_id: &str) -> Result<RetireReport> {
+        let retirer = self.key_retirer.get().ok_or_else(|| {
+            Error::new(
+                ErrorCode::KeyUnavailable,
+                "key retirement is unavailable (encryption disabled or no key catalog configured)",
+            )
+        })?;
+        // Move everything to the active version first; refuse to retire if any
+        // object could not be re-encrypted (it may still reference an old key).
+        let reencrypt = self.reencrypt_tenant_dek(tenant_id).await?;
+        if reencrypt.errors > 0 {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "re-encryption reported {} error(s); refusing to retire DEK versions that \
+                     may still be referenced",
+                    reencrypt.errors
+                ),
+            ));
+        }
+
+        // Observe which versions are still in use, then retire only the rest.
+        let metadata_in_use = match &self.persist {
+            Some(p) => p.metadata_versions_in_use(tenant_id).map_err(internal)?,
+            None => Vec::new(),
+        };
+        let metadata_versions_retired = retirer
+            .retire_drained_versions(tenant_id, KeyPurpose::Metadata, &metadata_in_use)
+            .await?;
+
+        let (content_versions_retired, content_verified) =
+            match self.content_versions_in_use(tenant_id).await? {
+                Some(content_in_use) => (
+                    retirer
+                        .retire_drained_versions(tenant_id, KeyPurpose::Content, &content_in_use)
+                        .await?,
+                    true,
+                ),
+                None => (0, false),
+            };
+
+        Ok(RetireReport {
+            metadata_versions_retired,
+            content_versions_retired,
+            content_verified,
+        })
+    }
+
+    /// The set of Content DEK versions still referenced by a tenant's stored
+    /// blobs, or `None` when the content backend cannot enumerate its namespace
+    /// (so content drainage cannot be verified). Used by retirement.
+    async fn content_versions_in_use(&self, tenant_id: &str) -> Result<Option<Vec<u32>>> {
+        let max = startup_hydration_limit("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000);
+        let listing = match self.content.list_objects(max).await {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return Ok(None),
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorCode::Internal,
+                    format!("content object listing failed: {error}"),
+                ))
+            }
+        };
+        let mut versions = Vec::new();
+        for obj in listing.objects {
+            if obj.tenant_id != tenant_id {
+                continue;
+            }
+            let Ok(stored) = self.content.get(&obj.tenant_id, &obj.artifact_id).await else {
+                // A blob we cannot read is treated as still-in-use of every
+                // version (conservative): return None so no content version is
+                // retired this pass.
+                return Ok(None);
+            };
+            if let Some(version) = envelope_dek_version(&stored) {
+                if !versions.contains(&version) {
+                    versions.push(version);
+                }
+            }
+        }
+        Ok(Some(versions))
     }
 
     /// Re-encrypt a tenant's data sealed under an older DEK version so it moves

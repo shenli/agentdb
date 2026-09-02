@@ -14,8 +14,33 @@ use agentdb_core::tenant::NewTenant;
 use agentdb_storage::{
     envelope_dek_version, is_envelope_v2, AeadTenantKeyring, CatalogKeyProvider, ContentBackend,
     DekCacheConfig, EnvelopeCrypto, InMemoryContentBackend, InMemoryKvStore, KeyCatalog, KeyPurpose,
-    KvStore, LocalKekProvider, Suite,
+    KeyProvider, KvStore, LocalKekProvider, Suite,
 };
+
+/// Test-local retirer that drives the single-node provider directly (the real
+/// `CatalogKeyAdmin` lives in `agentdb-api`, which this crate does not depend on).
+struct TestRetirer {
+    provider: Arc<CatalogKeyProvider>,
+}
+
+#[async_trait::async_trait]
+impl agentdb_core::TenantKeyRetirer for TestRetirer {
+    async fn retire_drained_versions(
+        &self,
+        tenant_id: &str,
+        purpose: KeyPurpose,
+        versions_in_use: &[u32],
+    ) -> agentdb_core::errors::Result<usize> {
+        self.provider
+            .retire_drained_versions(tenant_id, purpose, versions_in_use)
+            .map_err(|e| {
+                agentdb_core::errors::Error::new(
+                    agentdb_core::errors::ErrorCode::Internal,
+                    format!("{e}"),
+                )
+            })
+    }
+}
 
 /// The DEK version of every sealed metadata row in the raw store. Persist writes
 /// through a tablet-KV wrapper that physically prefixes keys, so we scan all raw
@@ -239,6 +264,100 @@ async fn reencrypt_walk_moves_content_blobs_to_the_active_content_dek() {
         content as Arc<dyn ContentBackend>,
         keyring2,
     );
+    let blob = rt2.get_artifact_blob(&t.tenant_id, &art.artifact_id).await.unwrap();
+    assert_eq!(blob, b"ARTIFACT-SECRET-blob");
+}
+
+#[tokio::test]
+async fn retire_drains_reencrypts_then_retires_old_versions_and_keeps_data_readable() {
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+    let content = Arc::new(InMemoryContentBackend::default());
+    let provider = Arc::new(CatalogKeyProvider::new(
+        KeyCatalog::new(kv.clone()),
+        Arc::new(LocalKekProvider::from_secret(b"kek-secret", "local:v1")),
+    ));
+    let keyring = Arc::new(AeadTenantKeyring::new(
+        provider.clone(),
+        Suite::XChaCha20Poly1305,
+        DekCacheConfig::default(),
+    ));
+    let rt = Runtime::with_kv_content_and_keyring(
+        kv.clone(),
+        content.clone() as Arc<dyn ContentBackend>,
+        keyring.clone(),
+    );
+    rt.set_key_retirer(Arc::new(TestRetirer { provider: provider.clone() }));
+
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "retire".into(),
+            policy: serde_json::json!({ "secret": "TENANT-SECRET" }),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: Some("agent".into()),
+            config: serde_json::json!({ "secret": "AGENT-SECRET" }),
+        })
+        .await
+        .unwrap();
+    let art = rt
+        .create_artifact(
+            NewArtifact {
+                tenant_id: t.tenant_id.clone(),
+                content_type: None,
+                expected_sha256: None,
+            },
+            b"ARTIFACT-SECRET-blob".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    // Rotate BOTH purposes (as rotate_tenant_dek does) so v1 becomes read-only.
+    provider.rotate(t.tenant_id.as_str(), KeyPurpose::Metadata).unwrap();
+    provider.rotate(t.tenant_id.as_str(), KeyPurpose::Content).unwrap();
+    keyring.invalidate(t.tenant_id.as_str());
+
+    // Retire: re-encrypts to v2, then retires the drained v1 versions.
+    let report = rt.retire_tenant_dek_versions(t.tenant_id.as_str()).await.unwrap();
+    assert!(report.content_verified, "in-memory backend is enumerable");
+    assert!(report.metadata_versions_retired >= 1, "{report:?}");
+    assert!(report.content_versions_retired >= 1, "{report:?}");
+
+    // v1 of both purposes is retired → the provider refuses to serve it; v2
+    // (active) still serves. (Observable proof of retirement without poking at
+    // the catalog's private accessors.)
+    for purpose in [KeyPurpose::Metadata, KeyPurpose::Content] {
+        assert!(
+            provider.dek_version(t.tenant_id.as_str(), purpose, 1).is_err(),
+            "retired v1 {purpose:?} is no longer served"
+        );
+        assert!(
+            provider.dek_version(t.tenant_id.as_str(), purpose, 2).is_ok(),
+            "active v2 {purpose:?} still served"
+        );
+    }
+
+    // Data is still readable (everything moved to v2 before retirement).
+    let provider2 = Arc::new(CatalogKeyProvider::new(
+        KeyCatalog::new(kv.clone()),
+        Arc::new(LocalKekProvider::from_secret(b"kek-secret", "local:v1")),
+    ));
+    let keyring2 = Arc::new(AeadTenantKeyring::new(
+        provider2,
+        Suite::XChaCha20Poly1305,
+        DekCacheConfig::default(),
+    ));
+    let rt2 = Runtime::with_kv_content_and_keyring(
+        kv.clone(),
+        content as Arc<dyn ContentBackend>,
+        keyring2,
+    );
+    let agents = rt2.list_agents(&t.tenant_id).await.unwrap();
+    assert_eq!(agents[0].agent_id, a.agent_id);
+    assert_eq!(agents[0].config["secret"], "AGENT-SECRET");
     let blob = rt2.get_artifact_blob(&t.tenant_id, &art.artifact_id).await.unwrap();
     assert_eq!(blob, b"ARTIFACT-SECRET-blob");
 }

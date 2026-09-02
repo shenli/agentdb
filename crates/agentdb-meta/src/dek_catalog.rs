@@ -174,6 +174,37 @@ pub async fn revoke_tenant(pool: &AnyPool, tenant_id: &str, destroy: bool) -> Me
     Ok(result.rows_affected())
 }
 
+/// Retire every `read_only` DEK version of `(tenant, purpose)` whose version is
+/// NOT in `versions_in_use`, marking it `retired` so it can never decrypt again.
+/// The caller guarantees `versions_in_use` is the complete set of versions still
+/// referenced by stored data (see the safety note on the storage-crate
+/// counterpart). Returns the number of versions retired.
+pub async fn retire_drained_versions(
+    pool: &AnyPool,
+    tenant_id: &str,
+    purpose: &str,
+    versions_in_use: &[i64],
+) -> MetaResult<u64> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT version FROM dek_catalog \
+         WHERE tenant_id = $1 AND purpose = $2 AND status = 'read_only'",
+    )
+    .bind(tenant_id)
+    .bind(purpose)
+    .fetch_all(pool)
+    .await?;
+    let mut retired = 0;
+    for (version,) in rows {
+        if versions_in_use.contains(&version) {
+            continue;
+        }
+        if set_status(pool, tenant_id, purpose, version, "retired").await? {
+            retired += 1;
+        }
+    }
+    Ok(retired)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +291,34 @@ mod tests {
         assert!(get_version(&pool, "ten_a", "content", 2).await.unwrap().is_none());
         // ten_b still present.
         assert!(get_version(&pool, "ten_b", "content", 1).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn retire_drained_versions_respects_in_use_and_status() {
+        let pool = pool().await;
+        // v1 (read_only) and v2 (active).
+        provision_if_absent(&pool, &row("ten_a", 1, b"a1")).await.unwrap();
+        set_status(&pool, "ten_a", "content", 1, "read_only").await.unwrap();
+        provision_if_absent(&pool, &row("ten_a", 2, b"a2")).await.unwrap();
+
+        // v1 still reported in use → not retired.
+        assert_eq!(
+            retire_drained_versions(&pool, "ten_a", "content", &[1, 2]).await.unwrap(),
+            0
+        );
+        // Only v2 in use → v1 (drained, read_only) retired; active v2 untouched.
+        assert_eq!(
+            retire_drained_versions(&pool, "ten_a", "content", &[2]).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            get_version(&pool, "ten_a", "content", 1).await.unwrap().unwrap().status,
+            "retired"
+        );
+        assert_eq!(
+            get_version(&pool, "ten_a", "content", 2).await.unwrap().unwrap().status,
+            "active"
+        );
     }
 
     #[tokio::test]

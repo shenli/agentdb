@@ -421,6 +421,12 @@ enum EncryptionCommand {
         #[arg(long)]
         tenant_id: String,
     },
+    /// Retire a tenant's drained DEK versions (safe completion of a rotation):
+    /// re-encrypts, then marks old versions no longer in use as retired.
+    Retire {
+        #[arg(long)]
+        tenant_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1232,6 +1238,14 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 let tenant_id = require_non_empty_cli_arg("--tenant-id", tenant_id)?;
                 api.post(
                     &format!("/api/admin/tenants/{tenant_id}/reencrypt-dek"),
+                    json!({}),
+                )
+                .await
+            }
+            EncryptionCommand::Retire { tenant_id } => {
+                let tenant_id = require_non_empty_cli_arg("--tenant-id", tenant_id)?;
+                api.post(
+                    &format!("/api/admin/tenants/{tenant_id}/retire-dek-versions"),
                     json!({}),
                 )
                 .await

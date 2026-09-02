@@ -239,6 +239,30 @@ impl MetaCatalogKeyProvider {
         Ok(affected)
     }
 
+    /// Retire the read-only DEK versions of `(tenant, purpose)` not in
+    /// `versions_in_use` (see the storage-crate counterpart's safety note), then
+    /// reload this node's maps so it stops serving the retired versions. Returns
+    /// the count retired.
+    pub async fn retire_drained_versions(
+        &self,
+        tenant_id: &str,
+        purpose: KeyPurpose,
+        versions_in_use: &[u32],
+    ) -> Result<usize, CryptoError> {
+        let in_use: Vec<i64> = versions_in_use.iter().map(|&v| v as i64).collect();
+        let retired = dek_catalog::retire_drained_versions(
+            &self.pool,
+            tenant_id,
+            purpose.as_str(),
+            &in_use,
+        )
+        .await
+        .map_err(|e| CryptoError::Config(format!("key catalog retire: {e}")))?;
+        // Reload so the retired versions (now non-readable) leave the maps.
+        self.refresh().await?;
+        Ok(retired as usize)
+    }
+
     fn lease_from_row(
         &self,
         row: &DekCatalogRow,
@@ -309,10 +333,32 @@ impl agentdb_core::TenantKeyRevoker for MetaCatalogKeyProvider {
     }
 }
 
+/// Lets the runtime retire a tenant's drained DEK versions (cluster shape).
+#[async_trait::async_trait]
+impl agentdb_core::TenantKeyRetirer for MetaCatalogKeyProvider {
+    async fn retire_drained_versions(
+        &self,
+        tenant_id: &str,
+        purpose: KeyPurpose,
+        versions_in_use: &[u32],
+    ) -> Result<usize, agentdb_core::errors::Error> {
+        self.retire_drained_versions(tenant_id, purpose, versions_in_use)
+            .await
+            .map_err(|e| {
+                agentdb_core::errors::Error::new(
+                    agentdb_core::errors::ErrorCode::Internal,
+                    format!("tenant key retirement failed: {e}"),
+                )
+            })
+    }
+}
+
 /// Single-node key admin: adapts the storage-crate [`CatalogKeyProvider`]
-/// (whose `rotate` / `revoke_tenant` are synchronous) to the runtime's async
-/// [`TenantKeyRotator`](agentdb_core::TenantKeyRotator) and
-/// [`TenantKeyRevoker`](agentdb_core::TenantKeyRevoker) hooks. Lives here
+/// (whose `rotate` / `revoke_tenant` / `retire_drained_versions` are
+/// synchronous) to the runtime's async
+/// [`TenantKeyRotator`](agentdb_core::TenantKeyRotator),
+/// [`TenantKeyRevoker`](agentdb_core::TenantKeyRevoker), and
+/// [`TenantKeyRetirer`](agentdb_core::TenantKeyRetirer) hooks. Lives here
 /// because the traits are defined in `agentdb-core`, which the storage crate
 /// does not depend on.
 pub struct CatalogKeyAdmin {
@@ -354,6 +400,25 @@ impl agentdb_core::TenantKeyRevoker for CatalogKeyAdmin {
             )
         })?;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl agentdb_core::TenantKeyRetirer for CatalogKeyAdmin {
+    async fn retire_drained_versions(
+        &self,
+        tenant_id: &str,
+        purpose: KeyPurpose,
+        versions_in_use: &[u32],
+    ) -> Result<usize, agentdb_core::errors::Error> {
+        self.provider
+            .retire_drained_versions(tenant_id, purpose, versions_in_use)
+            .map_err(|e| {
+                agentdb_core::errors::Error::new(
+                    agentdb_core::errors::ErrorCode::Internal,
+                    format!("tenant key retirement failed: {e}"),
+                )
+            })
     }
 }
 

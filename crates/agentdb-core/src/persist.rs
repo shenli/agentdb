@@ -2477,6 +2477,41 @@ impl Persist {
         Ok(report)
     }
 
+    /// The set of Metadata DEK versions still referenced by a tenant's stored
+    /// rows — the same rows the re-encryption walk covers (primary records,
+    /// events, export-ledger entries). Version retirement uses this to avoid
+    /// retiring a version that still has data. Order is unspecified.
+    pub fn metadata_versions_in_use(&self, tenant_id: &str) -> KvResult<Vec<u32>> {
+        let mut versions: Vec<u32> = Vec::new();
+        let mut note = |bytes: &[u8]| {
+            if is_envelope_v2(bytes) {
+                if let Some(version) = envelope_dek_version(bytes) {
+                    if !versions.contains(&version) {
+                        versions.push(version);
+                    }
+                }
+            }
+        };
+        let prefixes = [
+            format!("record/agent/{tenant_id}/"),
+            format!("record/session/{tenant_id}/"),
+            format!("record/searchable/{tenant_id}/"),
+            format!("record/skill/{tenant_id}/"),
+            format!("record/artifact/{tenant_id}/"),
+            format!("event/{tenant_id}/"),
+            export_ledger_tenant_prefix(tenant_id),
+        ];
+        for prefix in &prefixes {
+            for (_key, value) in self.collect_prefix(prefix.as_bytes())? {
+                note(&value);
+            }
+        }
+        if let Some(value) = self.kv.get(&tenant_record_key(tenant_id).into_bytes())? {
+            note(&value);
+        }
+        Ok(versions)
+    }
+
     /// Drain a prefix scan into memory so the KV iterator is dropped before any
     /// write (some stores dislike writing under a live iterator).
     fn collect_prefix(&self, prefix: &[u8]) -> KvResult<Vec<(Vec<u8>, Vec<u8>)>> {

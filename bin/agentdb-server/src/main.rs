@@ -489,11 +489,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             };
             // The rotator/revoker are the same provider; keep handles to install
             // on the runtime after it is built (the admin key-management paths).
-            let cluster_rotator = cluster_crypto.as_ref().map(|(_, _, r, _)| Arc::clone(r));
-            let cluster_revoker = cluster_crypto.as_ref().map(|(_, _, _, rv)| Arc::clone(rv));
+            let cluster_rotator = cluster_crypto.as_ref().map(|(_, _, r, _, _)| Arc::clone(r));
+            let cluster_revoker = cluster_crypto.as_ref().map(|(_, _, _, rv, _)| Arc::clone(rv));
+            let cluster_retirer = cluster_crypto.as_ref().map(|(_, _, _, _, rt)| Arc::clone(rt));
             let runtime = match config.tablet_store_layout {
                 TabletStoreLayoutKind::PrefixScoped => match cluster_crypto {
-                    Some((keyring, provisioner, _rotator, _revoker)) => {
+                    Some((keyring, provisioner, _rotator, _revoker, _retirer)) => {
                         agentdb_core::Runtime::with_kv_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
                             kv,
                             content,
@@ -542,7 +543,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         "opened grouped RocksDB tablet-store lifecycle"
                     );
                     match cluster_crypto {
-                        Some((keyring, provisioner, _rotator, _revoker)) => {
+                        Some((keyring, provisioner, _rotator, _revoker, _retirer)) => {
                             agentdb_core::Runtime::with_tablet_store_lifecycle_content_keyring_provisioner_and_replicated_logs_for_default_tablet(
                                 lifecycle,
                                 content,
@@ -569,6 +570,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             if let Some(revoker) = cluster_revoker {
                 runtime.set_key_revoker(revoker);
             }
+            if let Some(retirer) = cluster_retirer {
+                runtime.set_key_retirer(retirer);
+            }
             (runtime, content_mirror)
         } else {
             let runtime = match build_encryption_keyring(&kv)? {
@@ -576,7 +580,8 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     let rt =
                         agentdb_core::Runtime::with_kv_content_and_keyring(kv, content, keyring);
                     rt.set_key_rotator(admin.clone());
-                    rt.set_key_revoker(admin);
+                    rt.set_key_revoker(admin.clone());
+                    rt.set_key_retirer(admin);
                     rt
                 }
                 None => agentdb_core::Runtime::with_kv(kv, content),
@@ -2119,6 +2124,7 @@ async fn build_cluster_keyring_and_provisioner(
         Arc<dyn agentdb_core::TenantKeyProvisioner>,
         Arc<dyn agentdb_core::TenantKeyRotator>,
         Arc<dyn agentdb_core::TenantKeyRevoker>,
+        Arc<dyn agentdb_core::TenantKeyRetirer>,
     )>,
 > {
     let Some((kek, suite)) = encryption_kek_and_suite()? else {
@@ -2159,12 +2165,13 @@ async fn build_cluster_keyring_and_provisioner(
         ));
     let provisioner: Arc<dyn agentdb_core::TenantKeyProvisioner> = provider.clone();
     let rotator: Arc<dyn agentdb_core::TenantKeyRotator> = provider.clone();
-    let revoker: Arc<dyn agentdb_core::TenantKeyRevoker> = provider;
+    let revoker: Arc<dyn agentdb_core::TenantKeyRevoker> = provider.clone();
+    let retirer: Arc<dyn agentdb_core::TenantKeyRetirer> = provider;
     tracing::info!(
         suite = suite.as_str(),
         "cluster tenant envelope encryption enabled (shared meta-DB key catalog + local KEK)"
     );
-    Ok(Some((keyring, provisioner, rotator, revoker)))
+    Ok(Some((keyring, provisioner, rotator, revoker, retirer)))
 }
 
 fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<ContentBackendBundle> {
