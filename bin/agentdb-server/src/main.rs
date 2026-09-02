@@ -6695,6 +6695,26 @@ mod tests {
     }
 
     #[test]
+    fn sample_config_parses_as_single_node_file_config() {
+        let file: FileConfig = toml::from_str(SAMPLE_CONFIG).expect("sample config parses");
+        assert_eq!(file.deployment.mode.as_deref(), Some("single_node"));
+        assert_eq!(file.storage.kv.backend.as_deref(), Some("rocksdb"));
+        assert_eq!(file.storage.content.backend.as_deref(), Some("localfs"));
+        // data_dir omitted so the machine-scoped default applies.
+        assert!(file.storage.data_dir.is_none());
+        // The single-node template must not carry cluster-only object-store config.
+        assert!(file.storage.object_store.is_none());
+    }
+
+    #[test]
+    fn cluster_example_config_parses() {
+        let text = include_str!("../../../config/agentdb.cluster.toml");
+        let file: FileConfig = toml::from_str(text).expect("cluster example config parses");
+        assert_eq!(file.deployment.mode.as_deref(), Some("cluster"));
+        assert!(file.storage.object_store.is_some());
+    }
+
+    #[test]
     fn dev_alias_uses_in_memory_runtime() {
         let mut opts = base_opts();
         opts.dev = true;

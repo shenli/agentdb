@@ -1,0 +1,69 @@
+# AgentDB clustered / object-store configuration (EXAMPLE, evaluation-only).
+#
+# The single-node deployment (config/agentdb.toml) is the primary supported
+# shape. Clustered mode — replicated tablets over Raft with object-store-backed
+# content — is evaluation machinery and is not presented at the same support
+# level. This file documents the keys it needs.
+#
+# Support matrix:
+#   single_node + rocksdb + localfs        primary supported deployment
+#   cluster     + object_store content     target clustered deployment (evaluation)
+
+[deployment]
+mode = "cluster"
+
+[server]
+bind = "0.0.0.0:7878"
+# A non-loopback bind requires an API bearer token (prefer the env var).
+# api_auth_token = "change-me-min-16-chars"
+# Cluster internal Raft RPCs require an internal token. Prefer setting
+# AGENTDB_INTERNAL_AUTH_TOKEN instead of committing a secret. Current/previous
+# internal tokens follow the same 16-char, visible-ASCII, no-whitespace rule.
+# internal_auth_token = "change-me-min-16-chars"
+# internal_auth_previous_token = "old-token-min-16-chars"
+
+[storage]
+data_dir = "./agentdb-data"
+
+[storage.kv]
+backend = "rocksdb"
+
+[storage.tablet]
+layout = "grouped_rocksdb"
+
+[storage.content]
+backend = "object_store"
+# In cluster mirror mode (object_store content + local staging), the local copy
+# is a managed cache: objects unread for this TTL whose object-store copy exists
+# are evicted, so cold content lives only in the object store. 0 disables. Default 24h.
+# local_cache_ttl_ms = 86400000
+# cache_sweep_interval_ms = 300000
+
+# Shared object store. Required when storage.content.backend = "object_store".
+# Fixed internal prefixes are used automatically (agentdb/runtime, agentdb/content).
+[storage.object_store]
+backend = "s3" # or "localfs" for local testing / MinIO
+bucket = "my-agentdb"
+region = "us-west-2"
+# endpoint = "http://127.0.0.1:9000"  # optional, useful for MinIO
+# allow_http = true                    # optional, useful for MinIO
+# local_root = "./agentdb-data/object-store"  # for backend = "localfs"
+
+[routing]
+# Required in cluster mode.
+node_id = "node-a"
+# Logical isolation cell. Nodes sharing a value share tablet placement/rebalance.
+cell_id = "default"
+# region = "us-west-2"
+# availability_zone = "us-west-2a"
+capacity_class = "stable" # stable, mixed, or preemptible
+
+# Recovery-manifest backups make the object store a recovery root: a periodic
+# full dump of runtime metadata is uploaded so
+# `agentdb restore-from-bucket --config agentdb.cluster.toml` can rebuild an empty
+# data directory from the bucket alone. Enabled automatically when
+# [storage.object_store] is configured and the server is persistent.
+# [recovery]
+# enabled = true
+# manifest_backup_interval_ms = 300000
+# manifest_max_bytes = 1073741824
