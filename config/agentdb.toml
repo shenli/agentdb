@@ -1,62 +1,55 @@
 # AgentDB single-node configuration.
 #
+# This is the primary supported deployment: one process, local RocksDB metadata,
+# and local artifact storage. Every value below has a sensible default, so an
+# empty file (or no file at all) runs a working single-node server.
+#
 # Run with:
 #   agentdb doctor --config config/agentdb.toml
-#   agentdb serve --config config/agentdb.toml
+#   agentdb serve  --config config/agentdb.toml
+#
+# For a clustered / object-store deployment, see config/agentdb.cluster.toml.
 
 [deployment]
-mode = "single_node" # or "cluster"
+mode = "single_node"
 
 [server]
 bind = "127.0.0.1:7878"
-# dev = true uses ephemeral in-memory state.
+# dev = true uses ephemeral in-memory state (lost on shutdown).
 dev = false
 # A non-loopback HTTP bind requires a bearer token. Prefer setting
-# AGENTDB_API_AUTH_TOKEN instead of committing the current token. During a
-# rotation, set AGENTDB_API_AUTH_PREVIOUS_TOKEN temporarily; remove it after
-# every client has switched. Both values must be at least 16 visible ASCII
-# characters with no whitespace; the previous token requires a current token
-# and must differ from it.
+# AGENTDB_API_AUTH_TOKEN instead of committing the token. During a rotation, set
+# AGENTDB_API_AUTH_PREVIOUS_TOKEN temporarily and remove it after every client
+# has switched. Both values must be at least 16 visible ASCII characters with no
+# whitespace; the previous token requires a current token and must differ from it.
 # api_auth_token = "change-me-min-16-chars"
 # api_auth_previous_token = "old-token-min-16-chars"
-# Required for cluster mode internal Raft RPCs. Prefer setting
-# AGENTDB_INTERNAL_AUTH_TOKEN in production instead of committing a secret.
-# Current and previous internal tokens follow the same 16-character, visible
-# ASCII, no-whitespace rule; a previous token is ignored only after it is
-# removed, never when the current token is absent.
-# internal_auth_token = "change-me-min-16-chars"
-# internal_auth_previous_token = "old-token-min-16-chars"
-
-[mongodb]
-# Optional MongoDB wire-protocol compatibility listener.
-# This is a narrow AgentDB adapter for driver/tool access, not full MongoDB.
-# bind = "127.0.0.1:7879"
-# Optional MongoDB PLAIN authentication. You can also set
-# AGENTDB_MONGODB_USERNAME and AGENTDB_MONGODB_PASSWORD.
-# username = "agentdb"
-# password = "change-me"
 
 [storage]
-data_dir = "./agentdb-data"
+# Omit data_dir to use the machine-scoped default ($AGENTDB_HOME, then
+# $XDG_DATA_HOME/agentdb, then ~/.agentdb). To pin a location, set an ABSOLUTE
+# path here (the loader does not expand ~).
+# data_dir = "/var/lib/agentdb"
 # content_dir defaults to "<data_dir>/content" when omitted.
-# content_dir = "./agentdb-data/content"
+# content_dir = "/var/lib/agentdb/content"
 
 [storage.kv]
-backend = "rocksdb" # or "slatedb"
+backend = "rocksdb"
+
+[storage.content]
+backend = "localfs"
 
 [storage.tablet]
-# Track B tablet-store layout. grouped_rocksdb places hot tablet state in
-# bounded local RocksDB domains. prefix_scoped remains available for local
-# development and narrow debugging.
+# grouped_rocksdb places hot tablet state in bounded local RocksDB domains.
+# prefix_scoped remains available for local development and narrow debugging.
 layout = "grouped_rocksdb" # or "prefix_scoped"
 # root_dir defaults to "<data_dir>/tablet-stores".
-# root_dir = "./agentdb-data/tablet-stores"
-# Number of tablets sharing one RocksDB domain when layout = "grouped_rocksdb".
-# Use 1 only for explicit high-isolation testing; larger values cap memtables.
+# root_dir = "/var/lib/agentdb/tablet-stores"
+# Number of tablets sharing one RocksDB domain. Use 1 only for explicit
+# high-isolation testing; larger values cap memtable count.
 tablets_per_domain = 32
-# Maximum idle grouped RocksDB domains retained open by a node.
-# Memory budget note: mutable memtable capacity is roughly
-# max_open_domains * domain_write_buffer_size_mib * domain_max_write_buffers.
+# Maximum idle grouped RocksDB domains a node keeps open. Rough mutable-memtable
+# budget = max_open_domains * domain_write_buffer_size_mib * domain_max_write_buffers.
 max_open_domains = 16
 domain_write_buffer_size_mib = 16
 domain_max_write_buffers = 2
@@ -64,60 +57,8 @@ domain_parallelism = 1
 domain_max_background_jobs = 1
 domain_max_open_files = 128
 
-# Support matrix:
-# - single_node + rocksdb + localfs: primary supported deployment
-# - single_node + slatedb + s3: testing/evaluation
-# - cluster + slatedb + s3: target clustered deployment
-#
-# Cluster mode requirements:
-# - deployment.mode = "cluster"
-# - storage.kv.backend = "slatedb"
-# - storage.content.backend = "object_store"
-# - storage.object_store.backend = "s3"
-# - routing.node_id must be set
-# - server.internal_auth_token or AGENTDB_INTERNAL_AUTH_TOKEN must be set
-
-# Shared object-store config. Required when:
-# - storage.kv.backend = "slatedb"
-# - storage.content.backend = "object_store"
-# Fixed internal prefixes are used automatically:
-# - KV / SlateDB:     agentdb/runtime
-# - Content / blobs:  agentdb/content
-# [storage.object_store]
-# backend = "s3" # or "localfs" for local testing
-# bucket = "my-agentdb"
-# region = "us-west-2"
-# endpoint = "http://127.0.0.1:9000" # optional, useful for MinIO
-# allow_http = true                   # optional, useful for MinIO
-# local_root = "./agentdb-data/object-store" # for backend = "localfs"
-
-[storage.content]
-backend = "localfs" # or "object_store"
-# In cluster mirror mode (object_store content + LocalFs staging), the local
-# copy is a managed cache: objects unread for this TTL whose object-store
-# copy exists are evicted, so cold content lives only in the object store.
-# 0 disables eviction. Default: 24h.
-# local_cache_ttl_ms = 86400000
-# cache_sweep_interval_ms = 300000
-
-[routing]
-# Required in cluster mode.
-# node_id = "node-a"
-# Logical isolation cell for this node. Use the same value for nodes that
-# should share tablet placement and rebalance.
-cell_id = "default"
-# Region and AZ labels used by routing status and replica placement.
-# region = "us-west-2"
-# availability_zone = "us-west-2a"
-# stable, mixed, or preemptible.
-capacity_class = "stable"
-
-# Recovery-manifest backups make the object store a recovery root: a
-# periodic full dump of runtime metadata is uploaded so
-# `agentdb restore-from-bucket --config agentdb.toml` can rebuild an empty
-# data directory from the bucket alone. Enabled automatically when
-# [storage.object_store] is configured and the server is persistent.
-# [recovery]
-# enabled = true
-# manifest_backup_interval_ms = 300000
-# manifest_max_bytes = 1073741824
+# Tenant envelope encryption (optional, opt-in). See
+# docs/operations/single-node-production-checklist.md for the KEK and KMS options.
+# Set via environment, not this file:
+#   AGENTDB_ENCRYPTION_MODE=envelope
+#   AGENTDB_ENCRYPTION_KEK_SECRET=<high-entropy secret>   # or KEK_PROVIDER=command
