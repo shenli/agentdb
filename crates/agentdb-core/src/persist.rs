@@ -1275,7 +1275,12 @@ impl Persist {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(5);
         ops.push(WriteOp::Put {
             key: agent_record_key(a.tenant_id.as_str(), a.agent_id.as_str()).into_bytes(),
-            value: serde_json::to_vec(a).expect("agent serializes"),
+            value: self.encrypt_primary_row(
+                a.tenant_id.as_str(),
+                MetadataObjectKind::Agent,
+                a.agent_id.as_str(),
+                a,
+            )?,
         });
         if let Some(alias) = a.alias.as_deref() {
             if !alias.is_empty() {
@@ -2242,6 +2247,92 @@ impl Persist {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
     }
 
+    // ----- primary-record envelope encryption -----
+    //
+    // Tenant/agent/session/record/skill primary rows are sealed under the tenant
+    // Metadata DEK, mirroring the artifact path. Each row's AAD binds its
+    // `(tenant, object_kind, object_id)`, so a ciphertext cannot be moved to a
+    // different record. When the keyring is disabled these route through the
+    // identity/legacy path, so plaintext deployments are unaffected, and reads
+    // detect the frame version (a disabled→enabled rollout stays readable).
+
+    /// Seal a primary record's JSON under the tenant Metadata DEK.
+    fn encrypt_primary_row<T: serde::Serialize>(
+        &self,
+        tenant_id: &str,
+        object_kind: MetadataObjectKind,
+        object_id: &str,
+        value: &T,
+    ) -> KvResult<Vec<u8>> {
+        let context = MetadataCryptoContext {
+            tenant_id,
+            object_kind,
+            object_id,
+            key: None,
+        };
+        self.encrypt_metadata(
+            &context,
+            &serde_json::to_vec(value).expect("primary record serializes"),
+        )
+    }
+
+    /// Point-read a single envelope-encrypted primary row and decode it.
+    fn get_encrypted_json_row<T: serde::de::DeserializeOwned>(
+        &self,
+        key: String,
+        tenant_id: &str,
+        object_kind: MetadataObjectKind,
+        object_id: &str,
+    ) -> KvResult<Option<T>> {
+        let Some(bytes) = self.kv.get(key.as_bytes())? else {
+            return Ok(None);
+        };
+        let context = MetadataCryptoContext {
+            tenant_id,
+            object_kind,
+            object_id,
+            key: None,
+        };
+        let plaintext = self.decrypt_metadata(&context, &bytes)?;
+        Ok(Some(serde_json::from_slice(&plaintext).map_err(|err| {
+            agentdb_storage::Error::Other(format!("primary record at {key} does not decode: {err}"))
+        })?))
+    }
+
+    /// Decrypt-and-decode one row yielded by a primary-record prefix scan. The
+    /// AAD context is reconstructed from the full key
+    /// `record/{kind}/{tenant_id}/{object_id}` (the last two `/`-segments), which
+    /// is exactly what the write path sealed under.
+    fn decrypt_primary_scan_value<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        object_kind: MetadataObjectKind,
+    ) -> KvResult<T> {
+        let key_str = std::str::from_utf8(key)
+            .map_err(|_| agentdb_storage::Error::Other("primary record key is not utf8".into()))?;
+        let (tenant_id, object_id) = key_str
+            .rsplit_once('/')
+            .and_then(|(rest, object_id)| {
+                rest.rsplit_once('/').map(|(_, tenant_id)| (tenant_id, object_id))
+            })
+            .ok_or_else(|| {
+                agentdb_storage::Error::Other(format!("unexpected primary record key {key_str}"))
+            })?;
+        let context = MetadataCryptoContext {
+            tenant_id,
+            object_kind,
+            object_id,
+            key: None,
+        };
+        let plaintext = self.decrypt_metadata(&context, value)?;
+        serde_json::from_slice(&plaintext).map_err(|err| {
+            agentdb_storage::Error::Other(format!(
+                "primary record at {key_str} does not decode: {err}"
+            ))
+        })
+    }
+
     // Point reads for the cache-miss fallback path: the in-memory maps are a
     // cache over these rows, not the authority. Deleted rows are returned
     // as-is (soft-delete tombstones) so callers' liveness filters apply.
@@ -2250,7 +2341,12 @@ impl Persist {
     }
 
     pub fn get_agent_row(&self, tenant_id: &str, agent_id: &str) -> KvResult<Option<Agent>> {
-        self.get_json_row(agent_record_key(tenant_id, agent_id))
+        self.get_encrypted_json_row(
+            agent_record_key(tenant_id, agent_id),
+            tenant_id,
+            MetadataObjectKind::Agent,
+            agent_id,
+        )
     }
 
     pub fn get_session_row(&self, tenant_id: &str, session_id: &str) -> KvResult<Option<Session>> {
@@ -2285,7 +2381,12 @@ impl Persist {
         tenant_id: &str,
         record_id: &str,
     ) -> KvResult<Option<SearchableRecord>> {
-        self.get_json_row(record_key(tenant_id, record_id))
+        self.get_encrypted_json_row(
+            record_key(tenant_id, record_id),
+            tenant_id,
+            MetadataObjectKind::Record,
+            record_id,
+        )
     }
 
     pub fn scan_tenant_records(&self, tenant_id: &str) -> KvResult<Vec<SearchableRecord>> {
@@ -2293,10 +2394,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(prefix.as_bytes())?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            out.push(serde_json::from_slice(&v).map_err(|err| {
-                agentdb_storage::Error::Other(format!("record row does not decode: {err}"))
-            })?);
+            let (k, v) = res?;
+            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Record)?);
         }
         Ok(out)
     }
@@ -2321,10 +2420,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(prefix.as_bytes())?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            out.push(serde_json::from_slice(&v).map_err(|err| {
-                agentdb_storage::Error::Other(format!("agent row does not decode: {err}"))
-            })?);
+            let (k, v) = res?;
+            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Agent)?);
         }
         Ok(out)
     }
@@ -2385,9 +2482,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(b"record/agent/")?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            let a: Agent = serde_json::from_slice(&v).expect("agent decodes");
-            out.push(a);
+            let (k, v) = res?;
+            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Agent)?);
         }
         Ok(out)
     }
@@ -2573,7 +2669,12 @@ impl Persist {
         let mut ops: Vec<WriteOp> = vec![
             WriteOp::Put {
                 key: record_key(r.tenant_id.as_str(), r.record_id.as_str()).into_bytes(),
-                value: serde_json::to_vec(r).expect("record serializes"),
+                value: self.encrypt_primary_row(
+                    r.tenant_id.as_str(),
+                    MetadataObjectKind::Record,
+                    r.record_id.as_str(),
+                    r,
+                )?,
             },
             WriteOp::Put {
                 key: record_by_namespace_key(
@@ -2679,7 +2780,12 @@ impl Persist {
             WriteOp::Put {
                 key: skill_record_key(skill.tenant_id.as_str(), skill.skill_id.as_str())
                     .into_bytes(),
-                value: serde_json::to_vec(skill).expect("skill serializes"),
+                value: self.encrypt_primary_row(
+                    skill.tenant_id.as_str(),
+                    MetadataObjectKind::Skill,
+                    skill.skill_id.as_str(),
+                    skill,
+                )?,
             },
             WriteOp::Put {
                 key: skill_unique_key(skill.tenant_id.as_str(), &skill.name, &skill.version)
@@ -2801,10 +2907,12 @@ impl Persist {
         tenant_id: &str,
         record_id: &str,
     ) -> KvResult<Option<SearchableRecord>> {
-        let raw = self.kv.get(record_key(tenant_id, record_id).as_bytes())?;
-        let Some(bytes) = raw else { return Ok(None) };
-        let r: SearchableRecord = serde_json::from_slice(&bytes).expect("record decodes");
-        Ok(Some(r))
+        self.get_encrypted_json_row(
+            record_key(tenant_id, record_id),
+            tenant_id,
+            MetadataObjectKind::Record,
+            record_id,
+        )
     }
 
     /// Hydrate every searchable record from the KV store. The
@@ -2816,9 +2924,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(b"record/searchable/")?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            let r: SearchableRecord = serde_json::from_slice(&v).expect("record decodes");
-            out.push(r);
+            let (k, v) = res?;
+            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Record)?);
         }
         Ok(out)
     }
@@ -2954,7 +3061,12 @@ impl Persist {
     }
 
     pub fn get_skill_row(&self, tenant_id: &str, skill_id: &str) -> KvResult<Option<Skill>> {
-        self.get_json_row(skill_record_key(tenant_id, skill_id))
+        self.get_encrypted_json_row(
+            skill_record_key(tenant_id, skill_id),
+            tenant_id,
+            MetadataObjectKind::Skill,
+            skill_id,
+        )
     }
 
     /// Value of the `(tenant, name, version)` uniqueness row: the skill id.
@@ -2981,8 +3093,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(prefix.as_bytes())?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            out.push(serde_json::from_slice(&v).expect("skill decodes"));
+            let (k, v) = res?;
+            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Skill)?);
         }
         Ok(out)
     }
@@ -3005,9 +3117,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(b"record/skill/")?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            let skill: Skill = serde_json::from_slice(&v).expect("skill decodes");
-            out.push(skill);
+            let (k, v) = res?;
+            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Skill)?);
         }
         Ok(out)
     }

@@ -3,14 +3,12 @@
 //! every durable path and asserts, per path, whether that marker appears in the
 //! raw bytes on disk.
 //!
-//! This is the regression detector the design calls for. It is intentionally
-//! two-sided:
-//!   - Paths that ARE encrypted (events, artifact content) must show NO marker
-//!     in raw storage — a leak here is a regression.
-//!   - Paths NOT yet encrypted (agent config, searchable records, skills) are
-//!     asserted to STILL leak, so this test doubles as a tripwire: when a later
-//!     milestone encrypts one of them, this assertion flips and forces the
-//!     coverage map to be updated deliberately.
+//! This is the regression detector the design calls for. Every durable path
+//! whose payload is sealed at rest must show NO marker in raw storage — a leak
+//! is a regression. As of M17 that includes events, artifact content, and the
+//! agent/record/skill primary records (M17). Any still-plaintext path added
+//! here should assert `marker_in` as a tripwire, so encrypting it later forces
+//! this coverage map to be updated deliberately.
 
 use std::sync::Arc;
 
@@ -145,18 +143,97 @@ async fn raw_storage_marker_coverage_map() {
         "artifact content leaked into raw content storage (M2 regression)"
     );
 
-    // --- Not-yet-encrypted paths: tripwires. When a later milestone encrypts
-    //     one of these, the assertion flips — update this coverage map then. ---
+    // --- Primary records encrypted in M17: a marker here would be a regression.
+    //     (Their export-ledger copies were already encrypted earlier.) ---
     assert!(
-        marker_in(&kv_values, AGENT_MARKER),
-        "agent config is now encrypted — extend the coverage map"
+        !marker_in(&kv_values, AGENT_MARKER),
+        "agent config leaked into a raw KV value (M17 regression)"
     );
     assert!(
-        marker_in(&kv_values, RECORD_MARKER),
-        "searchable record is now encrypted — extend the coverage map (note: also the export ledger)"
+        !marker_in(&kv_values, RECORD_MARKER),
+        "searchable record leaked into a raw KV value (M17 regression)"
     );
     assert!(
-        marker_in(&kv_values, SKILL_MARKER),
-        "skill manifest is now encrypted — extend the coverage map"
+        !marker_in(&kv_values, SKILL_MARKER),
+        "skill manifest leaked into a raw KV value (M17 regression)"
     );
+}
+
+/// The M17 primary-record encryption must round-trip through a *fresh* runtime
+/// that hydrates by scanning + decrypting the sealed rows — the read side of the
+/// coverage above. A second runtime over the same store with the same keyring
+/// reconstructs every agent/record/skill and its secret payload.
+#[tokio::test]
+async fn primary_records_round_trip_through_hydration() {
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+    let content = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv_content_and_keyring(
+        kv.clone(),
+        content.clone() as Arc<dyn ContentBackend>,
+        envelope_keyring(),
+    );
+
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "roundtrip".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: Some("agent".into()),
+            config: serde_json::json!({ "secret": "AGENT-SECRET-payload" }),
+        })
+        .await
+        .unwrap();
+    rt.write_record(NewRecord {
+        tenant_id: t.tenant_id.clone(),
+        external_id: None,
+        namespace: vec!["n".into()],
+        scope: serde_json::json!({}),
+        text: Some("RECORD-SECRET-payload".into()),
+        metadata: serde_json::json!({}),
+        tags: vec![],
+        source: None,
+        embedding: None,
+        policy: IndexingPolicy::default(),
+        expires_at_ms: None,
+    })
+    .await
+    .unwrap();
+    rt.register_skill(
+        NewSkill {
+            tenant_id: t.tenant_id.clone(),
+            name: "skill".into(),
+            version: "1.0.0".into(),
+            manifest: serde_json::json!({ "secret": "SKILL-SECRET-payload" }),
+            artifact_refs: vec![],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    // A brand-new runtime over the SAME store + an equivalent keyring hydrates by
+    // scanning and decrypting the sealed primary rows.
+    let rt2 = Runtime::with_kv_content_and_keyring(
+        kv.clone(),
+        content.clone() as Arc<dyn ContentBackend>,
+        envelope_keyring(),
+    );
+
+    let agents = rt2.list_agents(&t.tenant_id).await.unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].agent_id, a.agent_id);
+    assert_eq!(agents[0].config["secret"], "AGENT-SECRET-payload");
+
+    let records = rt2.list_records(&t.tenant_id).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].text.as_deref(), Some("RECORD-SECRET-payload"));
+
+    let skills = rt2.list_skills(&t.tenant_id).await.unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].manifest["secret"], "SKILL-SECRET-payload");
 }

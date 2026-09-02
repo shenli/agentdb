@@ -110,9 +110,11 @@ to be updated when a later milestone encrypts one of them. Current coverage:
 | Artifact content | **Yes** (M2) |
 | Artifact metadata row | **Yes** (M3) |
 | Session segments / archives / replay prefixes | **Yes** (M2) |
-| Agent / session / tenant records | No |
-| Searchable records (+ their export-ledger copy) | No |
-| Skills | No |
+| Agent primary records | **Yes** (M17) |
+| Searchable record primary rows | **Yes** (M17) |
+| Skill primary records | **Yes** (M17) |
+| Export-ledger entries (all object types) | **Yes** (already sealed via `encrypt_metadata`) |
+| Session / tenant primary records | No (follow-up; tenant is bootstrap-sensitive) |
 | Secondary indexes, aliases, idempotency, commit/outbox | No (routing/control; keys stay plaintext for scans) |
 
 **Milestone 5 (landed): encryption precedes the Raft log in the clustered
@@ -278,14 +280,31 @@ keyring cache afterwards; the admin endpoint `POST /api/admin/tenants/{id}/revok
 every layer, including that a freshly-loaded cluster node will not serve a
 revoked key.
 
+**Milestone 17 (landed): primary-record coverage for agents, records, and
+skills.** The agent, searchable-record, and skill **primary rows** are now sealed
+under the tenant Metadata DEK, closing the plaintext gaps the coverage map
+tracked (their export-ledger copies were already encrypted). Each row's AAD binds
+its `(tenant, object_kind, object_id)` via new `MetadataObjectKind` variants, so
+a ciphertext cannot be moved between rows. Every write path routes the primary
+value through `encrypt_metadata`, and every read path — point reads
+(`get_*_row`), tenant scans, and the startup **hydration** scans (`scan_all_*`) —
+routes through `decrypt_metadata`, reconstructing the AAD from the key. With the
+keyring disabled the rows take the identity/legacy path unchanged, so plaintext
+deployments are unaffected and a disabled→enabled rollout stays readable. The
+coverage-map tripwires for agent/record/skill are flipped to assert *no* leak,
+and a new test round-trips all three through a fresh runtime that hydrates by
+decrypting.
+
 **Not yet done:** the background DEK re-encryption walk
 (rewriting old-version ciphertext so a rotated-away version can be retired) and a
 rotation/revocation CLI; and the
 `LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
-Agent/session/tenant primary records, searchable records, and skills are still
-plaintext at rest (their export-ledger copies are already encrypted; the search
-index is in-memory, not at rest). Event AAD binds tenant + session + kind (not
-yet the per-event seq). Dedicated-domain placement enforcement remains.
+Session and tenant primary records are still plaintext at rest (tenant is
+bootstrap-sensitive — deferred). Event AAD binds tenant + session + kind (not
+yet the per-event seq). Dedicated-domain placement enforcement remains, as does
+graceful hydration when a tenant's rows are undecryptable after a crypto-shred
+(today a `scan_all_*` decrypt error propagates — a pre-existing behavior shared
+with the already-encrypted artifact path).
 
 The pre-existing seams remain as the integration points those stages build on:
 

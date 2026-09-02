@@ -12,6 +12,11 @@ use crate::kms::KeyResolution;
 pub enum MetadataObjectKind {
     Artifact,
     Event,
+    Agent,
+    Session,
+    Record,
+    Skill,
+    Tenant,
 }
 
 impl MetadataObjectKind {
@@ -19,6 +24,11 @@ impl MetadataObjectKind {
         match self {
             Self::Artifact => "artifact",
             Self::Event => "event",
+            Self::Agent => "agent",
+            Self::Session => "session",
+            Self::Record => "record",
+            Self::Skill => "skill",
+            Self::Tenant => "tenant",
         }
     }
 }
