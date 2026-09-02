@@ -309,10 +309,23 @@ encryption is safe because the Metadata DEK is minted before the first
 first seal (single-node). The coverage map gains a tenant-policy tripwire, and
 the hydration round-trip test now also reconstructs the session and tenant.
 
+**Milestone 19 (landed): the external / KMS KEK seam.** Alongside the in-process
+`LocalKekProvider`, a `CommandKekProvider` delegates DEK wrap/unwrap to an
+external program — the KMS/HSM integration point, where **the KEK never enters
+AgentDB's process**. The program is invoked per key operation with the operation
+(`wrap`/`unwrap`), tenant, purpose, and KEK ref in the environment (so a wrapper
+can bind tenant+purpose as the KMS encryption context) and the raw bytes on
+stdin/stdout; a non-zero exit fails closed. Because DEKs are cached, this runs
+only on a cache miss or a key operation. The server selects it with
+`AGENTDB_ENCRYPTION_KEK_PROVIDER=command` +
+`AGENTDB_ENCRYPTION_KEK_COMMAND[_ARGS]` (default `local`), on both the single-node
+and cluster paths, so BYOK deployments plug in `aws kms`, `vault transit`, or an
+HSM CLI without code changes. A real KMS SDK provider is now just another
+`KekProvider`.
+
 **Not yet done:** the background DEK re-encryption walk
 (rewriting old-version ciphertext so a rotated-away version can be retired) and a
-rotation/revocation CLI; and the
-`LocalKekProvider` (KEK from a config secret) is not yet a KMS integration.
+rotation/revocation CLI.
 Event AAD binds tenant + session + kind (not yet the per-event seq).
 Dedicated-domain placement enforcement remains, as does graceful hydration when a
 tenant's rows are undecryptable after a crypto-shred (today a `scan_all_*`

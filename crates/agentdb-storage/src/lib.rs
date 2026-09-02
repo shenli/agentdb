@@ -31,7 +31,7 @@ pub use crypto::{
     is_envelope_v2, AeadTenantKeyring, CatalogKeyProvider, CryptoConfig, CryptoContext, CryptoError,
     CryptoMode, Dek, DekCacheConfig, DekLease, DekRecord, DekStatus, DisabledEnvelopeCrypto,
     EnvelopeCrypto, EnvelopeParts, KekProvider, KeyCatalog, KeyMetadata, KeyProvider, KeyPurpose,
-    LocalKekProvider, LocalKeyProvider, Suite, WrappedDek,
+    CommandKekProvider, LocalKekProvider, LocalKeyProvider, Suite, WrappedDek,
 };
 pub use error::{Error, Result};
 pub use kms::{

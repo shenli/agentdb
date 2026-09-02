@@ -160,10 +160,29 @@ layouts fail closed if it is requested).
   AGENTDB_ENCRYPTION_SUITE=xchacha20-poly1305           # or aes-256-gcm (default xchacha)
   ```
 
-- [ ] **The KEK secret is critical.** It wraps every per-tenant data key; losing
-  it makes all encrypted data permanently unreadable (that is also the
-  crypto-shred property). Store it in a secrets manager, back it up
-  independently of the data volume, and never log it.
+- [ ] **KMS / BYOK (recommended for production):** instead of a local KEK secret,
+  delegate DEK wrap/unwrap to an external program so the KEK never enters the
+  AgentDB process:
+
+  ```bash
+  AGENTDB_ENCRYPTION_MODE=envelope
+  AGENTDB_ENCRYPTION_KEK_PROVIDER=command
+  AGENTDB_ENCRYPTION_KEK_COMMAND=/usr/local/bin/agentdb-kek   # your KMS/HSM wrapper
+  AGENTDB_ENCRYPTION_KEK_COMMAND_ARGS=                        # optional, whitespace-separated
+  AGENTDB_ENCRYPTION_KEK_REF=kms:my-key-v1                    # label recorded in the catalog
+  ```
+
+  The program is run once per key operation with env `AGENTDB_KEK_OP`
+  (`wrap`/`unwrap`), `AGENTDB_KEK_TENANT`, `AGENTDB_KEK_PURPOSE`, and
+  `AGENTDB_KEK_REF`; it reads the raw input on **stdin** (the 32-byte DEK for
+  `wrap`, the wrapped blob for `unwrap`) and writes the raw result on **stdout**.
+  Bind tenant+purpose as your KMS encryption context. A non-zero exit fails
+  closed. DEKs are cached, so the program is invoked only on a cache miss or a
+  key operation.
+- [ ] **The KEK is critical.** It wraps every per-tenant data key; losing it (the
+  local secret, or access to the KMS key) makes all encrypted data permanently
+  unreadable (that is also the crypto-shred property). Store it in a secrets
+  manager / KMS, back it up independently of the data volume, and never log it.
 - [ ] Enabling on an existing deployment encrypts **new** writes; previously
   written plaintext stays readable (mixed reader). There is no in-place bulk
   migration yet.

@@ -1981,6 +1981,62 @@ fn build_encryption_keyring(
 /// Pure builder (env-free, so it is unit-testable): turn resolved encryption
 /// settings into a keyring + rotator, or `None` when disabled. Fails closed if
 /// envelope mode is requested without a KEK secret.
+/// Build the KEK provider from `AGENTDB_ENCRYPTION_KEK_PROVIDER`:
+/// - `local` (default): an in-process KEK derived from
+///   `AGENTDB_ENCRYPTION_KEK_SECRET` (the `secret` arg). Requires the secret.
+/// - `command`: delegates wrap/unwrap to the external program in
+///   `AGENTDB_ENCRYPTION_KEK_COMMAND` (with optional whitespace-separated
+///   `AGENTDB_ENCRYPTION_KEK_COMMAND_ARGS`) — the KMS/HSM seam, where the KEK
+///   never enters this process. The secret is not needed.
+///
+/// `kek_ref` (from `AGENTDB_ENCRYPTION_KEK_REF`) labels the KEK in the catalog so
+/// a rewrap can find DEKs to re-wrap when the KEK changes.
+fn resolve_kek_provider(
+    secret: Option<&str>,
+    kek_ref: &str,
+) -> anyhow::Result<Arc<dyn agentdb_storage::KekProvider>> {
+    let provider =
+        std::env::var("AGENTDB_ENCRYPTION_KEK_PROVIDER").unwrap_or_else(|_| "local".to_string());
+    match provider.trim() {
+        "" | "local" => {
+            let secret = secret.filter(|s| !s.is_empty()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the local KEK requires a non-empty AGENTDB_ENCRYPTION_KEK_SECRET (the \
+                     key-encryption-key secret; losing it makes encrypted data unreadable)"
+                )
+            })?;
+            Ok(Arc::new(agentdb_storage::LocalKekProvider::from_secret(
+                secret.as_bytes(),
+                kek_ref.to_string(),
+            )))
+        }
+        "command" => {
+            let program = std::env::var("AGENTDB_ENCRYPTION_KEK_COMMAND")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "AGENTDB_ENCRYPTION_KEK_PROVIDER=command requires \
+                         AGENTDB_ENCRYPTION_KEK_COMMAND (the KMS wrapper program)"
+                    )
+                })?;
+            let args = std::env::var("AGENTDB_ENCRYPTION_KEK_COMMAND_ARGS")
+                .ok()
+                .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>())
+                .unwrap_or_default();
+            tracing::info!(program = %program, "KEK provider: external command (KMS delegation)");
+            Ok(Arc::new(agentdb_storage::CommandKekProvider::new(
+                program,
+                args,
+                kek_ref.to_string(),
+            )))
+        }
+        other => anyhow::bail!(
+            "unknown AGENTDB_ENCRYPTION_KEK_PROVIDER {other:?} (expected local|command)"
+        ),
+    }
+}
+
 fn keyring_from_settings(
     mode: &str,
     secret: Option<&str>,
@@ -1991,13 +2047,6 @@ fn keyring_from_settings(
     match mode.trim() {
         "" | "disabled" => Ok(None),
         "envelope" => {
-            let secret = secret.filter(|s| !s.is_empty()).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "AGENTDB_ENCRYPTION_MODE=envelope requires a non-empty \
-                     AGENTDB_ENCRYPTION_KEK_SECRET (the key-encryption-key secret; losing it \
-                     makes encrypted data unreadable)"
-                )
-            })?;
             let suite = match suite {
                 Some("aes-256-gcm") => agentdb_storage::Suite::Aes256Gcm,
                 Some("xchacha20-poly1305") | None => agentdb_storage::Suite::XChaCha20Poly1305,
@@ -2005,10 +2054,7 @@ fn keyring_from_settings(
                     "unknown AGENTDB_ENCRYPTION_SUITE {other:?} (expected aes-256-gcm|xchacha20-poly1305)"
                 ),
             };
-            let kek = Arc::new(agentdb_storage::LocalKekProvider::from_secret(
-                secret.as_bytes(),
-                kek_ref.to_string(),
-            ));
+            let kek = resolve_kek_provider(secret, kek_ref)?;
             let provider = Arc::new(agentdb_storage::CatalogKeyProvider::new(
                 agentdb_storage::KeyCatalog::new(kv.clone()),
                 kek,
@@ -2042,13 +2088,7 @@ fn encryption_kek_and_suite(
         "envelope" => {
             let secret = std::env::var("AGENTDB_ENCRYPTION_KEK_SECRET")
                 .ok()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "AGENTDB_ENCRYPTION_MODE=envelope requires a non-empty \
-                         AGENTDB_ENCRYPTION_KEK_SECRET"
-                    )
-                })?;
+                .filter(|s| !s.is_empty());
             let kek_ref = std::env::var("AGENTDB_ENCRYPTION_KEK_REF")
                 .unwrap_or_else(|_| "local:v1".to_string());
             let suite = match std::env::var("AGENTDB_ENCRYPTION_SUITE").as_deref() {
@@ -2058,9 +2098,7 @@ fn encryption_kek_and_suite(
                     "unknown AGENTDB_ENCRYPTION_SUITE {other:?} (expected aes-256-gcm|xchacha20-poly1305)"
                 ),
             };
-            let kek: Arc<dyn agentdb_storage::KekProvider> = Arc::new(
-                agentdb_storage::LocalKekProvider::from_secret(secret.as_bytes(), kek_ref),
-            );
+            let kek = resolve_kek_provider(secret.as_deref(), &kek_ref)?;
             Ok(Some((kek, suite)))
         }
         other => {
