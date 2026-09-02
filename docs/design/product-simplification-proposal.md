@@ -1,7 +1,9 @@
 # AgentDB Product Simplification Proposal
 
 **Status:** Proposal, revised 2026-09-01 after a code inventory at `main`
-@ `385069f`; work-in-flight and deployment sections checked against `52cc332`  
+@ `385069f`; work-in-flight and deployment sections checked against `52cc332`.
+Encryption status refreshed 2026-09-02 against `main` @ `af6538c` (M1–M24 merged);
+the commit-pinned measurement tables are left as historical snapshots.  
 **Scope:** Product boundary, public API, packaging, and sequencing  
 **Does not change:** Current runtime behavior, compatibility commitments, or
 implementation status
@@ -67,15 +69,24 @@ what happens to the two active streams that fall on its defer list.
   cluster tests stay green and continue to run in CI. No new tablet, routing,
   Raft, or movement surface is added until a measured single-node limit or a
   named design partner requires it.
-- **Encryption at rest (#302 M1, #303 M2, #304 M3 merged).** The boundary
-  is: authenticated encryption on every durable path (content, events,
-  metadata) under a locally configured key, with restore validated, is *basic
-  encryption* and is core. M2 and M3 of
-  [`encryption-at-rest.md`](encryption-at-rest.md) deliver that for content,
-  events, and metadata values; extending coverage to the remaining durable
-  types and validating restore completes the core requirement. The
-  wrapped-DEK catalog, KMS integration, rotation, and revocation workflows
-  are deferred.
+- **Encryption at rest (#302–#325, M1–M24 merged).** The full effort shipped
+  since this proposal was first written, well past the *basic encryption*
+  boundary. Basic encryption — authenticated encryption on every durable path
+  under a locally configured key — is *core*, and it is done: content, events,
+  metadata values, and every primary record (tenant/agent/session/record/skill)
+  plus the export ledger are sealed, single-node and cluster, with per-event AAD.
+  But the advanced key-management this proposal had listed as *deferred* is also
+  built: a wrapped-DEK catalog, a pluggable KMS/HSM seam (`CommandKekProvider`),
+  online DEK rotation, two-phase revocation / crypto-shred, a data-plane
+  re-encryption walk, verification-gated version retirement, admin endpoints, and
+  an `agentdbctl encryption` CLI. This is a body of *not-core* capability
+  delivered ahead of a named customer or a measured need — exactly what the
+  proposal argues to defer. It should not be undone, but it needs an explicit
+  stability label: basic envelope encryption is **Core**; the rotation / revoke /
+  re-encrypt / retire admin surface and CLI are **Internal** (operator machinery,
+  no application-level compatibility promise); the KMS seam is Core-enabling but
+  not advertised in the beginner path. See the reclassification in Decision
+  Question 5 and Appendix A.
 
 ## Proposed Product Boundary
 
@@ -152,9 +163,13 @@ limit, or a supported hosted-product requirement:
 
 - production distributed tablets and their public control-plane API;
 - additional SDK languages or a binary application protocol;
-- sink-specific export products beyond the changefeed;
-- customer-managed key catalogs, rotation, and revocation workflows; and
+- sink-specific export products beyond the changefeed; and
 - automated multi-tier storage orchestration beyond bounded retention.
+
+Customer-managed key catalogs, rotation, and revocation workflows were on this
+list; they have since been built (M6–M24) rather than deferred. They stay in the
+codebase but are labeled **Internal** rather than advertised — see §Relationship
+To Work In Flight and Decision Question 5.
 
 ## Simplified Public Model
 
@@ -580,8 +595,16 @@ Answers reflect the inventory; the team should confirm them.
    do.
 4. **Which requirement justifies exposing the tablet control plane?** None
    identified. The roadmap and thesis both call it evaluation machinery.
-5. **Which customer requires AgentDB-owned BYOK rotation?** None identified.
-   Basic encryption stays core as defined above.
+5. **Which customer requires AgentDB-owned BYOK rotation?** None identified —
+   yet the full key-management stack (wrapped-DEK catalog, KMS/HSM seam, rotation,
+   revocation/crypto-shred, re-encryption, version retirement, CLI) was built
+   anyway (M6–M24), ahead of that evidence. Recommendation: keep it, but label
+   it. Basic envelope encryption is **Core** and on by default; the
+   rotate/revoke/re-encrypt/retire admin endpoints and `agentdbctl encryption`
+   CLI are **Internal** (operator-only, no compatibility promise) and stay out of
+   the quickstart and the twelve SDK methods; the `CommandKekProvider` KMS seam
+   is Core-enabling configuration, not an advertised concept. This keeps the
+   beginner surface at the four nouns without discarding shipped, tested work.
 6. **Can subscribe, watch, and export be one cursor contract?** Yes. The
    export ledger already carries every event in commit order; watch's only
    unique feature is the `fork_edge` item, which the changefeed keeps.
@@ -605,6 +628,7 @@ Counts are registered paths at `385069f`.
 | Internal | agent create/get/list/delete, session create under agent | 3 | keep; path shape no longer required by applications |
 | Internal | `/api/me`, `/api/storage/summary`, `/api/policy/worker/run` | 3 | keep |
 | Internal | tokens, tenant policies, indexes, content mirror, recovery, backups, restores, exports admin | 10 | keep, always mounted |
+| Internal | encryption DEK admin: rotate, revoke, reencrypt, retire-versions | 4 | keep, always mounted; added post-inventory (M15–M23), not in the 101 |
 | Internal | cluster, nodes, cells, stores, scheduler, drain, tablets, tablet ranges, movements, routing, Raft | 35 | mounted only in cluster mode |
 | Internal | `/api/internal/*` Raft messages, snapshots, faults, movement export | 5 | mounted only in cluster mode |
 | Labs | records, upsert, touch, search | 5 | behind `labs` |
