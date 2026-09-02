@@ -256,7 +256,7 @@ def context_source_refs(context: Mapping[str, Any], *, max_refs: Optional[int] =
     """Build `source_refs` from a context response.
 
     The context pack is a derived view. These refs preserve a compact pointer
-    back to the durable events, records, and skills that shaped that view.
+    back to the durable events and records that shaped that view.
     """
 
     refs = []
@@ -268,10 +268,6 @@ def context_source_refs(context: Mapping[str, Any], *, max_refs: Optional[int] =
         record_id = _field(record, "record_id", "recordId")
         if record_id is not None:
             refs.append({"record_id": record_id})
-    for skill in context.get("skills") or []:
-        skill_id = _field(skill, "skill_id", "skillId")
-        if skill_id is not None:
-            refs.append({"skill_id": skill_id})
     if max_refs is not None:
         return refs[:max_refs]
     return refs

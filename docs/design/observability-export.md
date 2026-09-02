@@ -245,7 +245,6 @@ It should include changes for:
 - event append
 - artifact metadata creation/update/delete
 - record write/delete
-- skill registration/binding changes
 - session lifecycle transitions
 - policy changes that affect retention or observability interpretation
 - tombstones for deletes and retention-driven purges
@@ -357,7 +356,7 @@ POST /api/tenants/{tenant_id}/exports/backfill
   "scope": "tenant" | "agent" | "session",
   "agent_id": "...",
   "session_id": "...",
-  "include": ["sessions", "events", "artifacts", "records", "skills", "policy"],
+  "include": ["sessions", "events", "artifacts", "records", "policy"],
   "from_cursor": "...",
   "limit": 1000
 }
@@ -418,8 +417,6 @@ session
 event
 artifact
 record
-skill
-skill_binding
 policy
 consumer
 ```
@@ -502,7 +499,6 @@ agentdb_events
 agentdb_event_refs
 agentdb_artifacts
 agentdb_records
-agentdb_skills
 agentdb_metrics_1m
 agentdb_tombstones
 agentdb_export_checkpoints
@@ -836,7 +832,7 @@ Response:
   durable ledger capability and supported object types.
 - Implemented: `POST /api/tenants/{tenant_id}/exports/backfill` with event
   snapshots plus tenant-scope metadata snapshots for tenants, agents, sessions,
-  artifacts, records, skills, and skill bindings.
+  artifacts, and records.
 - Implemented: explicit persisted cursor validation and
   `oldest_available_cursor` reporting for export watch, backfill, and status.
 - Implemented: commit-ordered v2 durable cursors backed by a persisted
@@ -857,8 +853,8 @@ Response:
 - Implemented: durable session and agent export ledger indexes for scoped
   event and metadata consumers. The public cursor remains the canonical tenant
   `ledger:...` cursor.
-- Implemented: tenant, agent, session, artifact, record, skill, and
-  skill-binding mutation ledger rows.
+- Implemented: tenant, agent, session, artifact, and record mutation ledger
+  rows.
 - Implemented: soft-delete tombstone export for metadata objects that use the
   runtime soft-delete contract.
 - Implemented: retention-GC and tenant-purge tombstone export for physical GC

@@ -17,7 +17,6 @@ export type SessionId = string;
 export type EventId = string;
 export type ArtifactId = string;
 export type RecordId = string;
-export type SkillId = string;
 
 export interface ClientOptions {
   baseUrl: string;
@@ -234,7 +233,6 @@ export class AgentDB {
 export class Workspace {
   readonly artifacts: ArtifactCollection;
   readonly records: RecordCollection;
-  readonly skills: SkillCollection;
   readonly data: Record<string, unknown>;
 
   constructor(
@@ -245,7 +243,6 @@ export class Workspace {
     this.data = opts.data ?? { tenant_id: id };
     this.artifacts = new ArtifactCollection(client, id);
     this.records = new RecordCollection(client, id);
-    this.skills = new SkillCollection(client, id);
   }
 
   get tenantId(): TenantId {
@@ -334,10 +331,6 @@ export class AgentHandle {
     );
   }
 
-  async bindSkill(skillId: SkillId, opts: { idempotencyKey?: string } = {}): Promise<Record<string, unknown>> {
-    return await this.workspaceClient().bindSkill(this.workspace.id, this.id, skillId, opts);
-  }
-
   private workspaceClient(): Client {
     return (this.workspace as unknown as { client: Client }).client;
   }
@@ -346,7 +339,6 @@ export class AgentHandle {
 export class SessionHandle {
   readonly artifacts: ArtifactCollection;
   readonly records: RecordCollection;
-  readonly skills: SkillCollection;
 
   constructor(
     readonly workspace: Workspace,
@@ -355,7 +347,6 @@ export class SessionHandle {
   ) {
     this.artifacts = workspace.artifacts;
     this.records = workspace.records;
-    this.skills = workspace.skills;
   }
 
   get id(): SessionId {
@@ -473,14 +464,6 @@ export class RecordCollection {
 
   async search(body: Record<string, unknown>): Promise<unknown[]> {
     return await this.client.searchRecords(this.tenantId, body);
-  }
-}
-
-export class SkillCollection {
-  constructor(private readonly client: Client, private readonly tenantId: TenantId) {}
-
-  async register(body: { name: string; version: string; manifest?: Record<string, unknown>; artifactRefs?: unknown[]; idempotencyKey?: string }): Promise<Record<string, unknown>> {
-    return await this.client.registerSkill(this.tenantId, body);
   }
 }
 
@@ -608,32 +591,6 @@ export class Client {
       this._withRecordCommitSeq(tenantId, body)
     );
     return Array.isArray(data.matches) ? data.matches : [];
-  }
-
-  async registerSkill(
-    tenantId: TenantId,
-    body: { name: string; version: string; manifest?: Record<string, unknown>; artifactRefs?: unknown[]; idempotencyKey?: string }
-  ): Promise<Record<string, unknown>> {
-    return await this._request("POST", `/api/tenants/${enc(tenantId)}/skills`, {
-      name: body.name,
-      version: body.version,
-      manifest: body.manifest ?? {},
-      artifact_refs: body.artifactRefs ?? [],
-    }, idem(body.idempotencyKey));
-  }
-
-  async bindSkill(
-    tenantId: TenantId,
-    agentId: AgentId,
-    skillId: SkillId,
-    opts: { idempotencyKey?: string } = {}
-  ): Promise<Record<string, unknown>> {
-    return await this._request(
-      "POST",
-      `/api/tenants/${enc(tenantId)}/agents/${enc(agentId)}/skills/bind`,
-      { skill_id: skillId },
-      idem(opts.idempotencyKey)
-    );
   }
 
   async watch(tenantId: TenantId, opts: ClientSubscribeOptions = {}): Promise<WatchItem[]> {

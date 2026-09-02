@@ -23,13 +23,11 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
     if (raw.endsWith("/fork")) return json({ session_id: "ses_child", agent_id: "agt_1" });
     if (raw.includes("/replay-prefix")) return json({ events: [] });
     if (raw.includes("/replay")) return json({ events: [] });
-    if (raw.endsWith("/context")) return json({ events: [], records: [], skills: [] });
+    if (raw.endsWith("/context")) return json({ events: [], records: [] });
     if (raw.includes("/watch")) return json([]);
     if (raw.endsWith("/artifacts")) return json({ artifact_id: "art_1" });
     if (raw.endsWith("/records/search")) return json({ matches: [] });
     if (raw.endsWith("/records")) return json({ record_id: "rec_1" });
-    if (raw.endsWith("/skills")) return json({ skill_id: "skl_1" });
-    if (raw.endsWith("/skills/bind")) return json({ skill_id: "skl_1" });
     return json({});
   };
 
@@ -47,8 +45,6 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
   await c.putArtifact(String(tenant.tenant_id), new Blob(["blob"]));
   await c.writeRecord(String(tenant.tenant_id), { namespace: ["mem"], text: "x" });
   await c.searchRecords(String(tenant.tenant_id), { namespace: ["mem"], text: "x" });
-  const skill = await c.registerSkill(String(tenant.tenant_id), { name: "tool", version: "1" });
-  await c.bindSkill(String(tenant.tenant_id), String(agent.agent_id), String(skill.skill_id));
 
   assert.ok(calls.some((url) => url.includes("/api/tenants/ten_1/agents")));
   assert.ok(calls.some((url) => url.includes("/api/tenants/ten_1/sessions/ses_1/events")));
@@ -101,14 +97,12 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
         ],
       });
     }
-    if (raw.endsWith("/context")) return json({ events: [], records: [], skills: [] });
+    if (raw.endsWith("/context")) return json({ events: [], records: [] });
     if (raw.endsWith("/artifacts")) {
       return json({ artifact_id: "art_1", content_type: "text/plain", bytes: 4, sha256: "abcd" });
     }
     if (raw.endsWith("/records/search")) return json({ matches: [] });
     if (raw.endsWith("/records")) return json({ record_id: "rec_1" });
-    if (raw.endsWith("/skills")) return json({ skill_id: "skl_1" });
-    if (raw.endsWith("/skills/bind")) return json({ skill_id: "skl_1" });
     if (raw.includes("/watch")) return json([]);
     return json({});
   };
@@ -139,8 +133,6 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
   await db.sessionById(session.id, { tenantId: workspace.id, agentId: agent.id }).fetch();
   await workspace.records.write({ namespace: ["mem"], text: "x" });
   await workspace.records.search({ namespace: ["mem"], text: "x" });
-  const skill = await workspace.skills.register({ name: "tool", version: "1" });
-  await agent.bindSkill(String(skill.skill_id));
   await workspace.watch({ scope: "agent", agentId: agent.id });
 
   assert.equal(user.ref().event_id, "evt_fetch");

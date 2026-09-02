@@ -133,7 +133,7 @@ class FakeSession:
             }
             for event in self._events[-max_events:]
         ]
-        return {"events": events, "records": [], "skills": []}
+        return {"events": events, "records": []}
 
     def replay(self, *, from_seq: int = 0, limit: int = 100) -> list[FakeEvent]:
         return [event for event in self._events if event.seq >= from_seq][:limit]

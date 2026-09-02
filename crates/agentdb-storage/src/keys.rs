@@ -89,18 +89,3 @@ pub fn record_index_outbox_key(tenant_id: &str, commit_seq: u64, record_id: &str
     format!("record/searchable_index_outbox/{tenant_id}/{commit_seq:020}/{record_id}")
 }
 
-/// Primary key for a skill record.
-pub fn skill_record_key(tenant_id: &str, skill_id: &str) -> String {
-    format!("record/skill/{tenant_id}/{skill_id}")
-}
-
-/// Uniqueness index for `(tenant_id, skill_name, version)`.
-pub fn skill_unique_key(tenant_id: &str, name: &str, version: &str) -> String {
-    format!("record/skill_unique/{tenant_id}/{name}/{version}")
-}
-
-/// Agent-to-skill binding row. `skill_id` is enough because each skill row
-/// carries its exact `(name, version)`.
-pub fn agent_skill_binding_key(tenant_id: &str, agent_id: &str, skill_id: &str) -> String {
-    format!("record/agent_skill/{tenant_id}/{agent_id}/{skill_id}")
-}

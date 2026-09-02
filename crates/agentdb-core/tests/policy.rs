@@ -3,7 +3,7 @@ use agentdb_core::errors::ErrorCode;
 use agentdb_core::policy::{Priority, RuntimePolicy, ABSOLUTE_MAX_ARTIFACT_BYTES};
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{AppendRequest, Runtime};
-use agentdb_core::{BindSkillRequest, NewAgent, NewSession, NewSkill, NewTenant};
+use agentdb_core::{NewAgent, NewSession, NewTenant};
 
 #[tokio::test]
 async fn tenant_policy_enforces_append_quota_and_stamps_version() {
@@ -411,17 +411,13 @@ async fn expanded_resource_quotas_are_enforced_and_reported() {
                     "soft_max_agents": 1,
                     "max_agents": 1,
                     "soft_max_artifacts": 1,
-                    "max_artifacts": 1,
-                    "soft_max_skills": 1,
-                    "max_skills": 2,
-                    "soft_max_skill_bindings_per_agent": 1,
-                    "max_skill_bindings_per_agent": 1
+                    "max_artifacts": 1
                 }
             }),
         })
         .await
         .unwrap();
-    let a = rt
+    let _a = rt
         .create_agent(NewAgent {
             tenant_id: t.tenant_id.clone(),
             alias: None,
@@ -466,73 +462,10 @@ async fn expanded_resource_quotas_are_enforced_and_reported() {
         ErrorCode::PolicyDenied
     );
 
-    let first_skill = rt
-        .register_skill(
-            NewSkill {
-                tenant_id: t.tenant_id.clone(),
-                name: "tool-a".into(),
-                version: "1.0.0".into(),
-                manifest: serde_json::json!({}),
-                artifact_refs: vec![],
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    let second_skill = rt
-        .register_skill(
-            NewSkill {
-                tenant_id: t.tenant_id.clone(),
-                name: "tool-b".into(),
-                version: "1.0.0".into(),
-                manifest: serde_json::json!({}),
-                artifact_refs: vec![],
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    rt.bind_skill(BindSkillRequest {
-        tenant_id: t.tenant_id.clone(),
-        agent_id: a.agent_id.clone(),
-        skill_id: first_skill.skill_id,
-        idempotency_key: None,
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        rt.bind_skill(BindSkillRequest {
-            tenant_id: t.tenant_id.clone(),
-            agent_id: a.agent_id.clone(),
-            skill_id: second_skill.skill_id,
-            idempotency_key: None,
-        })
-        .await
-        .unwrap_err()
-        .code,
-        ErrorCode::PolicyDenied
-    );
-
     let tenant_report = rt.backpressure_for_tenant(&t.tenant_id).await.unwrap();
     assert_eq!(
         tenant_report.header_value().as_deref(),
-        Some("agents=100,artifacts=100,skills=200")
-    );
-    let session = rt
-        .create_session(NewSession {
-            tenant_id: t.tenant_id.clone(),
-            agent_id: a.agent_id.clone(),
-            alias: None,
-        })
-        .await
-        .unwrap();
-    let session_report = rt
-        .backpressure_for_session(&t.tenant_id, &session.session_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        session_report.header_value().as_deref(),
-        Some("skill_bindings=100")
+        Some("agents=100,artifacts=100")
     );
 }
 

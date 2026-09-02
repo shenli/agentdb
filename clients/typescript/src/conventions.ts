@@ -273,10 +273,6 @@ export function contextSourceRefs(
     const recordId = field(record, "record_id", "recordId");
     if (recordId !== undefined) refs.push({ record_id: recordId });
   }
-  for (const skill of arrayField(context.skills)) {
-    const skillId = field(skill, "skill_id", "skillId");
-    if (skillId !== undefined) refs.push({ skill_id: skillId });
-  }
   return opts.maxRefs === undefined ? refs : refs.slice(0, opts.maxRefs);
 }
 

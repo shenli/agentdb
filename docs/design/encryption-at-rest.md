@@ -112,7 +112,6 @@ to be updated when a later milestone encrypts one of them. Current coverage:
 | Session segments / archives / replay prefixes | **Yes** (M2) |
 | Agent primary records | **Yes** (M17) |
 | Searchable record primary rows | **Yes** (M17) |
-| Skill primary records | **Yes** (M17) |
 | Export-ledger entries (all object types) | **Yes** (already sealed via `encrypt_metadata`) |
 | Session primary records | **Yes** (M18) |
 | Tenant primary records | **Yes** (M18) |
@@ -281,8 +280,8 @@ keyring cache afterwards; the admin endpoint `POST /api/admin/tenants/{id}/revok
 every layer, including that a freshly-loaded cluster node will not serve a
 revoked key.
 
-**Milestone 17 (landed): primary-record coverage for agents, records, and
-skills.** The agent, searchable-record, and skill **primary rows** are now sealed
+**Milestone 17 (landed): primary-record coverage for agents and records.** The
+agent and searchable-record **primary rows** are now sealed
 under the tenant Metadata DEK, closing the plaintext gaps the coverage map
 tracked (their export-ledger copies were already encrypted). Each row's AAD binds
 its `(tenant, object_kind, object_id)` via new `MetadataObjectKind` variants, so
@@ -292,13 +291,13 @@ value through `encrypt_metadata`, and every read path — point reads
 routes through `decrypt_metadata`, reconstructing the AAD from the key. With the
 keyring disabled the rows take the identity/legacy path unchanged, so plaintext
 deployments are unaffected and a disabled→enabled rollout stays readable. The
-coverage-map tripwires for agent/record/skill are flipped to assert *no* leak,
-and a new test round-trips all three through a fresh runtime that hydrates by
+coverage-map tripwires for agent/record are flipped to assert *no* leak,
+and a new test round-trips both through a fresh runtime that hydrates by
 decrypting.
 
 **Milestone 18 (landed): session and tenant primary-record coverage.** Extends
 M17's pattern to the last two primary-record types, so **every** primary row
-(tenant, agent, session, record, skill) and the export-ledger are now sealed at
+(tenant, agent, session, record) and the export-ledger are now sealed at
 rest. Session rows are written from three paths (create, and two event-append
 paths); a shared `encrypted_session_put_op` helper seals all three identically so
 none can drift into plaintext. The tenant row uses a single-id-segment key
@@ -329,8 +328,9 @@ and the admin endpoint `POST /api/admin/tenants/{id}/reencrypt-dek`) rewrites a
 tenant's metadata rows that are sealed under an **older** DEK version so they move
 to the current active version — the data-plane half of rotation, after which the
 old version has no remaining references and can be retired. It covers every
-Metadata-DEK-sealed KV row (the tenant's own record, its agent/session/record/
-skill/artifact primary rows, its session events, and its export-ledger entries),
+Metadata-DEK-sealed KV row (the tenant's own record, its
+agent/session/record/artifact primary rows, its session events, and its
+export-ledger entries),
 deriving each row's AAD context from its key. It is **safe by construction**: each
 row is decrypted under its recorded version *before* being re-sealed, so a
 context-mapping bug fails that single row loudly (counted in the report's
@@ -610,7 +610,7 @@ Before AgentDB advertises tenant BYOK, every durable byte path should be listed
 and classified as tenant payload, derived tenant data, operational metadata, or
 intentionally plaintext. The inventory must include:
 
-- tenants, sessions, events, records, record edges, skills, policies, and
+- tenants, sessions, events, records, record edges, policies, and
   tenant metadata;
 - artifact metadata and artifact content;
 - sealed event segments, archives, and replay-prefix materializations;
@@ -934,7 +934,7 @@ Implement the design in independently reviewable stages:
    tests.
 4. Encrypt the event and metadata hot paths with a bounded DEK cache and run the
    benchmark matrix.
-5. Cover records, skills, indexes, idempotency, export, Raft, snapshots,
+5. Cover records, indexes, idempotency, export, Raft, snapshots,
    checkpoints, backups, and temporary files; add raw-storage marker tests.
 6. Add KEK rewrap and the online DEK rotation worker, admin API, CLI, and
    metrics.

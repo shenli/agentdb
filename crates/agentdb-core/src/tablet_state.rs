@@ -904,9 +904,6 @@ fn classify_snapshot_entry(key: &[u8], value: &[u8]) -> StorageResult<SnapshotEn
         "record/searchable_index_outbox/",
         "record/tenant_meta/",
         "record/export_consumer/",
-        "record/skill/",
-        "record/skill_unique/",
-        "record/agent_skill/",
     ] {
         if let Some(rest) = key.strip_prefix(prefix) {
             return placement(first_segment(rest)?, None);

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use agentdb_core::record::{IndexingPolicy, RecordStatus};
 use agentdb_core::runtime::{MetadataFilter, RecordSearchMatch};
-use agentdb_core::{AgentSkillBinding, ArtifactRef, CredentialRef, RecordEdgeType, SourceRef};
+use agentdb_core::{ArtifactRef, CredentialRef, RecordEdgeType, SourceRef};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateTenantBody {
@@ -460,8 +460,6 @@ pub struct SearchRecordsQuery {
     #[serde(default)]
     pub source_record: Option<String>,
     #[serde(default)]
-    pub source_skill: Option<String>,
-    #[serde(default)]
     pub source_event: Option<String>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
@@ -547,26 +545,6 @@ fn default_context_include() -> Vec<String> {
 #[derive(Debug, Serialize)]
 pub struct SearchRecordsResponse {
     pub matches: Vec<RecordSearchMatch>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CreateSkillBody {
-    pub name: String,
-    pub version: String,
-    #[serde(default = "default_policy")]
-    pub manifest: serde_json::Value,
-    #[serde(default)]
-    pub artifact_refs: Vec<ArtifactRef>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct BindSkillBody {
-    pub skill_id: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListAgentSkillsResponse {
-    pub skills: Vec<AgentSkillBinding>,
 }
 
 #[derive(Debug, Deserialize)]

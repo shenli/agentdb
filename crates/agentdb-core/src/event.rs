@@ -25,8 +25,6 @@ pub struct SourceRef {
     pub artifact_id: Option<Id>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_id: Option<Id>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skill_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

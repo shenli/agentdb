@@ -110,7 +110,6 @@ The runtime store continues to own:
 - event envelopes or warm-head rows
 - artifact metadata
 - records
-- skills
 - policy state
 
 ### Session Segments

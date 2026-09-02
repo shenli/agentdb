@@ -52,7 +52,7 @@ fn status_for(code: ErrorCode) -> StatusCode {
     use ErrorCode::*;
     match code {
         TenantNotFound | AgentNotFound | SessionNotFound | ArtifactNotFound | RecordNotFound
-        | SkillNotFound | PolicyNotFound => StatusCode::NOT_FOUND,
+        | PolicyNotFound => StatusCode::NOT_FOUND,
         EventTooLarge | ArtifactTooLarge | HashMismatch | PolicyDenied | InvalidCursor => {
             StatusCode::UNPROCESSABLE_ENTITY
         }

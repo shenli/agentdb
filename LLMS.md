@@ -23,7 +23,7 @@ operations**.
 AgentDB is an **agent-native runtime database**. It stores the
 events your agent produces (thoughts, tool calls, tool outputs,
 user turns) in **sessions**, plus artifacts, searchable records,
-skills, fork lineage, replay streams, and context packs. One
+fork lineage, replay streams, and context packs. One
 runtime surface, one agent memory model.
 
 You talk to it through the native HTTP API:

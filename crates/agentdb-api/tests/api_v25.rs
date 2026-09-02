@@ -431,9 +431,7 @@ async fn export_status_reports_durable_export_capabilities() {
             "agent",
             "session",
             "artifact",
-            "record",
-            "skill",
-            "skill_binding"
+            "record"
         ])
     );
 }

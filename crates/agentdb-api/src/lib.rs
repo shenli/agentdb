@@ -1,7 +1,7 @@
 //! AgentDB HTTP API.
 //!
 //! V2 routes wrap `agentdb_core::Runtime` (tenant / agent / session / event
-//! lifecycle plus artifacts, records, skills, policies, replay, subscribe, and
+//! lifecycle plus artifacts, records, policies, replay, subscribe, and
 //! context).
 
 mod auth;

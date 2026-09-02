@@ -10,7 +10,6 @@ fn dashboard_targets_v2_session_surface() {
     assert!(app.contains("/subscribe"));
     assert!(app.contains("/records/search"));
     assert!(app.contains("/artifacts/"));
-    assert!(app.contains("/skills"));
     assert!(app.contains("/storage"));
     assert!(app.contains("/api/storage/summary"));
     assert!(app.contains("/lifecycle"));

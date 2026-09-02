@@ -56,11 +56,11 @@ canonical session ID without exposing `tenantId` to normal app code.
 
 - `AgentDB.workspace`, `AgentDB.sessionById`
 - `Workspace.agent`, `Workspace.agentById`, `Workspace.sessionById`, `Workspace.watch`
-- `Workspace.artifacts`, `Workspace.records`, `Workspace.skills`
-- `AgentHandle.session`, `AgentHandle.sessionById`, `AgentHandle.bindSkill`
+- `Workspace.artifacts`, `Workspace.records`
+- `AgentHandle.session`, `AgentHandle.sessionById`
 - `SessionHandle.append`, `appendUser`, `modelMessage`, `toolCall`, `toolResult`, `contextPackBuilt`
 - `SessionHandle.fetch`, `fetchRecent`, `replay`, `materializeReplayPrefix`, `fork`, `subscribe`, `context`
-- `SessionHandle.artifacts`, `records`, `skills`
+- `SessionHandle.artifacts`, `records`
 - `eventRef`, `artifactRef`
 
 The low-level tenant-scoped API remains available:
@@ -71,7 +71,6 @@ The low-level tenant-scoped API remains available:
 - `Client.watch`
 - `Client.putArtifact`, `getArtifact`, `getArtifactBlob`
 - `Client.writeRecord`, `searchRecords`
-- `Client.registerSkill`, `bindSkill`
 
 IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
 `art_*`, `rec_*`, and `skl_*`. Mutating SDK calls generate an
@@ -103,7 +102,7 @@ const session = await db.session(sessionId, { agentId });
 
 const history = await session.replay({ fromSeq: 0, limit: 100 });
 const context = await session.context({
-  include: ["recent_events", "records", "skills"],
+  include: ["recent_events", "records"],
 });
 
 const result = await session.agentStatus("recovered", { lastSeenSeq });

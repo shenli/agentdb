@@ -36,8 +36,8 @@ use agentdb_core::{
         FetchRequest, ForkSessionRequest, NewRecordEdge, RecordUpdate, RewindExportConsumerRequest,
         SearchRequest, WatchRequest, WatchScope,
     },
-    Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ErrorCode, Id, IdKind,
-    NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
+    Agent, Artifact, ChangefeedItem, ErrorCode, Id, IdKind,
+    NewAgent, NewArtifact, NewSession, NewTenant, SourceRef, Tenant,
 };
 use agentdb_meta::{
     cells, nodes, placement_scopes, tablet_movements, tablet_ranges, tablet_rebalance,
@@ -45,11 +45,11 @@ use agentdb_meta::{
 };
 
 use crate::dto::{
-    AckExportConsumerBody, AppendAndFetchBody, AppendBody, BindSkillBody, ClaimExportConsumerBody,
+    AckExportConsumerBody, AppendAndFetchBody, AppendBody, ClaimExportConsumerBody,
     ContextBody, CreateAgentBody, CreateExportConsumerBody, CreateRecordBody, CreateRecordEdgeBody,
-    CreateSessionBody, CreateSkillBody, CreateTenantBody, ExportBackfillBody,
+    CreateSessionBody, CreateTenantBody, ExportBackfillBody,
     ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
-    ExportWatchResponse, FetchQuery, ForkSessionBody, IncludeDeletedQuery, ListAgentSkillsResponse,
+    ExportWatchResponse, FetchQuery, ForkSessionBody, IncludeDeletedQuery,
     PolicyWorkerRunBody, ReplayQuery, RestoreSessionStorageBody, RewindExportConsumerBody,
     SearchRecordsBody, SearchRecordsResponse, SweepBody, TenantMetaBody,
     TransitionSessionLifecycleBody, UpdateRecordBody, WatchQuery,
@@ -263,14 +263,6 @@ pub fn routes() -> Router<AppState> {
             post(create_session),
         )
         .route(
-            "/api/tenants/:tenant_id/agents/:agent_id/skills",
-            get(list_agent_skills),
-        )
-        .route(
-            "/api/tenants/:tenant_id/agents/:agent_id/skills/bind",
-            post(bind_skill),
-        )
-        .route(
             "/api/tenants/:tenant_id/sessions/:session_id",
             get(get_session).delete(delete_session),
         )
@@ -404,11 +396,6 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/tenants/:tenant_id/meta/:key",
             get(get_tenant_meta).put(set_tenant_meta),
-        )
-        .route("/api/tenants/:tenant_id/skills", post(create_skill))
-        .route(
-            "/api/tenants/:tenant_id/skills/:skill_id",
-            get(get_skill).delete(delete_skill),
         )
         .route(
             "/api/tenants/:tenant_id/policy/lifecycle-sweep",
@@ -609,9 +596,7 @@ async fn get_admin_exports(State(s): State<AppState>) -> Result<Json<serde_json:
             "agent",
             "session",
             "artifact",
-            "record",
-            "skill",
-            "skill_binding"
+            "record"
         ],
         "consumer_count": consumers.len(),
         "metrics": {
@@ -6894,8 +6879,7 @@ async fn validate_tenant_export_cursor(
 
 fn validate_export_snapshot_include(include: &str) -> Result<(), ApiError> {
     match include {
-        "tenants" | "agents" | "sessions" | "artifacts" | "records" | "skills"
-        | "skill_bindings" => Ok(()),
+        "tenants" | "agents" | "sessions" | "artifacts" | "records" => Ok(()),
         other => Err(ApiError(agentdb_core::Error::new(
             ErrorCode::PolicyDenied,
             format!("unsupported exports/backfill include: {other}"),
@@ -6990,37 +6974,6 @@ async fn export_snapshot_backfill(
             );
         }
     }
-    if include.iter().any(|item| item == "skills") {
-        for skill in runtime.list_skills(tenant_id).await? {
-            push_snapshot_envelope(
-                &mut items,
-                "skill",
-                tenant_id.as_str(),
-                skill.skill_id.as_str(),
-                None,
-                None,
-                skill.created_at_ms,
-                observed_at_ms,
-                serde_json::to_value(&skill).map_err(internal_error)?,
-            );
-        }
-    }
-    if include.iter().any(|item| item == "skill_bindings") {
-        for binding in runtime.list_skill_bindings(tenant_id).await? {
-            push_snapshot_envelope(
-                &mut items,
-                "skill_binding",
-                tenant_id.as_str(),
-                &format!("{}:{}", binding.agent_id, binding.skill_id),
-                Some(binding.agent_id.as_str()),
-                None,
-                binding.bound_at_ms,
-                observed_at_ms,
-                serde_json::to_value(&binding).map_err(internal_error)?,
-            );
-        }
-    }
-
     items.sort_by(|left, right| left.cursor.cmp(&right.cursor));
     let oldest_available_cursor = items.first().map(|item| item.cursor.clone());
     if let Some(from_cursor) = from_cursor {
@@ -7042,7 +6995,7 @@ fn validate_metadata_snapshot_cursor(tenant_id: &Id, cursor: &str) -> Result<(),
             && parts[1].bytes().all(|byte| byte.is_ascii_digit())
             && matches!(
                 parts[2],
-                "tenant" | "agent" | "session" | "artifact" | "record" | "skill" | "skill_binding"
+                "tenant" | "agent" | "session" | "artifact" | "record"
             )
             && !parts[3].is_empty()
     });
@@ -7117,8 +7070,6 @@ async fn export_status(
             "session",
             "artifact",
             "record",
-            "skill",
-            "skill_binding",
         ],
         oldest_available_cursor,
         high_watermark,
@@ -7332,8 +7283,6 @@ fn export_envelope_from_changefeed_with_op(
         "session" => "session",
         "artifact" => "artifact",
         "record" => "record",
-        "skill" => "skill",
-        "skill_binding" => "skill_binding",
         _ => "unknown",
     };
     let effective_op = if op == "snapshot" {
@@ -8309,7 +8258,7 @@ async fn get_record(
 /// - `namespace` (repeatable; empty list = tenant root)
 /// - `tag` (repeatable; AND-semantics)
 /// - `source_session` + `source_seq`, `source_artifact`, `source_record`,
-///   `source_skill`, `source_event` (post-filter on `SourceRef`)
+///   `source_event` (post-filter on `SourceRef`)
 /// - `limit` (default 20, capped at 100)
 ///
 /// `embedding` is intentionally NOT exposed via GET — vector search uses
@@ -8387,82 +8336,6 @@ async fn delete_record(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn create_skill(
-    State(s): State<AppState>,
-    Path(tenant_id): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<CreateSkillBody>,
-) -> Result<(StatusCode, Json<Skill>), ApiError> {
-    reject_if_draining(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let skill = s
-        .runtime
-        .register_skill(
-            NewSkill {
-                tenant_id: tid,
-                name: body.name,
-                version: body.version,
-                manifest: body.manifest,
-                artifact_refs: body.artifact_refs,
-            },
-            idempotency_key(&headers),
-        )
-        .await?;
-    Ok((StatusCode::CREATED, Json(skill)))
-}
-
-async fn get_skill(
-    State(s): State<AppState>,
-    Path((tenant_id, skill_id)): Path<(String, String)>,
-) -> Result<Json<Skill>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let sid = parse_id_or(&skill_id, IdKind::Skill, ErrorCode::SkillNotFound)?;
-    Ok(Json(s.runtime.get_skill(&tid, &sid).await?))
-}
-
-async fn delete_skill(
-    State(s): State<AppState>,
-    Path((tenant_id, skill_id)): Path<(String, String)>,
-) -> Result<StatusCode, ApiError> {
-    reject_if_draining(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let sid = parse_id_or(&skill_id, IdKind::Skill, ErrorCode::SkillNotFound)?;
-    s.runtime.delete_skill(&tid, &sid).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn bind_skill(
-    State(s): State<AppState>,
-    Path((tenant_id, agent_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    Json(body): Json<BindSkillBody>,
-) -> Result<(StatusCode, Json<AgentSkillBinding>), ApiError> {
-    reject_if_draining(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let aid = parse_id_or(&agent_id, IdKind::Agent, ErrorCode::AgentNotFound)?;
-    let sid = parse_id_or(&body.skill_id, IdKind::Skill, ErrorCode::SkillNotFound)?;
-    let binding = s
-        .runtime
-        .bind_skill(BindSkillRequest {
-            tenant_id: tid,
-            agent_id: aid,
-            skill_id: sid,
-            idempotency_key: idempotency_key(&headers),
-        })
-        .await?;
-    Ok((StatusCode::CREATED, Json(binding)))
-}
-
-async fn list_agent_skills(
-    State(s): State<AppState>,
-    Path((tenant_id, agent_id)): Path<(String, String)>,
-) -> Result<Json<ListAgentSkillsResponse>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let aid = parse_id_or(&agent_id, IdKind::Agent, ErrorCode::AgentNotFound)?;
-    let skills = s.runtime.list_agent_skills(&tid, &aid).await?;
-    Ok(Json(ListAgentSkillsResponse { skills }))
-}
-
 async fn run_lifecycle_sweep(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -8524,7 +8397,6 @@ struct ParsedSearchQuery {
     source_seq: Option<u64>,
     source_artifact: Option<String>,
     source_record: Option<String>,
-    source_skill: Option<String>,
     source_event: Option<String>,
     limit: usize,
     min_visible_record_commit_seq: Option<u64>,
@@ -8545,7 +8417,6 @@ fn parse_search_query(raw: &str) -> ParsedSearchQuery {
         source_seq: None,
         source_artifact: None,
         source_record: None,
-        source_skill: None,
         source_event: None,
         limit: 20,
         min_visible_record_commit_seq: None,
@@ -8577,7 +8448,6 @@ fn parse_search_query(raw: &str) -> ParsedSearchQuery {
             "source_seq" => out.source_seq = val.parse().ok(),
             "source_artifact" => out.source_artifact = Some(val),
             "source_record" => out.source_record = Some(val),
-            "source_skill" => out.source_skill = Some(val),
             "source_event" => out.source_event = Some(val),
             "limit" => {
                 if let Ok(n) = val.parse() {
@@ -8645,7 +8515,6 @@ fn build_source_filter(q: &ParsedSearchQuery) -> Result<Option<SourceRef>, ApiEr
         || q.source_seq.is_some()
         || q.source_artifact.is_some()
         || q.source_record.is_some()
-        || q.source_skill.is_some()
         || q.source_event.is_some();
     if !any_set {
         return Ok(None);
@@ -8653,7 +8522,6 @@ fn build_source_filter(q: &ParsedSearchQuery) -> Result<Option<SourceRef>, ApiEr
     let session_id = parse_opt_id(q.source_session.as_deref(), IdKind::Session)?;
     let artifact_id = parse_opt_id(q.source_artifact.as_deref(), IdKind::Artifact)?;
     let record_id = parse_opt_id(q.source_record.as_deref(), IdKind::Record)?;
-    let skill_id = parse_opt_id(q.source_skill.as_deref(), IdKind::Skill)?;
     let event_id = parse_opt_id(q.source_event.as_deref(), IdKind::Event)?;
     Ok(Some(SourceRef {
         session_id,
@@ -8661,7 +8529,6 @@ fn build_source_filter(q: &ParsedSearchQuery) -> Result<Option<SourceRef>, ApiEr
         event_id,
         artifact_id,
         record_id,
-        skill_id,
     }))
 }
 
@@ -8691,7 +8558,6 @@ fn parse_context_includes(raw: &[String]) -> Vec<ContextInclude> {
         match item.as_str() {
             "recent_events" => out.push(ContextInclude::RecentEvents),
             "records" | "search_records" => out.push(ContextInclude::Records),
-            "skills" | "skill_instructions" => out.push(ContextInclude::Skills),
             "policy" => out.push(ContextInclude::Policy),
             _ => {}
         }

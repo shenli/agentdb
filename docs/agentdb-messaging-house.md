@@ -182,7 +182,7 @@ context, records, artifacts, and lineage that survive sandbox replacement.
 - Replay and fork support.
 - Searchable records with local/global index semantics.
 - Artifact metadata and blob storage.
-- Source references across events, records, artifacts, and skills.
+- Source references across events, records, and artifacts.
 - Context-building APIs.
 - SDKs for Python and TypeScript.
 - Persistence through KV and content backends.

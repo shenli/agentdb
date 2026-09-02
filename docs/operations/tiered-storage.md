@@ -83,7 +83,7 @@ After a lifecycle transition or sweep:
    ```
 
 3. Fetch context for the session and confirm the agent-facing state still
-   contains the expected recent events, records, skills, and policy.
+   contains the expected recent events, records, and policy.
 4. If the session was archived, restore it to `cold` or `warm` in a test
    tenant before relying on the archive path operationally.
 5. If derivative-only purge was used, confirm consumers understand that full

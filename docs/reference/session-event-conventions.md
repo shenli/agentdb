@@ -55,7 +55,7 @@ Rules:
 - `artifact_refs` points to large raw outputs, generated files, screenshots,
   logs, traces, or binary payloads. Do not silently inline large hands output in
   `payload`.
-- `source_refs` points to the session events, artifacts, records, or skills that
+- `source_refs` points to the session events, artifacts, or records that
   caused or informed this event.
 - `credential_refs` records opaque vault / broker references such as
   `cred_ref`, never credential values. The harness or control plane resolves
@@ -507,7 +507,7 @@ Required payload fields:
 | Field | Type | Notes |
 |---|---|---|
 | `context_pack_id` | string | Harness-generated context pack ID. |
-| `include` | array | Included source classes, such as `recent_events`, `records`, `skills`. |
+| `include` | array | Included source classes, such as `recent_events`, `records`. |
 
 Optional payload fields:
 
@@ -523,8 +523,8 @@ Optional payload fields:
 
 Reference rules:
 
-- `source_refs` should include representative events, records, artifacts, or
-  skills that shaped the context pack.
+- `source_refs` should include representative events, records, or artifacts
+  that shaped the context pack.
 - If the context pack body is large, store it as an artifact and reference it.
 
 Example:
@@ -534,12 +534,11 @@ Example:
   "kind": "context_pack_built",
   "source_refs": [
     { "event_id": "evt_user" },
-    { "record_id": "rec_memory" },
-    { "skill_id": "skl_tool_manifest" }
+    { "record_id": "rec_memory" }
   ],
   "payload": {
     "context_pack_id": "ctx_2026_04_30_001",
-    "include": ["recent_events", "records", "skills"],
+    "include": ["recent_events", "records"],
     "max_events": 20,
     "max_bytes": 1000000,
     "selected_event_count": 12
@@ -604,7 +603,7 @@ Map chat messages to `user_message` and `model_message`. Map tool parts to
 
 Map MCP tool invocations to `tool_call`; results and errors to `tool_result` and
 `tool_error`; resources or prompts used by the harness to `source_refs`,
-`artifact_refs`, searchable records, or skills depending on durability and
+`artifact_refs`, or searchable records depending on durability and
 replay needs.
 
 ## 6. Validation Checklist

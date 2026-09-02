@@ -8,7 +8,6 @@ pub enum ErrorCode {
     SessionNotFound,
     ArtifactNotFound,
     RecordNotFound,
-    SkillNotFound,
     PolicyNotFound,
     EventTooLarge,
     ArtifactTooLarge,

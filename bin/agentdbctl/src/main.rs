@@ -2813,8 +2813,6 @@ fn object_type_filter_matches(filter: &str, object_type: &str) -> bool {
         "sessions" => object_type == "session",
         "artifacts" => object_type == "artifact",
         "records" => object_type == "record",
-        "skills" => object_type == "skill",
-        "skill_bindings" => object_type == "skill_binding",
         other => other == object_type,
     }
 }

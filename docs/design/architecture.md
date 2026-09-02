@@ -20,7 +20,7 @@ crates/agentdb-api        bearer-protected tenant-scoped /api/... HTTP routes
         v
 crates/agentdb-core       multi-tenant runtime semantics
                           tenants -> agents -> sessions -> events
-                          artifacts, records, skills, policy,
+                          artifacts, records, policy,
                           lifecycle, fork/replay, context
                           watch/changefeed cursors
                           export ledger and managed consumer cursors
@@ -92,7 +92,6 @@ durable data semantics.
 - **Artifact**: metadata in the runtime store plus bytes in the content backend.
 - **Record**: searchable memory or observation with namespace, scope, tags, and
   optional source refs.
-- **Skill**: registered tool/package manifest and agent binding.
 - **Policy**: quota, lifecycle, retention, legal hold, and priority settings.
 
 All public IDs are opaque typed strings: `ten_*`, `agt_*`, `ses_*`, `evt_*`,
@@ -129,8 +128,6 @@ GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}/blob
 POST /api/tenants/{tenant_id}/records
 GET  /api/tenants/{tenant_id}/records/search
 POST /api/tenants/{tenant_id}/records/search
-POST /api/tenants/{tenant_id}/skills
-POST /api/tenants/{tenant_id}/agents/{agent_id}/skills/bind
 POST /api/tenants/{tenant_id}/policy/lifecycle-sweep
 POST /api/tenants/{tenant_id}/policy/gc-sweep
 POST /api/policy/worker/run
@@ -229,8 +226,8 @@ return recent context in one request.
 - `replay` reconstructs a fork-aware event view.
 - `subscribe` returns an SSE replay snapshot from `from_seq`.
 - `watch` returns generalized tenant/session/agent changefeed items.
-- `context` builds a budgeted pack from recent events, searched records, active
-  skills, and policy.
+- `context` builds a budgeted pack from recent events, searched records, and
+  policy.
 
 ```text
 append / lifecycle / record mutation
@@ -398,8 +395,6 @@ indexes during startup. A preflight applies these defaults before hydration:
 | `AGENTDB_STARTUP_MAX_ARTIFACTS` | 250,000 | Artifact metadata |
 | `AGENTDB_STARTUP_MAX_RECORDS` | 100,000 | Records; record-index outbox rows; record commit rows |
 | `AGENTDB_STARTUP_MAX_RECORD_EDGES` | 500,000 | Record edges |
-| `AGENTDB_STARTUP_MAX_SKILLS` | 100,000 | Skills; unique skill keys |
-| `AGENTDB_STARTUP_MAX_SKILL_BINDINGS` | 500,000 | Agent/skill bindings |
 | `AGENTDB_STARTUP_MAX_EXPORT_CONSUMERS` | 10,000 | Managed export consumers |
 | `AGENTDB_STARTUP_MAX_TENANT_META` | 500,000 | Tenant metadata rows |
 | `AGENTDB_STARTUP_MAX_IDEMPOTENCY` | 1,000,000 | Idempotency rows |
@@ -478,7 +473,7 @@ and maintain.
 
 ## Policy And GC
 
-Policy evaluation covers append, artifact writes, record writes, skill bindings,
+Policy evaluation covers append, artifact writes, record writes,
 context byte budgets, active-session quotas, lifecycle work units, and GC work
 units. Soft deletes mark runtime objects first; tenant-scoped GC sweeps later
 purge metadata, index entries, and artifact content when policy allows.
@@ -500,5 +495,5 @@ than treating a create conflict as a new identity. After binding, SDKs reuse or
 create aliases under the resolved tenant.
 
 Framework adapters should be thin. Their job is to map framework concepts onto
-AgentDB tenants, agents, sessions, events, records, artifacts, and skills while
+AgentDB tenants, agents, sessions, events, records, and artifacts while
 leaving runtime semantics on the server.

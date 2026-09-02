@@ -645,7 +645,6 @@ async fn search_filters_by_source_event_id() {
         event_id: Some(evt_id.clone()),
         artifact_id: None,
         record_id: None,
-        skill_id: None,
     });
     rt.write_record(with_source).await.unwrap();
 
@@ -665,7 +664,6 @@ async fn search_filters_by_source_event_id() {
         event_id: Some(evt_id.clone()),
         artifact_id: None,
         record_id: None,
-        skill_id: None,
     };
     let hits = rt
         .search_records(SearchRequest {

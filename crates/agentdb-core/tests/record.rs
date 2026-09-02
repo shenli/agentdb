@@ -88,7 +88,6 @@ fn record_round_trips_through_serde_with_all_fields() {
         event_id: None,
         artifact_id: None,
         record_id: None,
-        skill_id: None,
     });
     req.expires_at_ms = Some(9_999_999_999_999);
     req.policy = IndexingPolicy {

@@ -53,7 +53,6 @@ use crate::segment::{
     SessionSegment, SessionSegmentFile,
 };
 use crate::session::{ForkRef, Lifecycle, NewSession, Session, SnapshotLayer, SnapshotRef};
-use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tablet_state::{
     decode_sst_snapshot_payload, encode_sst_snapshot_payload, is_sst_snapshot_payload,
     LoggedTabletStateMachine, TabletCommand, TabletSnapshotShardFilter, TabletStateMachine,
@@ -556,7 +555,6 @@ pub struct FleetStorageSummary {
 pub enum ContextInclude {
     RecentEvents,
     Records,
-    Skills,
     Policy,
 }
 
@@ -575,7 +573,6 @@ pub struct ContextResponse {
     pub session_id: Id,
     pub events: Vec<EventEnvelope>,
     pub records: Vec<SearchableRecord>,
-    pub skills: Vec<AgentSkillBinding>,
     pub policy: Option<RuntimePolicy>,
     pub bytes_used: usize,
     pub truncated: bool,
@@ -777,8 +774,6 @@ pub struct GcSweepReport {
     pub agents_purged: usize,
     pub sessions_purged: usize,
     pub events_purged: usize,
-    pub skills_purged: usize,
-    pub skill_bindings_purged: usize,
     pub idempotency_purged: usize,
     pub records_purged: usize,
     pub artifacts_purged: usize,
@@ -974,12 +969,6 @@ struct State {
     tenant_aliases: BTreeMap<String, String>,
     agent_aliases: BTreeMap<String, String>,
     session_aliases: BTreeMap<String, String>,
-    /// V2.3 skills, keyed by skill_id string.
-    skills: BTreeMap<String, Skill>,
-    /// Uniqueness map for `(tenant_id, skill_name, version) -> skill_id`.
-    skill_uniques: BTreeMap<String, String>,
-    /// Agent skill bindings keyed by `(agent_id, skill_id)`.
-    agent_skill_bindings: BTreeMap<(String, String), AgentSkillBinding>,
     /// Managed export consumers keyed by `(tenant_id, consumer_name)`.
     export_consumers: BTreeMap<(String, String), ExportConsumer>,
     /// V2.2 searchable records, keyed by `record_id` string. Hydrated at
@@ -1073,10 +1062,6 @@ fn insert_runtime_event_cache(
 
 fn scoped_alias_key(tenant_id: &str, alias: &str) -> String {
     format!("{tenant_id}::{alias}")
-}
-
-fn skill_unique_state_key(tenant_id: &str, name: &str, version: &str) -> String {
-    format!("{tenant_id}::{name}::{version}")
 }
 
 fn policy_for_tenant_in_state(s: &State, tenant_id: &Id) -> RuntimePolicy {
@@ -2242,7 +2227,7 @@ fn movement_scratch_root(
     Ok(root)
 }
 
-fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 17] {
+fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 14] {
     [
         (
             "tenants",
@@ -2298,21 +2283,6 @@ fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 17] 
             "record edges",
             b"record/searchable_edge/".as_slice(),
             startup_hydration_limit("AGENTDB_STARTUP_MAX_RECORD_EDGES", 500_000),
-        ),
-        (
-            "skills",
-            b"record/skill/".as_slice(),
-            startup_hydration_limit("AGENTDB_STARTUP_MAX_SKILLS", 100_000),
-        ),
-        (
-            "unique skill keys",
-            b"record/skill_unique/".as_slice(),
-            startup_hydration_limit("AGENTDB_STARTUP_MAX_SKILLS", 100_000),
-        ),
-        (
-            "skill bindings",
-            b"record/agent_skill/".as_slice(),
-            startup_hydration_limit("AGENTDB_STARTUP_MAX_SKILL_BINDINGS", 500_000),
         ),
         (
             "managed export consumers",
@@ -2391,7 +2361,7 @@ fn startup_hydration_mode() -> HydrationMode {
 /// Prefixes that lazy hydration leaves to the on-demand fallback path; the
 /// startup preflight row caps do not apply to them in lazy mode (their whole
 /// point is supporting populations larger than the caps).
-const LAZY_HYDRATION_SKIPPED_PREFIXES: [&[u8]; 10] = [
+const LAZY_HYDRATION_SKIPPED_PREFIXES: [&[u8]; 7] = [
     b"record/tenant/",
     b"record/tenant_alias/",
     b"record/agent/",
@@ -2399,9 +2369,6 @@ const LAZY_HYDRATION_SKIPPED_PREFIXES: [&[u8]; 10] = [
     b"record/session/",
     b"record/session_alias/",
     b"record/artifact/",
-    b"record/skill/",
-    b"record/skill_unique/",
-    b"record/agent_skill/",
 ];
 
 fn hydrate_runtime_from_persist(
@@ -2416,40 +2383,6 @@ fn hydrate_runtime_from_persist(
     // hydrates in both modes.
     if mode == HydrationMode::Full {
         hydrate_metadata_maps(persist, &mut state);
-    }
-    // Skills, their uniqueness rows, and agent bindings are lazy too: the
-    // ensure_*/warm_* fallbacks load rows on first touch and the
-    // enumeration paths scan KV directly.
-    if mode == HydrationMode::Full {
-        for skill in persist.scan_all_skills().expect("hydrate skills") {
-            if skill.deleted_at_ms.is_none() {
-                state
-                    .skills
-                    .insert(skill.skill_id.as_str().to_string(), skill);
-            }
-        }
-        for ((tenant, name, version), skill_id) in persist
-            .scan_all_skill_uniques()
-            .expect("hydrate skill uniqueness")
-        {
-            state
-                .skill_uniques
-                .insert(skill_unique_state_key(&tenant, &name, &version), skill_id);
-        }
-        for binding in persist
-            .scan_all_agent_skill_bindings()
-            .expect("hydrate agent skill bindings")
-        {
-            if binding.deleted_at_ms.is_none() {
-                state.agent_skill_bindings.insert(
-                    (
-                        binding.agent_id.as_str().to_string(),
-                        binding.skill_id.as_str().to_string(),
-                    ),
-                    binding,
-                );
-            }
-        }
     }
     for consumer in persist
         .scan_all_export_consumers()
@@ -4528,11 +4461,6 @@ impl Runtime {
             s.records.clear();
             s.events.clear();
             s.tenant_aggregate_cache.clear();
-            // Skills have per-row fallbacks now: evict like the other
-            // large sets instead of re-scanning on every apply.
-            s.skills.clear();
-            s.skill_uniques.clear();
-            s.agent_skill_bindings.clear();
             s.export_consumers.clear();
             for consumer in consumers {
                 s.export_consumers.insert(
@@ -4665,7 +4593,6 @@ impl Runtime {
                 | ErrorCode::AgentNotFound
                 | ErrorCode::SessionNotFound
                 | ErrorCode::ArtifactNotFound
-                | ErrorCode::SkillNotFound
         )
     }
 
@@ -4791,121 +4718,6 @@ impl Runtime {
             let mut s = self.state.lock().await;
             s.records
                 .entry(record_id.as_str().to_string())
-                .or_insert(row);
-        }
-        Ok(())
-    }
-
-    async fn ensure_skill_cached(&self, tenant_id: &Id, skill_id: &Id) -> Result<()> {
-        let Some(p) = &self.persist else {
-            return Ok(());
-        };
-        {
-            let s = self.state.lock().await;
-            if s.skills.contains_key(skill_id.as_str()) {
-                return Ok(());
-            }
-        }
-        if let Some(row) = p
-            .get_skill_row(tenant_id.as_str(), skill_id.as_str())
-            .map_err(internal)?
-        {
-            let mut s = self.state.lock().await;
-            s.skills.entry(skill_id.as_str().to_string()).or_insert(row);
-        }
-        Ok(())
-    }
-
-    async fn ensure_skill_unique_cached(
-        &self,
-        tenant_id: &Id,
-        name: &str,
-        version: &str,
-    ) -> Result<()> {
-        let Some(p) = &self.persist else {
-            return Ok(());
-        };
-        let key = skill_unique_state_key(tenant_id.as_str(), name, version);
-        {
-            let s = self.state.lock().await;
-            if s.skill_uniques.contains_key(&key) {
-                return Ok(());
-            }
-        }
-        if let Some(skill_id) = p
-            .get_skill_unique_row(tenant_id.as_str(), name, version)
-            .map_err(internal)?
-        {
-            let mut s = self.state.lock().await;
-            s.skill_uniques.entry(key).or_insert(skill_id);
-        }
-        Ok(())
-    }
-
-    async fn ensure_agent_skill_binding_cached(
-        &self,
-        tenant_id: &Id,
-        agent_id: &Id,
-        skill_id: &Id,
-    ) -> Result<()> {
-        let Some(p) = &self.persist else {
-            return Ok(());
-        };
-        let key = (agent_id.as_str().to_string(), skill_id.as_str().to_string());
-        {
-            let s = self.state.lock().await;
-            if s.agent_skill_bindings.contains_key(&key) {
-                return Ok(());
-            }
-        }
-        if let Some(row) = p
-            .get_agent_skill_binding_row(tenant_id.as_str(), agent_id.as_str(), skill_id.as_str())
-            .map_err(internal)?
-        {
-            let mut s = self.state.lock().await;
-            s.agent_skill_bindings.entry(key).or_insert(row);
-        }
-        Ok(())
-    }
-
-    async fn authoritative_tenant_skills(&self, tenant_id: &Id) -> Result<Vec<Skill>> {
-        match &self.persist {
-            Some(p) => {
-                let scanned = p.scan_tenant_skills(tenant_id.as_str()).map_err(internal)?;
-                let s = self.state.lock().await;
-                Ok(scanned
-                    .into_iter()
-                    .map(|row| s.skills.get(row.skill_id.as_str()).cloned().unwrap_or(row))
-                    .collect())
-            }
-            None => {
-                let s = self.state.lock().await;
-                Ok(s.skills
-                    .values()
-                    .filter(|skill| skill.tenant_id.as_str() == tenant_id.as_str())
-                    .cloned()
-                    .collect())
-            }
-        }
-    }
-
-    /// Warm every binding row of one tenant into the cache. Cascade paths
-    /// (skill delete) and tenant-wide listings walk the in-memory map, so in
-    /// lazy mode the tenant's rows must be resident first; cached rows win.
-    async fn warm_tenant_skill_bindings(&self, tenant_id: &Id) -> Result<()> {
-        let Some(p) = &self.persist else {
-            return Ok(());
-        };
-        let scanned = p
-            .scan_tenant_agent_skill_bindings(tenant_id.as_str())
-            .map_err(internal)?;
-        let mut s = self.state.lock().await;
-        for row in scanned {
-            s.agent_skill_bindings
-                .entry((
-                    row.agent_id.as_str().to_string(),
-                    row.skill_id.as_str().to_string(),
-                ))
                 .or_insert(row);
         }
         Ok(())
@@ -5360,13 +5172,6 @@ impl Runtime {
             evicted += s.records.len();
             s.records.clear();
         }
-        let max_skills = Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_SKILLS", 100_000);
-        if s.skills.len() > max_skills {
-            evicted += s.skills.len();
-            s.skills.clear();
-            s.skill_uniques.clear();
-            s.agent_skill_bindings.clear();
-        }
         if s.sessions.len() > max_sessions {
             evicted += s.sessions.len();
             s.sessions.clear();
@@ -5407,9 +5212,6 @@ impl Runtime {
         s.tenant_aliases.clear();
         s.agent_aliases.clear();
         s.session_aliases.clear();
-        s.skills.clear();
-        s.skill_uniques.clear();
-        s.agent_skill_bindings.clear();
     }
 
     pub async fn get_tenant(&self, tenant_id: &Id) -> Result<Tenant> {
@@ -6687,418 +6489,6 @@ impl Runtime {
         self.replay_session(tenant_id, session_id).await
     }
 
-    /// Register a V2.3 skill. `(tenant_id, name, version)` is unique.
-    /// Artifact refs are validated against live artifacts in the same tenant.
-    pub async fn register_skill(
-        &self,
-        req: NewSkill,
-        idempotency_key: Option<String>,
-    ) -> Result<Skill> {
-        self.refresh_replicated_state().await?;
-        self.ensure_tenant_cached(&req.tenant_id).await?;
-        self.ensure_skill_unique_cached(&req.tenant_id, &req.name, &req.version)
-            .await?;
-        for art_ref in &req.artifact_refs {
-            self.ensure_artifact_cached(&req.tenant_id, &art_ref.artifact_id)
-                .await?;
-        }
-        // Quota admission counts the authoritative rows, not the cache.
-        let live_skill_count = self
-            .authoritative_tenant_skills(&req.tenant_id)
-            .await?
-            .into_iter()
-            .filter(|skill| skill.deleted_at_ms.is_none())
-            .count();
-        let idem_full_key = idempotency_key.as_ref().map(|k| {
-            format!(
-                "{}::{}::{}::{}",
-                req.tenant_id, "skill_register", req.name, k
-            )
-        });
-        let req_hash = hash_skill_register_request(&req);
-        if let Some(ref full) = idem_full_key {
-            if let Some(rec) = self.lookup_idempotency_record(full)? {
-                return verify_json_replay(&rec, req_hash);
-            }
-        }
-
-        let skill = {
-            let mut s = self.state.lock().await;
-            if let Some(ref full) = idem_full_key {
-                if let Some(rec) = self.lookup_idempotency_record(full)? {
-                    drop(s);
-                    return verify_json_replay(&rec, req_hash);
-                }
-            }
-            let tenant_live = s
-                .tenants
-                .get(req.tenant_id.as_str())
-                .is_some_and(|t| t.deleted_at_ms.is_none());
-            if !tenant_live {
-                return Err(Error::new(
-                    ErrorCode::TenantNotFound,
-                    format!("{}", req.tenant_id),
-                ));
-            }
-            let policy = policy_for_tenant_in_state(&s, &req.tenant_id);
-            if let Some(max) = policy.quota.max_skills {
-                if live_skill_count >= max {
-                    return Err(Error::new(
-                        ErrorCode::PolicyDenied,
-                        format!(
-                            "policy_version {} denies skill register: skill quota {max} exhausted",
-                            policy.version
-                        ),
-                    ));
-                }
-            }
-            let unique = skill_unique_state_key(req.tenant_id.as_str(), &req.name, &req.version);
-            if s.skill_uniques.contains_key(&unique) {
-                return Err(Error::new(
-                    ErrorCode::AliasConflict,
-                    format!(
-                        "skill version already registered: {}@{}",
-                        req.name, req.version
-                    ),
-                ));
-            }
-            for art_ref in &req.artifact_refs {
-                let exists = art_ref.artifact_id.kind() == crate::id::IdKind::Artifact
-                    && s.artifacts
-                        .get(art_ref.artifact_id.as_str())
-                        .is_some_and(|a| {
-                            a.deleted_at_ms.is_none()
-                                && a.tenant_id.as_str() == req.tenant_id.as_str()
-                        });
-                if !exists {
-                    return Err(Error::new(
-                        ErrorCode::ArtifactNotFound,
-                        format!("{}", art_ref.artifact_id),
-                    ));
-                }
-            }
-            let skill = Skill::create(req);
-            if let Some(p) = &self.persist {
-                p.put_skill(&skill).map_err(internal)?;
-            }
-            s.skill_uniques
-                .insert(unique, skill.skill_id.as_str().to_string());
-            s.skills
-                .insert(skill.skill_id.as_str().to_string(), skill.clone());
-            skill
-        };
-
-        if let Some(full) = idem_full_key {
-            let rec = IdempotencyRecord {
-                payload_hash: req_hash,
-                result_json: serde_json::to_string(&skill).unwrap(),
-                created_at_ms: crate::now_ms(),
-            };
-            if let Some(p) = &self.persist {
-                p.put_idempotency(&full, &rec).map_err(internal)?;
-            }
-            self.idem.put(full, rec);
-        }
-        Ok(skill)
-    }
-
-    pub async fn get_skill(&self, tenant_id: &Id, skill_id: &Id) -> Result<Skill> {
-        for attempt in 0..16 {
-            match self.get_skill_once(tenant_id, skill_id).await {
-                Err(e) if Self::metadata_cache_miss_retryable(e.code) && attempt < 15 => continue,
-                result => return result,
-            }
-        }
-        unreachable!("bounded retry loop returns")
-    }
-
-    async fn get_skill_once(&self, tenant_id: &Id, skill_id: &Id) -> Result<Skill> {
-        self.ensure_tenant_cached(tenant_id).await?;
-        self.ensure_skill_cached(tenant_id, skill_id).await?;
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        s.skills
-            .get(skill_id.as_str())
-            .filter(|skill| {
-                tenant_live
-                    && skill.deleted_at_ms.is_none()
-                    && skill.tenant_id.as_str() == tenant_id.as_str()
-            })
-            .cloned()
-            .ok_or_else(|| Error::new(ErrorCode::SkillNotFound, format!("{}", skill_id)))
-    }
-
-    pub async fn list_skills(&self, tenant_id: &Id) -> Result<Vec<Skill>> {
-        self.ensure_tenant_cached(tenant_id).await?;
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        if !tenant_live {
-            return Err(Error::new(
-                ErrorCode::TenantNotFound,
-                format!("{}", tenant_id),
-            ));
-        }
-        drop(s);
-        let mut skills = self
-            .authoritative_tenant_skills(tenant_id)
-            .await?
-            .into_iter()
-            .filter(|skill| {
-                skill.deleted_at_ms.is_none() && skill.tenant_id.as_str() == tenant_id.as_str()
-            })
-            .collect::<Vec<_>>();
-        skills.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| a.version.cmp(&b.version))
-                .then_with(|| a.skill_id.as_str().cmp(b.skill_id.as_str()))
-        });
-        Ok(skills)
-    }
-
-    pub async fn delete_skill(&self, tenant_id: &Id, skill_id: &Id) -> Result<()> {
-        self.refresh_replicated_state().await?;
-        self.ensure_tenant_cached(tenant_id).await?;
-        self.ensure_skill_cached(tenant_id, skill_id).await?;
-        // The cascade below walks the in-memory bindings map; make the
-        // tenant's binding rows resident first (lazy mode / post-eviction).
-        self.warm_tenant_skill_bindings(tenant_id).await?;
-        let mut s = self.state.lock().await;
-        let live = s.skills.get(skill_id.as_str()).is_some_and(|skill| {
-            skill.deleted_at_ms.is_none() && skill.tenant_id.as_str() == tenant_id.as_str()
-        });
-        if !live {
-            return Err(Error::new(
-                ErrorCode::SkillNotFound,
-                format!("{}", skill_id),
-            ));
-        }
-
-        let now = crate::now_ms();
-        let updated_skill = {
-            let skill = s
-                .skills
-                .get_mut(skill_id.as_str())
-                .expect("presence checked above");
-            skill.deleted_at_ms = Some(now);
-            skill.clone()
-        };
-        let binding_keys: Vec<(String, String)> = s
-            .agent_skill_bindings
-            .iter()
-            .filter(|(_, binding)| {
-                binding.tenant_id.as_str() == tenant_id.as_str()
-                    && binding.skill_id.as_str() == skill_id.as_str()
-                    && binding.deleted_at_ms.is_none()
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        let mut updated_bindings = Vec::new();
-        for key in binding_keys {
-            if let Some(binding) = s.agent_skill_bindings.get_mut(&key) {
-                binding.deleted_at_ms = Some(now);
-                updated_bindings.push(binding.clone());
-            }
-        }
-
-        if let Some(p) = &self.persist {
-            if let Err(e) = p.put_skill(&updated_skill) {
-                if let Some(skill) = s.skills.get_mut(skill_id.as_str()) {
-                    skill.deleted_at_ms = None;
-                }
-                for binding in &updated_bindings {
-                    if let Some(current) = s.agent_skill_bindings.get_mut(&(
-                        binding.agent_id.as_str().to_string(),
-                        binding.skill_id.as_str().to_string(),
-                    )) {
-                        current.deleted_at_ms = None;
-                    }
-                }
-                drop(s);
-                return Err(internal(e));
-            }
-            for binding in &updated_bindings {
-                if let Err(e) = p.put_agent_skill_binding(binding) {
-                    drop(s);
-                    return Err(internal(e));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Bind an exact skill version to an agent. Rebinding the same skill id is
-    /// idempotent even without an Idempotency-Key.
-    pub async fn bind_skill(&self, req: BindSkillRequest) -> Result<AgentSkillBinding> {
-        self.refresh_replicated_state().await?;
-        self.ensure_tenant_cached(&req.tenant_id).await?;
-        self.ensure_agent_cached(&req.tenant_id, &req.agent_id)
-            .await?;
-        self.ensure_skill_cached(&req.tenant_id, &req.skill_id)
-            .await?;
-        self.ensure_agent_skill_binding_cached(&req.tenant_id, &req.agent_id, &req.skill_id)
-            .await?;
-        // The per-agent binding quota walks the in-memory map; warm the
-        // tenant's binding rows so the count is authoritative in lazy mode.
-        self.warm_tenant_skill_bindings(&req.tenant_id).await?;
-        let idem_full_key = req.idempotency_key.as_ref().map(|k| {
-            format!(
-                "{}::{}::{}::{}",
-                req.tenant_id, "skill_bind", req.agent_id, k
-            )
-        });
-        let req_hash = hash_skill_bind_request(&req);
-        if let Some(ref full) = idem_full_key {
-            if let Some(rec) = self.lookup_idempotency_record(full)? {
-                return verify_json_replay(&rec, req_hash);
-            }
-        }
-
-        let binding = {
-            let mut s = self.state.lock().await;
-            if let Some(ref full) = idem_full_key {
-                if let Some(rec) = self.lookup_idempotency_record(full)? {
-                    drop(s);
-                    return verify_json_replay(&rec, req_hash);
-                }
-            }
-            let agent = s
-                .agents
-                .get(req.agent_id.as_str())
-                .filter(|a| {
-                    a.deleted_at_ms.is_none() && a.tenant_id.as_str() == req.tenant_id.as_str()
-                })
-                .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)))?;
-            let skill = s
-                .skills
-                .get(req.skill_id.as_str())
-                .filter(|skill| {
-                    skill.deleted_at_ms.is_none()
-                        && skill.tenant_id.as_str() == req.tenant_id.as_str()
-                })
-                .ok_or_else(|| Error::new(ErrorCode::SkillNotFound, format!("{}", req.skill_id)))?;
-            let key = (
-                agent.agent_id.as_str().to_string(),
-                skill.skill_id.as_str().to_string(),
-            );
-            if let Some(existing) = s.agent_skill_bindings.get(&key) {
-                return Ok(existing.clone());
-            }
-            let policy = policy_for_tenant_in_state(&s, &req.tenant_id);
-            if let Some(max) = policy.quota.max_skill_bindings_per_agent {
-                let live_bindings = s
-                    .agent_skill_bindings
-                    .values()
-                    .filter(|binding| {
-                        binding.tenant_id.as_str() == req.tenant_id.as_str()
-                            && binding.agent_id.as_str() == req.agent_id.as_str()
-                            && binding.deleted_at_ms.is_none()
-                    })
-                    .count();
-                if live_bindings >= max {
-                    return Err(Error::new(
-                        ErrorCode::PolicyDenied,
-                        format!(
-                            "policy_version {} denies skill bind: skill binding quota {max} exhausted",
-                            policy.version
-                        ),
-                    ));
-                }
-            }
-            let binding =
-                AgentSkillBinding::create(req.tenant_id.clone(), req.agent_id.clone(), skill);
-            if let Some(p) = &self.persist {
-                p.put_agent_skill_binding(&binding).map_err(internal)?;
-            }
-            s.agent_skill_bindings.insert(key, binding.clone());
-            binding
-        };
-
-        if let Some(full) = idem_full_key {
-            let rec = IdempotencyRecord {
-                payload_hash: req_hash,
-                result_json: serde_json::to_string(&binding).unwrap(),
-                created_at_ms: crate::now_ms(),
-            };
-            if let Some(p) = &self.persist {
-                p.put_idempotency(&full, &rec).map_err(internal)?;
-            }
-            self.idem.put(full, rec);
-        }
-        Ok(binding)
-    }
-
-    pub async fn list_agent_skills(
-        &self,
-        tenant_id: &Id,
-        agent_id: &Id,
-    ) -> Result<Vec<AgentSkillBinding>> {
-        self.ensure_tenant_cached(tenant_id).await?;
-        self.ensure_agent_cached(tenant_id, agent_id).await?;
-        self.warm_tenant_skill_bindings(tenant_id).await?;
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        let agent_live = s.agents.get(agent_id.as_str()).is_some_and(|a| {
-            tenant_live && a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str()
-        });
-        if !agent_live {
-            return Err(Error::new(
-                ErrorCode::AgentNotFound,
-                format!("{}", agent_id),
-            ));
-        }
-        Ok(s.agent_skill_bindings
-            .values()
-            .filter(|b| {
-                b.deleted_at_ms.is_none()
-                    && b.tenant_id.as_str() == tenant_id.as_str()
-                    && b.agent_id.as_str() == agent_id.as_str()
-            })
-            .cloned()
-            .collect())
-    }
-
-    pub async fn list_skill_bindings(&self, tenant_id: &Id) -> Result<Vec<AgentSkillBinding>> {
-        self.ensure_tenant_cached(tenant_id).await?;
-        self.warm_tenant_skill_bindings(tenant_id).await?;
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        if !tenant_live {
-            return Err(Error::new(
-                ErrorCode::TenantNotFound,
-                format!("{}", tenant_id),
-            ));
-        }
-        let mut bindings = s
-            .agent_skill_bindings
-            .values()
-            .filter(|binding| {
-                binding.deleted_at_ms.is_none() && binding.tenant_id.as_str() == tenant_id.as_str()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        bindings.sort_by(|a, b| {
-            a.agent_id
-                .as_str()
-                .cmp(b.agent_id.as_str())
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| a.version.cmp(&b.version))
-        });
-        Ok(bindings)
-    }
-
     pub async fn resolve_policy_for_tenant(&self, tenant_id: &Id) -> Result<RuntimePolicy> {
         let s = self.state.lock().await;
         let tenant = s
@@ -7157,17 +6547,6 @@ impl Runtime {
             report.push_if_over("artifact_storage", agg.live_artifact_bytes, soft);
         }
 
-        if let Some(soft) = policy.quota.soft_max_skills {
-            let live_skills = s
-                .skills
-                .values()
-                .filter(|skill| {
-                    skill.tenant_id.as_str() == tenant_id.as_str() && skill.deleted_at_ms.is_none()
-                })
-                .count();
-            report.push_if_over("skills", live_skills as u64, soft as u64);
-        }
-
         Ok(report)
     }
 
@@ -7198,18 +6577,6 @@ impl Runtime {
         let mut report = BackpressureReport::default();
         if let Some(soft) = policy.quota.soft_max_events_per_session {
             report.push_if_over("session_events", session.next_seq, soft);
-        }
-        if let Some(soft) = policy.quota.soft_max_skill_bindings_per_agent {
-            let live_bindings = s
-                .agent_skill_bindings
-                .values()
-                .filter(|binding| {
-                    binding.tenant_id.as_str() == tenant_id.as_str()
-                        && binding.agent_id.as_str() == session.agent_id.as_str()
-                        && binding.deleted_at_ms.is_none()
-                })
-                .count();
-            report.push_if_over("skill_bindings", live_bindings as u64, soft as u64);
         }
         Ok(report)
     }
@@ -7260,30 +6627,8 @@ impl Runtime {
         if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
             report.push_if_over("artifact_storage", agg.live_artifact_bytes, soft);
         }
-        if let Some(soft) = policy.quota.soft_max_skills {
-            let live_skills = s
-                .skills
-                .values()
-                .filter(|skill| {
-                    skill.tenant_id.as_str() == tenant_id.as_str() && skill.deleted_at_ms.is_none()
-                })
-                .count();
-            report.push_if_over("skills", live_skills as u64, soft as u64);
-        }
         if let Some(soft) = policy.quota.soft_max_events_per_session {
             report.push_if_over("session_events", session.next_seq, soft);
-        }
-        if let Some(soft) = policy.quota.soft_max_skill_bindings_per_agent {
-            let live_bindings = s
-                .agent_skill_bindings
-                .values()
-                .filter(|binding| {
-                    binding.tenant_id.as_str() == tenant_id.as_str()
-                        && binding.agent_id.as_str() == session.agent_id.as_str()
-                        && binding.deleted_at_ms.is_none()
-                })
-                .count();
-            report.push_if_over("skill_bindings", live_bindings as u64, soft as u64);
         }
 
         Ok(report)
@@ -8069,8 +7414,6 @@ impl Runtime {
             report.gc.agents_purged += gc.agents_purged;
             report.gc.sessions_purged += gc.sessions_purged;
             report.gc.events_purged += gc.events_purged;
-            report.gc.skills_purged += gc.skills_purged;
-            report.gc.skill_bindings_purged += gc.skill_bindings_purged;
             report.gc.idempotency_purged += gc.idempotency_purged;
             report.gc.records_purged += gc.records_purged;
             report.gc.artifacts_purged += gc.artifacts_purged;
@@ -8244,39 +7587,6 @@ impl Runtime {
                     p.purge_agent(&agent, reason, deleted_at_ms)
                         .map_err(internal)?;
                 }
-                let binding_keys: Vec<(String, String)> = s
-                    .agent_skill_bindings
-                    .iter()
-                    .filter(|(_, binding)| {
-                        binding.tenant_id.as_str() == agent.tenant_id.as_str()
-                            && binding.agent_id.as_str() == agent.agent_id.as_str()
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                for key in binding_keys {
-                    let Some(binding) = s.agent_skill_bindings.get(&key).cloned() else {
-                        continue;
-                    };
-                    if let Some(p) = &self.persist {
-                        let tenant_deleted_at = s
-                            .tenants
-                            .get(binding.tenant_id.as_str())
-                            .and_then(|tenant| tenant.deleted_at_ms);
-                        let deleted_at_ms = first_deletion_ms(
-                            now_ms,
-                            &[
-                                binding.deleted_at_ms,
-                                agent.deleted_at_ms,
-                                tenant_deleted_at,
-                            ],
-                        );
-                        let reason = gc_tombstone_reason(binding.deleted_at_ms, tenant_deleted_at);
-                        p.purge_agent_skill_binding(&binding, reason, deleted_at_ms)
-                            .map_err(internal)?;
-                    }
-                    s.agent_skill_bindings.remove(&key);
-                    report.skill_bindings_purged += 1;
-                }
                 s.agents.remove(&agent_id);
                 if let Some(alias) = agent.alias.as_deref() {
                     s.agent_aliases
@@ -8372,93 +7682,6 @@ impl Runtime {
                         .remove(&scoped_alias_key(session.tenant_id.as_str(), alias));
                 }
                 report.sessions_purged += 1;
-                report.changefeed_purge_events += 1;
-                report.work_units += 1;
-            }
-        }
-
-        {
-            let mut s = self.state.lock().await;
-            let skill_ids: Vec<String> = s
-                .skills
-                .iter()
-                .filter_map(|(id, skill)| {
-                    if tenant_scope
-                        .is_some_and(|tenant_id| skill.tenant_id.as_str() != tenant_id.as_str())
-                    {
-                        return None;
-                    }
-                    let tenant = s.tenants.get(skill.tenant_id.as_str())?;
-                    let policy = RuntimePolicy::from_json(&tenant.policy);
-                    let deleted_at = skill.deleted_at_ms.or(tenant.deleted_at_ms)?;
-                    if policy.retention.legal_hold
-                        || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
-                    {
-                        return None;
-                    }
-                    Some(id.clone())
-                })
-                .collect();
-
-            for skill_id in skill_ids {
-                let Some(skill) = s.skills.get(&skill_id).cloned() else {
-                    continue;
-                };
-                let policy = policy_for_tenant_in_state(&s, &skill.tenant_id);
-                if !gc_work_allowed(&mut report, &policy) {
-                    break;
-                }
-                let binding_keys: Vec<(String, String)> = s
-                    .agent_skill_bindings
-                    .iter()
-                    .filter(|(_, binding)| {
-                        binding.tenant_id.as_str() == skill.tenant_id.as_str()
-                            && binding.skill_id.as_str() == skill.skill_id.as_str()
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                for key in binding_keys {
-                    let Some(binding) = s.agent_skill_bindings.get(&key).cloned() else {
-                        continue;
-                    };
-                    if let Some(p) = &self.persist {
-                        let tenant_deleted_at = s
-                            .tenants
-                            .get(binding.tenant_id.as_str())
-                            .and_then(|tenant| tenant.deleted_at_ms);
-                        let deleted_at_ms = first_deletion_ms(
-                            now_ms,
-                            &[
-                                binding.deleted_at_ms,
-                                skill.deleted_at_ms,
-                                tenant_deleted_at,
-                            ],
-                        );
-                        let reason = gc_tombstone_reason(binding.deleted_at_ms, tenant_deleted_at);
-                        p.purge_agent_skill_binding(&binding, reason, deleted_at_ms)
-                            .map_err(internal)?;
-                    }
-                    s.agent_skill_bindings.remove(&key);
-                    report.skill_bindings_purged += 1;
-                }
-                if let Some(p) = &self.persist {
-                    let tenant_deleted_at = s
-                        .tenants
-                        .get(skill.tenant_id.as_str())
-                        .and_then(|tenant| tenant.deleted_at_ms);
-                    let deleted_at_ms =
-                        first_deletion_ms(now_ms, &[skill.deleted_at_ms, tenant_deleted_at]);
-                    let reason = gc_tombstone_reason(skill.deleted_at_ms, tenant_deleted_at);
-                    p.purge_skill(&skill, reason, deleted_at_ms)
-                        .map_err(internal)?;
-                }
-                s.skill_uniques.remove(&skill_unique_state_key(
-                    skill.tenant_id.as_str(),
-                    &skill.name,
-                    &skill.version,
-                ));
-                s.skills.remove(&skill_id);
-                report.skills_purged += 1;
                 report.changefeed_purge_events += 1;
                 report.work_units += 1;
             }
@@ -8627,10 +7850,7 @@ impl Runtime {
                         .any(|record| record.tenant_id.as_str() == tenant.tenant_id.as_str())
                     || s.artifacts
                         .values()
-                        .any(|artifact| artifact.tenant_id.as_str() == tenant.tenant_id.as_str())
-                    || s.skills
-                        .values()
-                        .any(|skill| skill.tenant_id.as_str() == tenant.tenant_id.as_str());
+                        .any(|artifact| artifact.tenant_id.as_str() == tenant.tenant_id.as_str());
                 if has_children {
                     continue;
                 }
@@ -8780,7 +8000,6 @@ impl Runtime {
             && req.artifact_refs.is_empty()
             && req.source_refs.is_empty()
             && req.credential_refs.is_empty()
-            && req.kind != "skill_used"
             && !env_flag_disabled_runtime("AGENTDB_SESSION_APPEND_COALESCE")
     }
 
@@ -9436,52 +8655,6 @@ impl Runtime {
                     return Err(Error::new(ErrorCode::RecordNotFound, format!("{}", rec_id)));
                 }
             }
-            if let Some(skill_id) = &sr.skill_id {
-                let exists = (skill_id.kind() == crate::id::IdKind::Skill)
-                    && s.skills.get(skill_id.as_str()).is_some_and(|skill| {
-                        skill.deleted_at_ms.is_none()
-                            && skill.tenant_id.as_str() == req.tenant_id.as_str()
-                    });
-                if !exists {
-                    return Err(Error::new(
-                        ErrorCode::SkillNotFound,
-                        format!("{}", skill_id),
-                    ));
-                }
-            }
-        }
-
-        if req.kind == "skill_used" {
-            let skill_id_raw = req
-                .payload
-                .get("skill_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::SkillNotFound,
-                        "skill_used payload must include skill_id",
-                    )
-                })?;
-            let version = req
-                .payload
-                .get("version")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::SkillNotFound,
-                        "skill_used payload must include version",
-                    )
-                })?;
-            let skill_id = Id::parse_kind(skill_id_raw, crate::id::IdKind::Skill)
-                .map_err(|_| Error::new(ErrorCode::SkillNotFound, skill_id_raw))?;
-            let exact = s.skills.get(skill_id.as_str()).is_some_and(|skill| {
-                skill.deleted_at_ms.is_none()
-                    && skill.tenant_id.as_str() == req.tenant_id.as_str()
-                    && skill.version == version
-            });
-            if !exact {
-                return Err(Error::new(ErrorCode::SkillNotFound, skill_id_raw));
-            }
         }
 
         let metadata_key = self.resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)?;
@@ -9737,14 +8910,12 @@ impl Runtime {
         let session = self.get_session(&req.tenant_id, &req.session_id).await?;
         let include_events = req.include.contains(&ContextInclude::RecentEvents);
         let include_records = req.include.contains(&ContextInclude::Records);
-        let include_skills = req.include.contains(&ContextInclude::Skills);
         let include_policy = req.include.contains(&ContextInclude::Policy);
 
         let mut response = ContextResponse {
             session_id: req.session_id.clone(),
             events: Vec::new(),
             records: Vec::new(),
-            skills: Vec::new(),
             policy: None,
             bytes_used: 0,
             truncated: false,
@@ -9783,20 +8954,6 @@ impl Runtime {
                         response.truncated = true;
                         break;
                     }
-                }
-            }
-        }
-
-        if include_skills {
-            let skills = self
-                .list_agent_skills(&req.tenant_id, &session.agent_id)
-                .await?;
-            for skill in skills {
-                if push_budgeted(&mut response.bytes_used, req.max_bytes, &skill) {
-                    response.skills.push(skill);
-                } else {
-                    response.truncated = true;
-                    break;
                 }
             }
         }
@@ -10529,8 +9686,6 @@ impl Runtime {
                             | "sessions"
                             | "artifacts"
                             | "records"
-                            | "skills"
-                            | "skill_bindings"
                     )
                 }))
         {
@@ -10629,8 +9784,6 @@ impl Runtime {
                         | "session"
                         | "artifact"
                         | "record"
-                        | "skill"
-                        | "skill_binding"
                 )
                 && !parts[3].is_empty()
         });
@@ -12880,30 +12033,8 @@ fn backpressure_for_tenant_session_in_state(
     if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
         report.push_if_over("artifact_storage", agg.live_artifact_bytes, soft);
     }
-    if let Some(soft) = policy.quota.soft_max_skills {
-        let live_skills = s
-            .skills
-            .values()
-            .filter(|skill| {
-                skill.tenant_id.as_str() == tenant_id.as_str() && skill.deleted_at_ms.is_none()
-            })
-            .count();
-        report.push_if_over("skills", live_skills as u64, soft as u64);
-    }
     if let Some(soft) = policy.quota.soft_max_events_per_session {
         report.push_if_over("session_events", session.next_seq, soft);
-    }
-    if let Some(soft) = policy.quota.soft_max_skill_bindings_per_agent {
-        let live_bindings = s
-            .agent_skill_bindings
-            .values()
-            .filter(|binding| {
-                binding.tenant_id.as_str() == tenant_id.as_str()
-                    && binding.agent_id.as_str() == session.agent_id.as_str()
-                    && binding.deleted_at_ms.is_none()
-            })
-            .count();
-        report.push_if_over("skill_bindings", live_bindings as u64, soft as u64);
     }
 
     report
@@ -13098,10 +12229,6 @@ fn source_ref_json_upper_bound(reference: &SourceRef) -> usize {
             "record_id",
             json_str_upper_bound(record_id.as_str()),
         );
-    }
-    if let Some(skill_id) = reference.skill_id.as_ref() {
-        total =
-            add_json_field_upper_bound(total, "skill_id", json_str_upper_bound(skill_id.as_str()));
     }
     total
 }
@@ -13335,10 +12462,6 @@ fn validate_export_include(include: &[String]) -> Result<()> {
                 | "artifact"
                 | "records"
                 | "record"
-                | "skills"
-                | "skill"
-                | "skill_bindings"
-                | "skill_binding"
                 | "fork_edges"
                 | "fork_edge"
         ) {
@@ -13496,8 +12619,6 @@ fn export_include_matches_type(include: &str, object_type: &str) -> bool {
         "sessions" => object_type == "session",
         "artifacts" => object_type == "artifact",
         "records" => object_type == "record",
-        "skills" => object_type == "skill",
-        "skill_bindings" => object_type == "skill_binding",
         "fork_edges" => object_type == "fork_edge",
         other => other == object_type,
     }
@@ -13571,7 +12692,6 @@ fn source_ref_matches(rec: &SourceRef, filter: &SourceRef) -> bool {
         && match_id(&rec.event_id, &filter.event_id)
         && match_id(&rec.artifact_id, &filter.artifact_id)
         && match_id(&rec.record_id, &filter.record_id)
-        && match_id(&rec.skill_id, &filter.skill_id)
 }
 
 fn search_index_candidate_limit(req: &SearchRequest) -> usize {
@@ -14507,36 +13627,6 @@ fn verify_idem_replay(rec: &IdempotencyRecord, req: &AppendRequest) -> Result<Ap
     Ok(resp)
 }
 
-fn hash_skill_register_request(req: &NewSkill) -> u64 {
-    hash_json(&serde_json::json!({
-        "tenant_id": req.tenant_id.as_str(),
-        "name": req.name,
-        "version": req.version,
-        "manifest": req.manifest,
-        "artifact_refs": req.artifact_refs,
-    }))
-}
-
-fn hash_skill_bind_request(req: &BindSkillRequest) -> u64 {
-    hash_json(&serde_json::json!({
-        "tenant_id": req.tenant_id.as_str(),
-        "agent_id": req.agent_id.as_str(),
-        "skill_id": req.skill_id.as_str(),
-    }))
-}
-
-fn verify_json_replay<T>(rec: &IdempotencyRecord, expected_hash: u64) -> Result<T>
-where
-    T: serde::de::DeserializeOwned,
-{
-    if rec.payload_hash != expected_hash {
-        return Err(Error::new(
-            ErrorCode::IdempotencyConflict,
-            "request differs for the same idempotency key",
-        ));
-    }
-    Ok(serde_json::from_str(&rec.result_json).unwrap())
-}
 
 /// Map a storage-layer error into a V2 `Internal` error. The persist layer
 /// returns `agentdb_storage::Error`; surfacing it as `Internal` keeps the

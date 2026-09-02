@@ -26,7 +26,6 @@ Agent platforms repeatedly need the same primitives:
 - append-and-fetch for the agent turn loop
 - artifact offload for large or binary payloads
 - searchable scoped records
-- skill registry and exact-version replay
 - fork and replay for branchable runs
 - subscriptions and watch cursors for observers and dashboards
 - durable observability export for ClickHouse, ClickStack, JSONL, and archive
@@ -39,9 +38,8 @@ mapping code.
 The session is not the model context window. Context windows are transient,
 lossy, model-specific, and often transformed by compaction or trimming. The
 session log is durable, ordered, queryable, and recoverable. Context builders and
-framework adapters choose which slices, summaries, records, artifacts, and
-skills to pass to a model, while AgentDB preserves the underlying execution
-truth.
+framework adapters choose which slices, summaries, records, and artifacts to
+pass to a model, while AgentDB preserves the underlying execution truth.
 
 ## Runtime Boundaries
 
@@ -102,14 +100,13 @@ AgentDB or still needs product hardening.
 
 | Area | Status | Notes |
 |---|---|---|
-| Runtime objects | Implemented | Tenant, agent, session, event, artifact, record, skill, policy, and tenant metadata exist in the Rust runtime and native API. |
+| Runtime objects | Implemented | Tenant, agent, session, event, artifact, record, policy, and tenant metadata exist in the Rust runtime and native API. |
 | Native API and SDKs | Implemented | Tenant-scoped HTTP API plus maintained Python and TypeScript SDKs. Non-loopback binds require rotating installation bearer auth; scoped admin tokens protect admin routes. Loopback development may remain open, and tenant-scoped end-user authorization remains a hosted/control-plane concern. |
 | Append loop | Implemented | Per-session serialized append, contiguous `seq`, append-and-fetch, idempotency, backpressure signals, and raw-secret write-path guards. |
 | Fork and replay | Implemented | Pointer forks, fork-aware replay, bounded ancestor reads, replay scan stats, and explicit replay-prefix materialization over core/HTTP/SDK surfaces. |
 | Changefeeds | Implemented | Session subscribe, cursor-based `watch`, fork-edge control items, commit-ordered durable `export_watch`, and managed export consumers with retained-cursor validation and claim/ack/rewind. |
 | Artifacts | Implemented | Metadata and content bytes are stored separately with lifecycle-aware purge paths, a 128 MiB absolute object limit, local-filesystem fsync, failure cleanup, and standalone startup orphan reconciliation. The local sweep fully scans and materializes the blob listing; object-store listing/reconciliation is not yet implemented. |
 | Records and retrieval | Implemented for scoped runtime retrieval | Durable base records, local/global indexes, commit-sequence visibility repair, record edges, and source refs exist. Memory extraction, ranking, summarization, and embedding spend are application/platform responsibilities. |
-| Skills | Implemented | Versioned skill manifests and agent bindings are runtime objects; exact-version replay is supported through event refs and bindings. |
 | Policy, lifecycle, and GC | Implemented | Quota/backpressure, warm/cold/archive lifecycle, archive restore, retention, legal hold, derivative-only artifact purge, and policy workers exist. |
 | Credential boundary | Implemented defense in depth | Events carry opaque `credential_refs`; SDKs and runtime sanitize/reject common raw-secret payload shapes. Real secret resolution remains in the control plane/vault. |
 | Sandbox snapshots | AgentDB refs implemented; sandbox service external | AgentDB stores `SnapshotRef` / `SnapshotLayer` metadata and resolves resume refs across fork chains. Snapshot bytes, copy-on-write fork, restore, and byte retention belong to the sandbox service. |
@@ -176,7 +173,6 @@ IDs are public opaque strings:
 | Event | `evt_` |
 | Artifact | `art_` |
 | Record | `rec_` |
-| Skill | `skl_` |
 | Policy | `pol_` |
 
 Clients must not parse meaning from the suffix. The prefix is for validation,
@@ -200,8 +196,6 @@ authentication and only expose tenant IDs as low-level escape hatches.
 - **Artifact**: metadata plus content-backend bytes.
 - **Record**: searchable memory or observation with namespace, scope, metadata,
   tags, source refs, and indexing policy.
-- **Skill**: manifest/version plus optional artifact refs; bindings attach
-  skills to agents.
 - **Policy**: tenant and agent behavior for quota, retention, lifecycle,
   context budgets, legal hold, and garbage collection.
 
@@ -265,7 +259,7 @@ The canonical harness flow is:
 
 ```text
 wake(session_id)
-get events, records, artifacts, skills, and policy hints
+get events, records, artifacts, and policy hints
 build model context in the harness
 call the model
 execute requested tools or sandboxes as external hands
