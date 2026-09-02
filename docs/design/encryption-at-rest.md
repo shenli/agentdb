@@ -341,9 +341,21 @@ and confirms every one of that tenant's rows moved from v1 to v2 (leaving other
 tenants untouched), the data still decrypts through a fresh runtime, and a second
 pass rewrites nothing.
 
-**Not yet done:** re-encryption of **content** blobs (segments/archives/
-artifacts under the Content DEK — the metadata walk is the bulk; content is a
-parallel follow-up), automatic retirement of a fully-drained version, and a
+**Milestone 21 (landed): content-blob re-encryption.** `reencrypt_tenant_dek` now
+also rewrites a tenant's **content** blobs (session segments, archive bundles,
+replay prefixes, and artifacts, sealed under the **Content** DEK) that are under
+an older version, so a rotation — which advances both the Metadata and Content
+DEKs — can be fully drained and the old versions of *both* purposes retired. It
+enumerates the content backend (`list_objects`; a no-op when the backend cannot
+enumerate its namespace) and, for each stale blob, recovers the object kind by
+trying each content kind until one opens — safe because a wrong kind fails the
+AAD check rather than corrupting the blob — then re-seals under the active Content
+DEK through the existing `open_content`/`seal_content` path. Same idempotency and
+counts as the metadata walk; a test rotates the Content DEK, re-encrypts, and
+confirms the artifact blob moved from v1 to v2 and still decrypts through a fresh
+runtime.
+
+**Not yet done:** automatic retirement of a fully-drained version, and a
 rotation/revocation/re-encryption CLI.
 Event AAD binds tenant + session + kind (not yet the per-event seq).
 Dedicated-domain placement enforcement remains, as does graceful hydration when a

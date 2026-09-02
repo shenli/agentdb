@@ -27,7 +27,8 @@ use agentdb_index::vector::{HnswVectorIndex, VectorIndex};
 use agentdb_storage::content::{sha256_hex, ContentBackend, InMemoryContentBackend};
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::{
-    is_envelope_v2, AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
+    envelope_dek_version, is_envelope_v2, AllowAllKmsKeyResolver, ContentCryptoAdapter,
+    ContentCryptoContext,
     CryptoContext, DisabledEnvelopeCrypto, EnvelopeCrypto, IdentityContentCryptoAdapter,
     IdentityMetadataCryptoAdapter, KeyOperation, KeyPurpose, KeyResolution, KmsError,
     KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter, PrefixScopedTabletStore,
@@ -3823,18 +3824,120 @@ impl Runtime {
         Ok(())
     }
 
-    /// Re-encrypt a tenant's metadata rows sealed under an older DEK version so
-    /// they move to the active version (the data-plane half of DEK rotation).
-    /// Idempotent; a no-op when encryption is disabled. Returns how many rows
-    /// were inspected, rewritten, and skipped.
+    /// Re-encrypt a tenant's data sealed under an older DEK version so it moves
+    /// to the active version (the data-plane half of DEK rotation) — both the
+    /// metadata rows (under the Metadata DEK) and the content blobs (segments,
+    /// archives, replay prefixes, artifacts, under the Content DEK), matching the
+    /// two purposes `rotate_tenant_dek` advances. Idempotent; a no-op when
+    /// encryption is disabled. Returns the combined count of rows/blobs
+    /// inspected, rewritten, and skipped.
     pub async fn reencrypt_tenant_dek(
         &self,
         tenant_id: &str,
     ) -> Result<crate::persist::ReencryptReport> {
-        match &self.persist {
-            Some(p) => p.reencrypt_tenant_metadata(tenant_id).map_err(internal),
-            None => Ok(crate::persist::ReencryptReport::default()),
+        let mut report = match &self.persist {
+            Some(p) => p.reencrypt_tenant_metadata(tenant_id).map_err(internal)?,
+            None => crate::persist::ReencryptReport::default(),
+        };
+        self.reencrypt_tenant_content(tenant_id, &mut report).await?;
+        Ok(report)
+    }
+
+    /// Re-encrypt a tenant's content blobs under the active Content DEK, folding
+    /// the counts into `report`. A no-op when encryption is disabled or the
+    /// content backend cannot enumerate its objects. Each stale blob's object
+    /// kind is recovered by trying each content kind until one opens (safe: a
+    /// wrong kind fails the AAD check rather than corrupting the blob).
+    async fn reencrypt_tenant_content(
+        &self,
+        tenant_id: &str,
+        report: &mut crate::persist::ReencryptReport,
+    ) -> Result<()> {
+        if !self.keyring.is_enabled() {
+            return Ok(());
         }
+        let active = self
+            .keyring
+            .active_key(tenant_id, KeyPurpose::Content)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("active content DEK: {e}")))?
+            .version;
+        let max = startup_hydration_limit("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000);
+        let listing = match self.content.list_objects(max).await {
+            Ok(listing) => listing,
+            // A backend that cannot enumerate its namespace cannot be walked;
+            // there is nothing to do rather than an error.
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return Ok(()),
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorCode::Internal,
+                    format!("content object listing failed: {error}"),
+                ))
+            }
+        };
+        // The keyring path of seal/open_content ignores this key (it is only used
+        // by the legacy adapter), and this walk runs only with the keyring
+        // enabled, so a placeholder suffices.
+        let content_key = KeyResolution {
+            key_id: format!("tenant:{tenant_id}:content"),
+            key_version: None,
+        };
+        const KINDS: [&str; 4] = ["artifact", "segment", "archive", "replay_prefix"];
+        for obj in listing.objects {
+            if obj.tenant_id != tenant_id {
+                continue;
+            }
+            let stored = match self.content.get(&obj.tenant_id, &obj.artifact_id).await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    report.errors += 1;
+                    continue;
+                }
+            };
+            if !is_envelope_v2(&stored) {
+                continue; // plaintext / legacy — not sealed under a Content DEK version
+            }
+            let Some(version) = envelope_dek_version(&stored) else {
+                continue;
+            };
+            report.scanned += 1;
+            if version >= active {
+                continue; // already current
+            }
+            let mut resealed_ok = false;
+            for kind in KINDS {
+                let Ok(plaintext) = self.open_content(
+                    tenant_id,
+                    kind,
+                    &obj.artifact_id,
+                    content_key.clone(),
+                    stored.clone(),
+                ) else {
+                    continue;
+                };
+                if let Ok(resealed) =
+                    self.seal_content(tenant_id, kind, &obj.artifact_id, &content_key, &plaintext)
+                {
+                    if self
+                        .content
+                        .put(tenant_id, &obj.artifact_id, &resealed)
+                        .await
+                        .is_ok()
+                    {
+                        report.reencrypted += 1;
+                        resealed_ok = true;
+                        break;
+                    }
+                }
+            }
+            if !resealed_ok {
+                tracing::warn!(
+                    object_id = %obj.artifact_id,
+                    "content re-encryption could not re-seal a blob"
+                );
+                report.errors += 1;
+            }
+        }
+        Ok(())
     }
 
     pub async fn with_tablet_context<F, T>(&self, tablet_id: i64, future: F) -> T

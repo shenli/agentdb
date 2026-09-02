@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use agentdb_core::agent::NewAgent;
+use agentdb_core::artifact::NewArtifact;
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{AppendRequest, Runtime};
 use agentdb_core::session::NewSession;
@@ -159,4 +160,85 @@ async fn reencrypt_walk_moves_metadata_from_the_old_dek_version_to_the_active_on
     let records = rt2.list_records(&t.tenant_id).await.unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].text.as_deref(), Some("RECORD-SECRET"));
+}
+
+#[tokio::test]
+async fn reencrypt_walk_moves_content_blobs_to_the_active_content_dek() {
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+    let content = Arc::new(InMemoryContentBackend::default());
+    let provider = Arc::new(CatalogKeyProvider::new(
+        KeyCatalog::new(kv.clone()),
+        Arc::new(LocalKekProvider::from_secret(b"kek-secret", "local:v1")),
+    ));
+    let keyring = Arc::new(AeadTenantKeyring::new(
+        provider.clone(),
+        Suite::XChaCha20Poly1305,
+        DekCacheConfig::default(),
+    ));
+    let rt = Runtime::with_kv_content_and_keyring(
+        kv.clone(),
+        content.clone() as Arc<dyn ContentBackend>,
+        keyring.clone(),
+    );
+
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "reenc-content".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let art = rt
+        .create_artifact(
+            NewArtifact {
+                tenant_id: t.tenant_id.clone(),
+                content_type: None,
+                expected_sha256: None,
+            },
+            b"ARTIFACT-SECRET-blob".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    // The artifact content is sealed under Content DEK v1.
+    let stored_v1 = content
+        .get(t.tenant_id.as_str(), art.artifact_id.as_str())
+        .await
+        .unwrap();
+    assert!(is_envelope_v2(&stored_v1));
+    assert_eq!(envelope_dek_version(&stored_v1), Some(1));
+
+    // Rotate the Content DEK to v2 and drop the cached active lease.
+    provider.rotate(t.tenant_id.as_str(), KeyPurpose::Content).unwrap();
+    keyring.invalidate(t.tenant_id.as_str());
+
+    // Re-encrypt: the artifact blob is rewritten under Content v2.
+    let report = rt.reencrypt_tenant_dek(t.tenant_id.as_str()).await.unwrap();
+    assert_eq!(report.errors, 0, "no blob should fail to re-seal");
+    assert!(report.reencrypted >= 1, "the artifact blob was rewritten: {report:?}");
+
+    let stored_v2 = content
+        .get(t.tenant_id.as_str(), art.artifact_id.as_str())
+        .await
+        .unwrap();
+    assert_eq!(envelope_dek_version(&stored_v2), Some(2), "blob now under v2");
+
+    // Still readable: a fresh runtime over the same store + an equivalent keyring
+    // decrypts the re-sealed blob.
+    let provider2 = Arc::new(CatalogKeyProvider::new(
+        KeyCatalog::new(kv.clone()),
+        Arc::new(LocalKekProvider::from_secret(b"kek-secret", "local:v1")),
+    ));
+    let keyring2 = Arc::new(AeadTenantKeyring::new(
+        provider2,
+        Suite::XChaCha20Poly1305,
+        DekCacheConfig::default(),
+    ));
+    let rt2 = Runtime::with_kv_content_and_keyring(
+        kv.clone(),
+        content as Arc<dyn ContentBackend>,
+        keyring2,
+    );
+    let blob = rt2.get_artifact_blob(&t.tenant_id, &art.artifact_id).await.unwrap();
+    assert_eq!(blob, b"ARTIFACT-SECRET-blob");
 }
