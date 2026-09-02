@@ -1227,7 +1227,12 @@ impl Persist {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(5);
         ops.push(WriteOp::Put {
             key: tenant_record_key(t.tenant_id.as_str()).into_bytes(),
-            value: serde_json::to_vec(t).expect("tenant serializes"),
+            value: self.encrypt_primary_row(
+                t.tenant_id.as_str(),
+                MetadataObjectKind::Tenant,
+                t.tenant_id.as_str(),
+                t,
+            )?,
         });
         if !t.external_key.is_empty() {
             ops.push(WriteOp::Put {
@@ -1395,10 +1400,7 @@ impl Persist {
 
     fn put_session_ops(&self, s: &Session) -> KvResult<Vec<WriteOp>> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(5);
-        ops.push(WriteOp::Put {
-            key: session_record_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
-            value: serde_json::to_vec(s).expect("session serializes"),
-        });
+        ops.push(self.encrypted_session_put_op(s)?);
         if let Some(alias) = s.alias.as_deref() {
             if !alias.is_empty() {
                 ops.push(WriteOp::Put {
@@ -1713,11 +1715,7 @@ impl Persist {
             ops.extend(self.append_batch_ops(event, None, None)?);
         }
         if let Some(session) = session {
-            ops.push(WriteOp::Put {
-                key: session_record_key(session.tenant_id.as_str(), session.session_id.as_str())
-                    .into_bytes(),
-                value: serde_json::to_vec(session).expect("session serializes"),
-            });
+            ops.push(self.encrypted_session_put_op(session)?);
         }
         Ok(ops)
     }
@@ -1774,11 +1772,7 @@ impl Persist {
         });
         ops.extend(self.export_ledger_event_ops(event)?);
         if let Some(session) = session {
-            let sk = session_record_key(session.tenant_id.as_str(), session.session_id.as_str());
-            ops.push(WriteOp::Put {
-                key: sk.into_bytes(),
-                value: serde_json::to_vec(session).expect("session serializes"),
-            });
+            ops.push(self.encrypted_session_put_op(session)?);
         }
         // Secondary index: event_by_id -> {session_id, seq}. Lets a caller
         // look up an event by its event_id without scanning the session.
@@ -2276,6 +2270,21 @@ impl Persist {
         )
     }
 
+    /// The `WriteOp::Put` for a session's primary row, sealed under the tenant
+    /// Metadata DEK. Centralized because a session is written from several paths
+    /// (create, event append); all must seal identically or a read fails.
+    fn encrypted_session_put_op(&self, s: &Session) -> KvResult<WriteOp> {
+        Ok(WriteOp::Put {
+            key: session_record_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
+            value: self.encrypt_primary_row(
+                s.tenant_id.as_str(),
+                MetadataObjectKind::Session,
+                s.session_id.as_str(),
+                s,
+            )?,
+        })
+    }
+
     /// Point-read a single envelope-encrypted primary row and decode it.
     fn get_encrypted_json_row<T: serde::de::DeserializeOwned>(
         &self,
@@ -2333,11 +2342,42 @@ impl Persist {
         })
     }
 
+    /// Decrypt-and-decode one tenant row from a `record/tenant/{tenant_id}` scan.
+    /// The tenant key has a single id segment (the tenant is its own object), so
+    /// tenant_id and object_id are both the last segment — unlike the two-segment
+    /// [`decrypt_primary_scan_value`].
+    fn decrypt_tenant_scan_value(&self, key: &[u8], value: &[u8]) -> KvResult<Tenant> {
+        let key_str = std::str::from_utf8(key)
+            .map_err(|_| agentdb_storage::Error::Other("tenant record key is not utf8".into()))?;
+        let tenant_id = key_str
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                agentdb_storage::Error::Other(format!("unexpected tenant record key {key_str}"))
+            })?;
+        let context = MetadataCryptoContext {
+            tenant_id,
+            object_kind: MetadataObjectKind::Tenant,
+            object_id: tenant_id,
+            key: None,
+        };
+        let plaintext = self.decrypt_metadata(&context, value)?;
+        serde_json::from_slice(&plaintext).map_err(|err| {
+            agentdb_storage::Error::Other(format!("tenant record at {key_str} does not decode: {err}"))
+        })
+    }
+
     // Point reads for the cache-miss fallback path: the in-memory maps are a
     // cache over these rows, not the authority. Deleted rows are returned
     // as-is (soft-delete tombstones) so callers' liveness filters apply.
     pub fn get_tenant_row(&self, tenant_id: &str) -> KvResult<Option<Tenant>> {
-        self.get_json_row(tenant_record_key(tenant_id))
+        self.get_encrypted_json_row(
+            tenant_record_key(tenant_id),
+            tenant_id,
+            MetadataObjectKind::Tenant,
+            tenant_id,
+        )
     }
 
     pub fn get_agent_row(&self, tenant_id: &str, agent_id: &str) -> KvResult<Option<Agent>> {
@@ -2350,7 +2390,12 @@ impl Persist {
     }
 
     pub fn get_session_row(&self, tenant_id: &str, session_id: &str) -> KvResult<Option<Session>> {
-        self.get_json_row(session_record_key(tenant_id, session_id))
+        self.get_encrypted_json_row(
+            session_record_key(tenant_id, session_id),
+            tenant_id,
+            MetadataObjectKind::Session,
+            session_id,
+        )
     }
 
     pub fn get_artifact_row(
@@ -2431,10 +2476,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(prefix.as_bytes())?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            out.push(serde_json::from_slice(&v).map_err(|err| {
-                agentdb_storage::Error::Other(format!("session row does not decode: {err}"))
-            })?);
+            let (k, v) = res?;
+            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Session)?);
         }
         Ok(out)
     }
@@ -2471,9 +2514,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(b"record/tenant/")?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            let t: Tenant = serde_json::from_slice(&v).expect("tenant decodes");
-            out.push(t);
+            let (k, v) = res?;
+            out.push(self.decrypt_tenant_scan_value(&k, &v)?);
         }
         Ok(out)
     }
@@ -2492,9 +2534,8 @@ impl Persist {
         let iter = self.kv.scan_prefix(b"record/session/")?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            let s: Session = serde_json::from_slice(&v).expect("session decodes");
-            out.push(s);
+            let (k, v) = res?;
+            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Session)?);
         }
         Ok(out)
     }
