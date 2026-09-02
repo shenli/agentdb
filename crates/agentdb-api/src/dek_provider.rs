@@ -61,6 +61,13 @@ impl MetaCatalogKeyProvider {
         let mut active = HashMap::new();
         let mut by_version = HashMap::new();
         for row in &rows {
+            // Only *readable* statuses are ever served. Skipping revoked/retired
+            // rows entirely means a soft revoke (status → revoked) makes the key
+            // unavailable even for decryption after a reload, and the periodic
+            // refresh never resurrects a revoked key.
+            if row.status != "active" && row.status != "read_only" {
+                continue;
+            }
             let purpose = parse_purpose(&row.purpose)?;
             let lease = self.lease_from_row(row, purpose)?;
             by_version.insert(
@@ -209,6 +216,29 @@ impl MetaCatalogKeyProvider {
         Ok(out)
     }
 
+    /// Revoke (or crypto-shred, when `destroy`) all of a tenant's DEKs in the
+    /// shared catalog and drop them from this node's maps. Soft revoke marks
+    /// every row `revoked` (serve refuses them; reversible); `destroy` deletes
+    /// the rows, destroying the wrapped key material (irreversible). Other nodes
+    /// drop the keys on their next [`refresh`]. Returns the number of rows
+    /// affected in the catalog.
+    pub async fn revoke_tenant(&self, tenant_id: &str, destroy: bool) -> Result<u64, CryptoError> {
+        let affected = dek_catalog::revoke_tenant(&self.pool, tenant_id, destroy)
+            .await
+            .map_err(|e| CryptoError::Config(format!("key catalog revoke: {e}")))?;
+        // Drop this node's cached leases for the tenant so it stops serving them
+        // immediately (soft revoke) / for good (shred).
+        self.active
+            .write()
+            .expect("dek map poisoned")
+            .retain(|(t, _), _| t != tenant_id);
+        self.by_version
+            .write()
+            .expect("dek map poisoned")
+            .retain(|(t, _, _), _| t != tenant_id);
+        Ok(affected)
+    }
+
     fn lease_from_row(
         &self,
         row: &DekCatalogRow,
@@ -259,22 +289,44 @@ impl agentdb_core::TenantKeyRotator for MetaCatalogKeyProvider {
     }
 }
 
-/// Single-node key rotator: adapts the storage-crate [`CatalogKeyProvider`]
-/// (whose `rotate` is synchronous) to the runtime's async [`TenantKeyRotator`]
-/// hook. Lives here because the trait is defined in `agentdb-core`, which the
-/// storage crate does not depend on.
-pub struct CatalogKeyRotator {
+/// Lets the runtime revoke / crypto-shred a tenant's DEKs (cluster shape).
+#[async_trait::async_trait]
+impl agentdb_core::TenantKeyRevoker for MetaCatalogKeyProvider {
+    async fn revoke_tenant(
+        &self,
+        tenant_id: &str,
+        destroy: bool,
+    ) -> Result<(), agentdb_core::errors::Error> {
+        self.revoke_tenant(tenant_id, destroy)
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                agentdb_core::errors::Error::new(
+                    agentdb_core::errors::ErrorCode::Internal,
+                    format!("tenant key revocation failed: {e}"),
+                )
+            })
+    }
+}
+
+/// Single-node key admin: adapts the storage-crate [`CatalogKeyProvider`]
+/// (whose `rotate` / `revoke_tenant` are synchronous) to the runtime's async
+/// [`TenantKeyRotator`](agentdb_core::TenantKeyRotator) and
+/// [`TenantKeyRevoker`](agentdb_core::TenantKeyRevoker) hooks. Lives here
+/// because the traits are defined in `agentdb-core`, which the storage crate
+/// does not depend on.
+pub struct CatalogKeyAdmin {
     provider: Arc<agentdb_storage::CatalogKeyProvider>,
 }
 
-impl CatalogKeyRotator {
+impl CatalogKeyAdmin {
     pub fn new(provider: Arc<agentdb_storage::CatalogKeyProvider>) -> Self {
         Self { provider }
     }
 }
 
 #[async_trait::async_trait]
-impl agentdb_core::TenantKeyRotator for CatalogKeyRotator {
+impl agentdb_core::TenantKeyRotator for CatalogKeyAdmin {
     async fn rotate_tenant(&self, tenant_id: &str) -> Result<(), agentdb_core::errors::Error> {
         for purpose in PROVISIONED_PURPOSES {
             self.provider.rotate(tenant_id, purpose).map_err(|e| {
@@ -284,6 +336,23 @@ impl agentdb_core::TenantKeyRotator for CatalogKeyRotator {
                 )
             })?;
         }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl agentdb_core::TenantKeyRevoker for CatalogKeyAdmin {
+    async fn revoke_tenant(
+        &self,
+        tenant_id: &str,
+        destroy: bool,
+    ) -> Result<(), agentdb_core::errors::Error> {
+        self.provider.revoke_tenant(tenant_id, destroy).map_err(|e| {
+            agentdb_core::errors::Error::new(
+                agentdb_core::errors::ErrorCode::Internal,
+                format!("tenant key revocation failed: {e}"),
+            )
+        })?;
         Ok(())
     }
 }
@@ -489,6 +558,30 @@ mod tests {
         let kr_b = AeadTenantKeyring::new(node_b, Suite::XChaCha20Poly1305, DekCacheConfig::default());
         assert_eq!(kr_b.open(&ctx, &sealed_v1).unwrap(), b"v1-payload");
         assert_eq!(kr_b.open(&ctx, &sealed_v2).unwrap(), b"v2-payload");
+    }
+
+    #[tokio::test]
+    async fn revoke_tenant_soft_then_shred_stops_serving_and_reloads_empty() {
+        let pool = pool().await;
+        let provider = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
+        provider.provision_all("ten_a").await.unwrap();
+        assert!(provider.active_dek("ten_a", KeyPurpose::Content).is_ok());
+
+        // Soft revoke: this node stops serving immediately (maps dropped)...
+        let affected = provider.revoke_tenant("ten_a", false).await.unwrap();
+        assert_eq!(affected, 2); // content + metadata
+        assert!(provider.active_dek("ten_a", KeyPurpose::Content).is_err());
+        // ...and a fresh node loading the catalog does NOT serve the revoked keys
+        // (rows are marked revoked, so they never enter the active map).
+        let reloaded = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
+        assert!(reloaded.active_dek("ten_a", KeyPurpose::Content).is_err());
+
+        // Crypto-shred: the rows are deleted outright.
+        assert_eq!(provider.revoke_tenant("ten_a", true).await.unwrap(), 2);
+        assert!(dek_catalog::get_version(&pool, "ten_a", "content", 1)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

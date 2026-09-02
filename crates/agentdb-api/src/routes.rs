@@ -120,6 +120,10 @@ pub fn routes() -> Router<AppState> {
             post(rotate_tenant_dek),
         )
         .route(
+            "/api/admin/tenants/:tenant_id/revoke-dek",
+            post(revoke_tenant_dek),
+        )
+        .route(
             "/api/admin/drain",
             get(get_admin_drain).post(post_admin_drain),
         )
@@ -5652,6 +5656,41 @@ async fn rotate_tenant_dek(
     Ok(Json(serde_json::json!({
         "tenant_id": tid.as_str(),
         "rotated": true
+    })))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RevokeDekQuery {
+    /// When true, crypto-shred: delete the wrapped key material (irreversible).
+    /// When false/absent, soft revoke: mark the DEKs revoked (reversible).
+    #[serde(default)]
+    destroy: bool,
+}
+
+/// Admin: revoke — or crypto-shred (`?destroy=true`) — a tenant's
+/// data-encryption keys. A soft revoke marks every DEK version revoked so the
+/// tenant's encrypted data is immediately unreadable but recoverable; a shred
+/// deletes the wrapped key material, so the data can never be decrypted again.
+/// Fails closed (`KEY_UNAVAILABLE`) when encryption is disabled or no key
+/// catalog is configured.
+async fn revoke_tenant_dek(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Query(q): Query<RevokeDekQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    // Resolve the tenant first (404 if unknown).
+    let _ = s.runtime.get_tenant(&tid).await?;
+    s.runtime.revoke_tenant_dek(tid.as_str(), q.destroy).await?;
+    Ok(Json(serde_json::json!({
+        "tenant_id": tid.as_str(),
+        "revoked": true,
+        "destroyed": q.destroy
     })))
 }
 

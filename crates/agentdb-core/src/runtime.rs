@@ -1425,6 +1425,20 @@ pub trait TenantKeyRotator: Send + Sync {
     async fn rotate_tenant(&self, tenant_id: &str) -> Result<()>;
 }
 
+/// Revokes a tenant's data-encryption keys (an admin operation).
+///
+/// `destroy = false` is a **soft** revoke: every DEK version is marked revoked,
+/// so the serve path refuses to unwrap it and the tenant's encrypted data is
+/// immediately unreadable — but the wrapped bytes remain, so it is reversible.
+/// `destroy = true` is a **crypto-shred**: the wrapped DEK material is deleted,
+/// so the tenant's encrypted data can never be decrypted again (irreversible).
+/// Implemented by the key catalog / cluster key provider; unset when encryption
+/// is disabled. The runtime invalidates its keyring cache after revocation.
+#[async_trait::async_trait]
+pub trait TenantKeyRevoker: Send + Sync {
+    async fn revoke_tenant(&self, tenant_id: &str, destroy: bool) -> Result<()>;
+}
+
 pub struct Runtime {
     state: Mutex<State>,
     hydration_mode: HydrationMode,
@@ -1448,6 +1462,10 @@ pub struct Runtime {
     /// the server wiring), so it is set out-of-band rather than through the many
     /// runtime constructors. Unset when encryption is disabled.
     key_rotator: OnceLock<Arc<dyn TenantKeyRotator>>,
+    /// Optional: revokes / crypto-shreds a tenant's DEKs on the admin path.
+    /// Installed once at startup via [`Runtime::set_key_revoker`]. Unset when
+    /// encryption is disabled.
+    key_revoker: OnceLock<Arc<dyn TenantKeyRevoker>>,
     kms: Arc<dyn KmsKeyResolver>,
     /// Per-(tenant, namespace) BM25 text index for V2.2 searchable
     /// records. Wrapped in a `std::sync::Mutex` because
@@ -3190,6 +3208,7 @@ impl Runtime {
             keyring: Arc::new(DisabledEnvelopeCrypto),
             key_provisioner: None,
             key_rotator: OnceLock::new(),
+            key_revoker: OnceLock::new(),
             kms: Arc::new(AllowAllKmsKeyResolver),
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3211,6 +3230,7 @@ impl Runtime {
             keyring: Arc::new(DisabledEnvelopeCrypto),
             key_provisioner: None,
             key_rotator: OnceLock::new(),
+            key_revoker: OnceLock::new(),
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3235,6 +3255,7 @@ impl Runtime {
             keyring: Arc::new(DisabledEnvelopeCrypto),
             key_provisioner: None,
             key_rotator: OnceLock::new(),
+            key_revoker: OnceLock::new(),
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -3743,6 +3764,7 @@ impl Runtime {
             keyring,
             key_provisioner,
             key_rotator: OnceLock::new(),
+            key_revoker: OnceLock::new(),
             kms,
             text_index: StdMutex::new(hydration.text_index),
             vector_index: StdMutex::new(hydration.vector_index),
@@ -3773,6 +3795,30 @@ impl Runtime {
             )
         })?;
         rotator.rotate_tenant(tenant_id).await?;
+        self.keyring.invalidate(tenant_id);
+        Ok(())
+    }
+
+    /// Install the tenant key revoker once at startup (see [`set_key_rotator`]).
+    ///
+    /// [`set_key_rotator`]: Runtime::set_key_rotator
+    pub fn set_key_revoker(&self, revoker: Arc<dyn TenantKeyRevoker>) {
+        let _ = self.key_revoker.set(revoker);
+    }
+
+    /// Revoke a tenant's data-encryption keys (admin operation). With
+    /// `destroy = false` every DEK version is marked revoked (reversible); with
+    /// `destroy = true` the wrapped key material is deleted (crypto-shred,
+    /// irreversible). Cached DEK leases for the tenant are then dropped. Fails
+    /// closed when no revoker is installed (encryption disabled or no catalog).
+    pub async fn revoke_tenant_dek(&self, tenant_id: &str, destroy: bool) -> Result<()> {
+        let revoker = self.key_revoker.get().ok_or_else(|| {
+            Error::new(
+                ErrorCode::KeyUnavailable,
+                "key revocation is unavailable (encryption disabled or no key catalog configured)",
+            )
+        })?;
+        revoker.revoke_tenant(tenant_id, destroy).await?;
         self.keyring.invalidate(tenant_id);
         Ok(())
     }
