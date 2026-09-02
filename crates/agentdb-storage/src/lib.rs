@@ -28,7 +28,8 @@ pub use content_crypto::{
     ContentCryptoAdapter, ContentCryptoContext, IdentityContentCryptoAdapter,
 };
 pub use crypto::{
-    is_envelope_v2, AeadTenantKeyring, CatalogKeyProvider, CryptoConfig, CryptoContext, CryptoError,
+    envelope_dek_version, is_envelope_v2, AeadTenantKeyring, CatalogKeyProvider, CryptoConfig,
+    CryptoContext, CryptoError,
     CryptoMode, Dek, DekCacheConfig, DekLease, DekRecord, DekStatus, DisabledEnvelopeCrypto,
     EnvelopeCrypto, EnvelopeParts, KekProvider, KeyCatalog, KeyMetadata, KeyProvider, KeyPurpose,
     CommandKekProvider, LocalKekProvider, LocalKeyProvider, Suite, WrappedDek,

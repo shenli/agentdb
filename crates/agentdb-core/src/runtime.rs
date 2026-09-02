@@ -3823,6 +3823,20 @@ impl Runtime {
         Ok(())
     }
 
+    /// Re-encrypt a tenant's metadata rows sealed under an older DEK version so
+    /// they move to the active version (the data-plane half of DEK rotation).
+    /// Idempotent; a no-op when encryption is disabled. Returns how many rows
+    /// were inspected, rewritten, and skipped.
+    pub async fn reencrypt_tenant_dek(
+        &self,
+        tenant_id: &str,
+    ) -> Result<crate::persist::ReencryptReport> {
+        match &self.persist {
+            Some(p) => p.reencrypt_tenant_metadata(tenant_id).map_err(internal),
+            None => Ok(crate::persist::ReencryptReport::default()),
+        }
+    }
+
     pub async fn with_tablet_context<F, T>(&self, tablet_id: i64, future: F) -> T
     where
         F: Future<Output = T>,

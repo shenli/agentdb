@@ -124,6 +124,10 @@ pub fn routes() -> Router<AppState> {
             post(revoke_tenant_dek),
         )
         .route(
+            "/api/admin/tenants/:tenant_id/reencrypt-dek",
+            post(reencrypt_tenant_dek),
+        )
+        .route(
             "/api/admin/drain",
             get(get_admin_drain).post(post_admin_drain),
         )
@@ -5691,6 +5695,29 @@ async fn revoke_tenant_dek(
         "tenant_id": tid.as_str(),
         "revoked": true,
         "destroyed": q.destroy
+    })))
+}
+
+/// Admin: re-encrypt a tenant's metadata rows under the active DEK version (the
+/// data-plane half of rotation). Idempotent; a no-op when encryption is
+/// disabled. Returns how many rows were scanned, rewritten, and skipped.
+async fn reencrypt_tenant_dek(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let _ = s.runtime.get_tenant(&tid).await?;
+    let report = s.runtime.reencrypt_tenant_dek(tid.as_str()).await?;
+    Ok(Json(serde_json::json!({
+        "tenant_id": tid.as_str(),
+        "scanned": report.scanned,
+        "reencrypted": report.reencrypted,
+        "errors": report.errors
     })))
 }
 

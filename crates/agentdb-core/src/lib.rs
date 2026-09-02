@@ -26,6 +26,7 @@ pub mod global_index;
 pub mod id;
 pub mod idempotency;
 pub(crate) mod persist;
+pub use persist::ReencryptReport;
 pub mod policy;
 pub mod record;
 pub mod runtime;
