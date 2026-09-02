@@ -32,6 +32,10 @@ dev = false
 # data_dir = "/var/lib/agentdb"
 # content_dir defaults to "<data_dir>/content" when omitted.
 # content_dir = "/var/lib/agentdb/content"
+# Advisory disk budget for the data directory, in GiB (default 20). Shown in the
+# startup banner and GET /api/storage/disk; over ~80% the dashboard warns. This
+# never blocks writes — it is a signal, not a hard cap.
+# disk_budget_gib = 20
 
 [storage.kv]
 backend = "rocksdb"

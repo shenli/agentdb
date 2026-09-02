@@ -608,3 +608,8 @@ body.session-view .view-overview {
     grid-template-columns: 1fr;
   }
 }
+
+/* Advisory disk budget: highlight when over the soft threshold. */
+.metric strong.over-budget {
+  color: #d9822b;
+}
