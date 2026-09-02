@@ -643,27 +643,6 @@ async fn agent_soft_delete_gc_cascades_sessions_and_bindings() {
     ))
     .await
     .unwrap();
-    let skill = rt
-        .register_skill(
-            agentdb_core::NewSkill {
-                tenant_id: tenant.tenant_id.clone(),
-                name: "tool".into(),
-                version: "1.0.0".into(),
-                manifest: serde_json::json!({}),
-                artifact_refs: vec![],
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    rt.bind_skill(agentdb_core::BindSkillRequest {
-        tenant_id: tenant.tenant_id.clone(),
-        agent_id: agent.agent_id.clone(),
-        skill_id: skill.skill_id,
-        idempotency_key: None,
-    })
-    .await
-    .unwrap();
 
     rt.delete_agent(&tenant.tenant_id, &agent.agent_id)
         .await
@@ -680,7 +659,6 @@ async fn agent_soft_delete_gc_cascades_sessions_and_bindings() {
     assert_eq!(report.agents_purged, 1);
     assert_eq!(report.sessions_purged, 1);
     assert_eq!(report.events_purged, 1);
-    assert_eq!(report.skill_bindings_purged, 1);
     assert_eq!(report.changefeed_purge_events, 2);
 }
 

@@ -261,7 +261,7 @@ metadata object mutations; in-memory/dev runtimes fall back to current event
 watch cursors (`frontier:v1:...`). Runtime `watch` accepts both frontier cursors
 and older `v2:` item cursors for resume compatibility. Use the optional
 comma-separated `include` query parameter, for example
-`include=events,records,skills`, to filter object types:
+`include=events,records`, to filter object types:
 
 Durable export is currently a single-tablet feature. When metadata-backed
 cluster routing is active (`routing.mode = snapshot`), export status, watch,
@@ -351,8 +351,8 @@ snapshots:
 ```
 
 Metadata snapshot includes use `snapshot:...` cursors and currently support
-`["tenants", "agents", "sessions", "artifacts", "records", "skills",
-"skill_bindings"]`. Do not mix `events` with metadata includes in one backfill
+`["tenants", "agents", "sessions", "artifacts", "records"]`. Do not mix
+`events` with metadata includes in one backfill
 request; run metadata backfill first, then event backfill/tail. Omit
 `snapshot_high_watermark` on the first metadata request, then echo the returned
 value on every request that supplies the preceding `from_cursor`.
@@ -500,14 +500,9 @@ Record edges connect two records with an `edge_type` of `related`, `derived`,
 is a small JSON KV surface for adapter cursors and runtime-local configuration,
 not a replacement for application tables.
 
-Skills and policy:
+Policy:
 
 ```text
-POST   /api/tenants/{tenant_id}/skills
-GET    /api/tenants/{tenant_id}/skills/{skill_id}
-DELETE /api/tenants/{tenant_id}/skills/{skill_id}
-GET    /api/tenants/{tenant_id}/agents/{agent_id}/skills
-POST   /api/tenants/{tenant_id}/agents/{agent_id}/skills/bind
 POST   /api/tenants/{tenant_id}/policy/lifecycle-sweep
 POST   /api/tenants/{tenant_id}/policy/gc-sweep
 ```
@@ -574,13 +569,11 @@ Workspace
   watch(scope="tenant", agent_id=None, from_cursor=None, limit=100)
   artifacts.put/get/blob
   records.write/search
-  skills.register
 
 AgentHandle
   id
   session(alias=None, *, session_id=None)
   session_by_id(session_id)
-  bind_skill(skill_id, *, idempotency_key=None)
 
 SessionHandle / Session
   append(payload, kind="message", idempotency_key=None, fetch_last_n=0, ...)
@@ -630,8 +623,6 @@ get_artifact(tenant_id, artifact_id)
 get_artifact_blob(tenant_id, artifact_id)
 write_record(tenant_id, **body)
 search_records(tenant_id, **body)
-register_skill(tenant_id, name, version, manifest=None, artifact_refs=None)
-bind_skill(tenant_id, agent_id, skill_id, idempotency_key=None)
 watch(tenant_id, scope="tenant", agent_id=None, from_cursor=None, limit=100)
 ```
 
@@ -687,13 +678,11 @@ Workspace
   watch(opts?)
   artifacts.put/get/blob
   records.write/search
-  skills.register
 
 AgentHandle
   agentId
   session(alias?, opts?)
   sessionById(sessionId)
-  bindSkill(skillId, opts?)
 
 SessionHandle / Session
   append(payload, opts?)
@@ -740,8 +729,6 @@ getArtifact(tenantId, artifactId)
 getArtifactBlob(tenantId, artifactId)
 writeRecord(tenantId, body)
 searchRecords(tenantId, body)
-registerSkill(tenantId, body)
-bindSkill(tenantId, agentId, skillId, opts?)
 watch(tenantId, opts?)
 ```
 

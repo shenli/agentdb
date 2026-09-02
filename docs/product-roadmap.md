@@ -9,7 +9,7 @@ For the conceptual motivation and positioning, see
 ## Implemented
 
 - Native runtime objects: tenants, agents, sessions, events, artifacts, records,
-  skills, policies, tenant metadata, and record graph edges.
+  policies, tenant metadata, and record graph edges.
 - Per-session append semantics: serialized append, contiguous session-local
   sequence numbers, append-and-fetch, idempotency, and backpressure reporting.
 - Native tenant-scoped HTTP API plus maintained Python and TypeScript SDKs;

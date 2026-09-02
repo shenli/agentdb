@@ -52,14 +52,6 @@ pub struct QuotaPolicy {
     #[serde(default)]
     pub max_artifact_storage_bytes: Option<u64>,
     #[serde(default)]
-    pub soft_max_skills: Option<usize>,
-    #[serde(default)]
-    pub max_skills: Option<usize>,
-    #[serde(default)]
-    pub soft_max_skill_bindings_per_agent: Option<usize>,
-    #[serde(default)]
-    pub max_skill_bindings_per_agent: Option<usize>,
-    #[serde(default)]
     pub soft_max_lifecycle_work_per_sweep: Option<usize>,
     #[serde(default)]
     pub max_lifecycle_work_per_sweep: Option<usize>,
@@ -231,10 +223,6 @@ fn tier_template(name: &str) -> RuntimePolicy {
                 max_artifacts: Some(100),
                 soft_max_artifact_storage_bytes: Some(8 * 1024 * 1024),
                 max_artifact_storage_bytes: Some(10 * 1024 * 1024),
-                soft_max_skills: Some(40),
-                max_skills: Some(50),
-                soft_max_skill_bindings_per_agent: Some(40),
-                max_skill_bindings_per_agent: Some(50),
                 soft_max_lifecycle_work_per_sweep: Some(80),
                 max_lifecycle_work_per_sweep: Some(100),
                 soft_max_gc_work_per_sweep: Some(80),
@@ -271,10 +259,6 @@ fn tier_template(name: &str) -> RuntimePolicy {
                 max_artifacts: Some(10_000),
                 soft_max_artifact_storage_bytes: Some(8 * 1024 * 1024 * 1024),
                 max_artifact_storage_bytes: Some(10 * 1024 * 1024 * 1024),
-                soft_max_skills: Some(800),
-                max_skills: Some(1_000),
-                soft_max_skill_bindings_per_agent: Some(800),
-                max_skill_bindings_per_agent: Some(1_000),
                 soft_max_lifecycle_work_per_sweep: Some(8_000),
                 max_lifecycle_work_per_sweep: Some(10_000),
                 soft_max_gc_work_per_sweep: Some(8_000),
@@ -308,10 +292,6 @@ fn tier_template(name: &str) -> RuntimePolicy {
                 max_artifacts: None,
                 soft_max_artifact_storage_bytes: None,
                 max_artifact_storage_bytes: None,
-                soft_max_skills: None,
-                max_skills: None,
-                soft_max_skill_bindings_per_agent: None,
-                max_skill_bindings_per_agent: None,
                 soft_max_lifecycle_work_per_sweep: None,
                 max_lifecycle_work_per_sweep: None,
                 soft_max_gc_work_per_sweep: None,

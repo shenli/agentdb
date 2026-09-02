@@ -31,7 +31,6 @@ export {
   RecordCollection,
   Session,
   SessionHandle,
-  SkillCollection,
   Workspace,
   appendResultRef,
   artifactRef,
@@ -80,7 +79,6 @@ export type {
   EventId,
   ArtifactId,
   RecordId,
-  SkillId,
   WatchItem,
 } from "./client.js";
 

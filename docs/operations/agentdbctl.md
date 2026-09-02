@@ -378,7 +378,7 @@ Backfill metadata snapshots before the event tail:
 ```bash
 CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... \
-    --include tenants,agents,sessions,artifacts,records,skills,skill_bindings \
+    --include tenants,agents,sessions,artifacts,records \
     --backfill
 ```
 

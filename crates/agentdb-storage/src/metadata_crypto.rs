@@ -15,7 +15,6 @@ pub enum MetadataObjectKind {
     Agent,
     Session,
     Record,
-    Skill,
     Tenant,
 }
 
@@ -27,7 +26,6 @@ impl MetadataObjectKind {
             Self::Agent => "agent",
             Self::Session => "session",
             Self::Record => "record",
-            Self::Skill => "skill",
             Self::Tenant => "tenant",
         }
     }

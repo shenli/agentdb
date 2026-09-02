@@ -49,7 +49,7 @@ def capture(client):
         if url.endswith("/replay"):
             return response(body={"events": []})
         if url.endswith("/context"):
-            return response(body={"events": [], "records": [], "skills": []})
+            return response(body={"events": [], "records": []})
         if url.endswith("/watch"):
             return response(body=[])
         if url.endswith("/artifacts"):
@@ -58,10 +58,6 @@ def capture(client):
             return response(body={"matches": []})
         if url.endswith("/records"):
             return response(body={"record_id": "rec_1"})
-        if url.endswith("/skills"):
-            return response(body={"skill_id": "skl_1"})
-        if url.endswith("/skills/bind"):
-            return response(body={"skill_id": "skl_1"})
         return response()
 
     return calls, patch.object(client._http, "request", side_effect=fake)
@@ -85,8 +81,6 @@ def test_v2_urls_cover_core_flow():
         c.verify_artifact_lifecycle(tenant["tenant_id"])
         c.write_record(tenant["tenant_id"], namespace=["mem"], text="x")
         c.search_records(tenant["tenant_id"], namespace=["mem"], text="x")
-        skill = c.register_skill(tenant["tenant_id"], name="tool", version="1")
-        c.bind_skill(tenant["tenant_id"], agent["agent_id"], skill["skill_id"])
 
     urls = [url for _, url, _ in calls]
     assert "/api/tenants" in urls[0]
@@ -120,8 +114,6 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
         )
         workspace.records.write(namespace=["mem"], text="x")
         workspace.records.search(namespace=["mem"], text="x")
-        skill = workspace.skills.register(name="tool", version="1")
-        agent.bind_skill(skill["skill_id"])
         workspace.watch(scope="agent", agent_id=agent.id)
         recovered = agent.session_by_id(session.id)
         recovered.replay()
@@ -136,7 +128,6 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
     assert any("/api/tenants/ten_1/artifacts" in url for url in urls)
     assert any("/api/tenants/ten_1/artifacts/verify-lifecycle" in url for url in urls)
     assert any("/api/tenants/ten_1/records" in url for url in urls)
-    assert any("/api/tenants/ten_1/skills" in url for url in urls)
     assert any("/api/tenants/ten_1/watch" in url for url in urls)
     assert any("/api/tenants/ten_1/sessions/ses_1/replay" in url for url in urls)
 
@@ -259,10 +250,12 @@ def test_idempotency_key_is_opt_in_for_mutations():
     calls, patched = capture(c)
     with patched:
         c.session("ten_1", "ses_1", agent_id="agt_1").append({"x": 1})
-        c.register_skill("ten_1", name="tool", version="1", idempotency_key="skill-1")
+        c.session("ten_1", "ses_1", agent_id="agt_1").append(
+            {"x": 2}, idempotency_key="append-1"
+        )
     headers = [kwargs.get("headers", {}) for _, _, kwargs in calls]
     assert "Idempotency-Key" not in headers[0]
-    assert any(h.get("Idempotency-Key") == "skill-1" for h in headers)
+    assert any(h.get("Idempotency-Key") == "append-1" for h in headers)
 
 
 def test_bearer_token_is_sent_when_configured():

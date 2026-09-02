@@ -109,7 +109,6 @@ function dispatch(action) {
     fork: forkSession,
     artifact: loadArtifact,
     records: searchRecords,
-    skills: loadSkills,
     clear: () => setRaw(""),
   };
   return actions[action] && actions[action]();
@@ -445,7 +444,7 @@ async function buildContext() {
       body: JSON.stringify({
         max_events: 20,
         max_bytes: 1000000,
-        include: ["recent_events", "records", "skills", "policy"],
+        include: ["recent_events", "records", "policy"],
         record_query: recordQuery(),
       }),
     });
@@ -492,17 +491,6 @@ async function searchRecords() {
       body: JSON.stringify(recordQuery()),
     });
     renderRows("records", data.matches || []);
-  } catch (err) {
-    fail(err);
-  }
-}
-
-async function loadSkills() {
-  try {
-    const cfg = readConfig();
-    if (!cfg.agentId) throw new Error("agent_id is required");
-    const data = await request(`/api/tenants/${enc(cfg.tenantId)}/agents/${enc(cfg.agentId)}/skills`);
-    renderRows("skills", data.skills || []);
   } catch (err) {
     fail(err);
   }
@@ -788,7 +776,7 @@ function renderRows(id, rows) {
     const node = document.createElement("button");
     node.className = "row";
     node.type = "button";
-    node.textContent = row.record_id || row.skill_id || row.id || summary(row);
+    node.textContent = row.record_id || row.id || summary(row);
     node.addEventListener("click", () => setRaw(row));
     root.append(node);
   });

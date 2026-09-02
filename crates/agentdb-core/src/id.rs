@@ -11,7 +11,6 @@ pub enum IdKind {
     Artifact,
     Record,
     RecordEdge,
-    Skill,
     Policy,
     Snapshot,
 }
@@ -27,7 +26,6 @@ impl IdKind {
             IdKind::Artifact => "art",
             IdKind::Record => "rec",
             IdKind::RecordEdge => "edg",
-            IdKind::Skill => "skl",
             IdKind::Policy => "pol",
             IdKind::Snapshot => "snp",
         }
@@ -43,7 +41,6 @@ impl IdKind {
             "art" => IdKind::Artifact,
             "rec" => IdKind::Record,
             "edg" => IdKind::RecordEdge,
-            "skl" => IdKind::Skill,
             "pol" => IdKind::Policy,
             "snp" => IdKind::Snapshot,
             _ => return None,

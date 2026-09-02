@@ -45,7 +45,7 @@ fn envelope_round_trips_through_json() {
         agent_id: Id::new(IdKind::Agent),
         session_id: Id::new(IdKind::Session),
         seq: 7,
-        kind: "skill_used".into(),
+        kind: "tool_result".into(),
         payload: serde_json::json!({}),
         artifact_refs: vec![],
         source_refs: vec![],
@@ -59,7 +59,7 @@ fn envelope_round_trips_through_json() {
     let back: EventEnvelope = serde_json::from_str(&s).unwrap();
     assert_eq!(back.event_id, e.event_id);
     assert_eq!(back.seq, 7);
-    assert_eq!(back.kind, "skill_used");
+    assert_eq!(back.kind, "tool_result");
     assert_eq!(back.idempotency_key, None);
     assert_eq!(back.runtime_version, agentdb_core::RUNTIME_VERSION);
 }
@@ -87,7 +87,6 @@ fn envelope_carries_artifact_source_and_credential_refs() {
             event_id: None,
             artifact_id: None,
             record_id: None,
-            skill_id: None,
         }],
         credential_refs: vec![CredentialRef {
             cred_ref: "vault://agent/acme/github".into(),

@@ -28,7 +28,6 @@ SessionId = str
 EventId = str
 ArtifactId = str
 RecordId = str
-SkillId = str
 _RECORD_COMMIT_SEQ_HEADER = "X-AgentDB-Record-Commit-Seq"
 
 
@@ -244,7 +243,6 @@ class Workspace:
         self.data = data or {"tenant_id": tenant_id}
         self.artifacts = ArtifactCollection(self)
         self.records = RecordCollection(self)
-        self.skills = SkillCollection(self)
 
     @property
     def id(self) -> TenantId:
@@ -399,14 +397,6 @@ class AgentHandle:
     def session_by_id(self, session_id: SessionId) -> "SessionHandle":
         return self.session(session_id=session_id)
 
-    def bind_skill(self, skill_id: SkillId, *, idempotency_key: Optional[str] = None) -> dict:
-        return self.workspace._client.bind_skill(
-            self.workspace.tenant_id,
-            self.agent_id,
-            skill_id,
-            idempotency_key=idempotency_key,
-        )
-
 
 class SessionHandle:
     def __init__(
@@ -421,7 +411,6 @@ class SessionHandle:
         self.agent = agent
         self.artifacts = ArtifactCollection(workspace)
         self.records = RecordCollection(workspace)
-        self.skills = SkillCollection(workspace)
 
     @property
     def id(self) -> SessionId:
@@ -610,29 +599,6 @@ class RecordCollection:
         return self._workspace._client.search_records(self._workspace.tenant_id, **body)
 
 
-class SkillCollection:
-    def __init__(self, workspace: Workspace) -> None:
-        self._workspace = workspace
-
-    def register(
-        self,
-        *,
-        name: str,
-        version: str,
-        manifest: Optional[dict] = None,
-        artifact_refs: Optional[list] = None,
-        idempotency_key: Optional[str] = None,
-    ) -> dict:
-        return self._workspace._client.register_skill(
-            self._workspace.tenant_id,
-            name=name,
-            version=version,
-            manifest=manifest,
-            artifact_refs=artifact_refs,
-            idempotency_key=idempotency_key,
-        )
-
-
 def artifact_ref(artifact: dict) -> dict:
     ref = {"artifact_id": artifact["artifact_id"]}
     for key in ("content_type", "bytes", "sha256"):
@@ -789,43 +755,6 @@ class Client:
         body = self._with_record_commit_seq(tenant_id, body)
         data = self._request("POST", f"/api/tenants/{_quote(tenant_id)}/records/search", json=body)
         return data.get("matches", [])
-
-    def register_skill(
-        self,
-        tenant_id: TenantId,
-        *,
-        name: str,
-        version: str,
-        manifest: Optional[dict] = None,
-        artifact_refs: Optional[list] = None,
-        idempotency_key: Optional[str] = None,
-    ) -> dict:
-        return self._request(
-            "POST",
-            f"/api/tenants/{_quote(tenant_id)}/skills",
-            json={
-                "name": name,
-                "version": version,
-                "manifest": manifest or {},
-                "artifact_refs": artifact_refs or [],
-            },
-            headers=_idem_header(idempotency_key),
-        )
-
-    def bind_skill(
-        self,
-        tenant_id: TenantId,
-        agent_id: AgentId,
-        skill_id: SkillId,
-        *,
-        idempotency_key: Optional[str] = None,
-    ) -> dict:
-        return self._request(
-            "POST",
-            f"/api/tenants/{_quote(tenant_id)}/agents/{_quote(agent_id)}/skills/bind",
-            json={"skill_id": skill_id},
-            headers=_idem_header(idempotency_key),
-        )
 
     def watch(
         self,

@@ -121,7 +121,7 @@ pub struct SearchableRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     /// Source provenance: where did this record come from
-    /// (event/artifact/skill).
+    /// (event/artifact).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceRef>,
     /// Caller-supplied vector embedding. Indexed only when

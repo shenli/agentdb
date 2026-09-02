@@ -1,7 +1,7 @@
 # agentdb (Python)
 
 Python client for AgentDB, the runtime database for agent sessions, artifacts,
-records, skills, replay, and context.
+records, replay, and context.
 
 ## Install
 
@@ -31,7 +31,7 @@ print(result.seq, [event.payload for event in result.recent])
 ```
 
 `tenant_id` is infrastructure state. Normal agent code binds a workspace once
-and then works with agents, sessions, artifacts, records, and skills from that
+and then works with agents, sessions, artifacts, and records from that
 handle. Raw tenant-scoped calls remain available through `Client` for internal
 tests and admin-style tooling.
 
@@ -63,11 +63,11 @@ asyncio.run(main())
 
 - `AgentDB.workspace`, `AgentDB.session_by_id`
 - `Workspace.agent`, `Workspace.agent_by_id`, `Workspace.session_by_id`, `Workspace.watch`
-- `Workspace.artifacts`, `Workspace.records`, `Workspace.skills`
-- `AgentHandle.session`, `AgentHandle.session_by_id`, `AgentHandle.bind_skill`
+- `Workspace.artifacts`, `Workspace.records`
+- `AgentHandle.session`, `AgentHandle.session_by_id`
 - `SessionHandle.append`, `append_user`, `model_message`, `tool_call`, `tool_result`, `context_pack_built`
 - `SessionHandle.fetch`, `fetch_recent`, `replay`, `materialize_replay_prefix`, `fork`, `subscribe`, `context`
-- `SessionHandle.artifacts`, `records`, `skills`
+- `SessionHandle.artifacts`, `records`
 - `event_ref`, `artifact_ref`
 
 IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
@@ -96,7 +96,7 @@ agent = db.workspace(tenant_id=tenant_id).agent_by_id(agent_id)
 session = agent.session_by_id(session_id)
 
 history = session.replay(from_seq=0, limit=100)
-context = session.context(include=["recent_events", "records", "skills"])
+context = session.context(include=["recent_events", "records"])
 
 result = session.agent_status("recovered", last_seen_seq=last_seen_seq)
 

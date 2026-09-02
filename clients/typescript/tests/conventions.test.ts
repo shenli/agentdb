@@ -113,17 +113,15 @@ test("artifact approval context and status builders match conventions", () => {
   });
 });
 
-test("contextSourceRefs extracts events records and skills", () => {
+test("contextSourceRefs extracts events and records", () => {
   const context = {
     events: [{ event_id: "evt_1" }, { eventId: "evt_2" }, { seq: 3 }],
     records: [{ record_id: "rec_1" }],
-    skills: [{ skill_id: "skl_1" }],
   };
   assert.deepEqual(contextSourceRefs(context), [
     { event_id: "evt_1" },
     { event_id: "evt_2" },
     { record_id: "rec_1" },
-    { skill_id: "skl_1" },
   ]);
   assert.deepEqual(contextSourceRefs(context, { maxRefs: 2 }), [
     { event_id: "evt_1" },

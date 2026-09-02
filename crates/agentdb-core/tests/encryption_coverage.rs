@@ -17,7 +17,6 @@ use agentdb_core::artifact::NewArtifact;
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{AppendRequest, Runtime};
 use agentdb_core::session::NewSession;
-use agentdb_core::skill::NewSkill;
 use agentdb_core::tenant::NewTenant;
 use agentdb_storage::{
     AeadTenantKeyring, ContentBackend, DekCacheConfig, EnvelopeCrypto, InMemoryContentBackend,
@@ -52,7 +51,6 @@ async fn raw_storage_marker_coverage_map() {
     const ARTIFACT_MARKER: &str = "COVERAGE-ARTIFACT-2b";
     const AGENT_MARKER: &str = "COVERAGE-AGENT-3c";
     const RECORD_MARKER: &str = "COVERAGE-RECORD-4d";
-    const SKILL_MARKER: &str = "COVERAGE-SKILL-5e";
     const TENANT_MARKER: &str = "COVERAGE-TENANT-6f";
 
     let t = rt
@@ -113,18 +111,6 @@ async fn raw_storage_marker_coverage_map() {
     })
     .await
     .unwrap();
-    rt.register_skill(
-        NewSkill {
-            tenant_id: t.tenant_id.clone(),
-            name: "skill".into(),
-            version: "1.0.0".into(),
-            manifest: serde_json::json!({ "secret": SKILL_MARKER }),
-            artifact_refs: vec![],
-        },
-        None,
-    )
-    .await
-    .unwrap();
 
     let kv_values: Vec<Vec<u8>> = kv.scan_prefix(b"").unwrap().map(|r| r.unwrap().1).collect();
     let raw_artifact = content
@@ -153,10 +139,6 @@ async fn raw_storage_marker_coverage_map() {
     assert!(
         !marker_in(&kv_values, RECORD_MARKER),
         "searchable record leaked into a raw KV value (M17 regression)"
-    );
-    assert!(
-        !marker_in(&kv_values, SKILL_MARKER),
-        "skill manifest leaked into a raw KV value (M17 regression)"
     );
     assert!(
         !marker_in(&kv_values, TENANT_MARKER),
@@ -216,18 +198,6 @@ async fn primary_records_round_trip_through_hydration() {
     })
     .await
     .unwrap();
-    rt.register_skill(
-        NewSkill {
-            tenant_id: t.tenant_id.clone(),
-            name: "skill".into(),
-            version: "1.0.0".into(),
-            manifest: serde_json::json!({ "secret": "SKILL-SECRET-payload" }),
-            artifact_refs: vec![],
-        },
-        None,
-    )
-    .await
-    .unwrap();
 
     // A brand-new runtime over the SAME store + an equivalent keyring hydrates by
     // scanning and decrypting the sealed primary rows.
@@ -245,10 +215,6 @@ async fn primary_records_round_trip_through_hydration() {
     let records = rt2.list_records(&t.tenant_id).await.unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].text.as_deref(), Some("RECORD-SECRET-payload"));
-
-    let skills = rt2.list_skills(&t.tenant_id).await.unwrap();
-    assert_eq!(skills.len(), 1);
-    assert_eq!(skills[0].manifest["secret"], "SKILL-SECRET-payload");
 
     let sessions = rt2.list_sessions(&t.tenant_id).await.unwrap();
     assert_eq!(sessions.len(), 1);

@@ -30,7 +30,7 @@ hard problem is deciding what to remember and how to retrieve it.
 
 **Runtime / session store.** This layer records every execution event: user
 messages, model outputs, tool calls, tool results, observations, artifacts,
-records, skills, policy decisions, forks, and lifecycle state. It is append
+records, policy decisions, forks, and lifecycle state. It is append
 heavy, session scoped, replayable, and recoverable. This is AgentDB's scope.
 
 **Application database.** Product data such as users, orders, billing records,
@@ -288,7 +288,6 @@ AgentDB's native objects are intentionally close to the runtime domain:
   source refs, artifact refs, and policy metadata.
 - **Artifact**: metadata plus content bytes for large or binary payloads.
 - **Record**: searchable memory, note, observation, or retrieved context entry.
-- **Skill**: registered package/tool manifest with versioned bindings.
 - **Policy**: quota, lifecycle, retention, context budget, legal hold, and GC
   behavior.
 
@@ -296,7 +295,7 @@ The hot path is:
 
 ```text
 wake(session_id)
-load recent events, records, artifacts, skills, and policy hints
+load recent events, records, artifacts, and policy hints
 build model context in the harness
 call the model
 execute tools or sandboxes as external hands
@@ -333,7 +332,7 @@ them can. The better question is: **what runtime guarantees does the application
 still have to build above the database?**
 
 AgentDB's claim is that agent-runtime state needs a product-level abstraction:
-tenant, agent, session, event, artifact, record, skill, policy, replay, fork,
+tenant, agent, session, event, artifact, record, policy, replay, fork,
 watch, and lifecycle. Existing databases can implement parts of this, but they
 do not expose that abstraction directly.
 
@@ -488,7 +487,7 @@ AgentDB is useful when two or more of these are true:
 - Recovery, replay, and auditability matter.
 - Forking or branch comparison is part of the agent design.
 - The append-then-read-recent-context path is on the critical loop.
-- Artifacts, observations, records, and skills need a common runtime model.
+- Artifacts, observations, and records need a common runtime model.
 - You want framework adapters to map concepts, not reinvent persistence.
 
 AgentDB is overkill when the workload is a small number of agents, session

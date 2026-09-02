@@ -27,7 +27,7 @@ runtime surface.
 - **Replay and fork runs** to debug decisions, inspect lineage, or explore an
   alternate path.
 - **Keep runtime state together** across events, records, artifacts, context
-  packs, skills, and lifecycle transitions.
+  packs, and lifecycle transitions.
 - **Stream live state** to dashboards, supervisors, evaluators, and tools.
 
 General databases can store agent data. AgentDB focuses on the workload shape

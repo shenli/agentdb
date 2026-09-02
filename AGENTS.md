@@ -30,7 +30,7 @@ The native API is the canonical AgentDB runtime surface.
   parts, background services, deployment requirements, or cross-component
   protocols unless they are justified by a concrete product or reliability need.
 - Preserve the agent-runtime model. AgentDB is optimized for session events,
-  records, artifacts, skills, context, fork/replay, and lifecycle operations;
+  records, artifacts, context, fork/replay, and lifecycle operations;
   do not reshape features into generic CRUD/database abstractions without a
   clear reason.
 

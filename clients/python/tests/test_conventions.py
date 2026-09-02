@@ -113,17 +113,15 @@ def test_artifact_approval_context_and_status_builders():
     }
 
 
-def test_context_source_refs_extracts_events_records_and_skills():
+def test_context_source_refs_extracts_events_and_records():
     context = {
         "events": [{"event_id": "evt_1"}, {"eventId": "evt_2"}, {"seq": 3}],
         "records": [{"record_id": "rec_1"}],
-        "skills": [{"skill_id": "skl_1"}],
     }
     assert context_source_refs(context) == [
         {"event_id": "evt_1"},
         {"event_id": "evt_2"},
         {"record_id": "rec_1"},
-        {"skill_id": "skl_1"},
     ]
     assert context_source_refs(context, max_refs=2) == [
         {"event_id": "evt_1"},

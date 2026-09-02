@@ -24,7 +24,6 @@ fn empty_source_ref() -> SourceRef {
         event_id: None,
         artifact_id: None,
         record_id: None,
-        skill_id: None,
     }
 }
 

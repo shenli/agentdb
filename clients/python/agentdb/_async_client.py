@@ -23,7 +23,6 @@ from .client import (
     Event,
     RecordId,
     SessionId,
-    SkillId,
     TenantId,
     WatchItem,
 )
@@ -185,43 +184,6 @@ class AsyncClient:
             "POST", f"/api/tenants/{_quote(tenant_id)}/records/search", json=body
         )
         return data.get("matches", [])
-
-    async def register_skill(
-        self,
-        tenant_id: TenantId,
-        *,
-        name: str,
-        version: str,
-        manifest: Optional[dict] = None,
-        artifact_refs: Optional[list] = None,
-        idempotency_key: Optional[str] = None,
-    ) -> dict:
-        return await self._request(
-            "POST",
-            f"/api/tenants/{_quote(tenant_id)}/skills",
-            json={
-                "name": name,
-                "version": version,
-                "manifest": manifest or {},
-                "artifact_refs": artifact_refs or [],
-            },
-            headers=_idem_header(idempotency_key),
-        )
-
-    async def bind_skill(
-        self,
-        tenant_id: TenantId,
-        agent_id: AgentId,
-        skill_id: SkillId,
-        *,
-        idempotency_key: Optional[str] = None,
-    ) -> dict:
-        return await self._request(
-            "POST",
-            f"/api/tenants/{_quote(tenant_id)}/agents/{_quote(agent_id)}/skills/bind",
-            json={"skill_id": skill_id},
-            headers=_idem_header(idempotency_key),
-        )
 
     async def watch(
         self,
@@ -528,5 +490,4 @@ __all__ = [
     "SessionId",
     "ArtifactId",
     "RecordId",
-    "SkillId",
 ]

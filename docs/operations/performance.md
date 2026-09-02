@@ -205,8 +205,8 @@ their steady-state applies are incremental (below).
 On a replicated runtime, committed Raft entries used to trigger a full state
 rehydrate on the next request — O(everything) per apply. The default is now
 incremental: the large cached sets are evicted and reload on demand through
-the KV fallbacks, the small config sets (skills, bindings, export consumers,
-record edges, tenant meta) are re-scanned, and the search indexes converge
+the KV fallbacks, the small config sets (export consumers, record edges,
+tenant meta) are re-scanned, and the search indexes converge
 through the replicated record-index outbox. Outbox rows are trimmed once both
 index watermarks pass them, keeping each drain proportional to new mutations.
 `AGENTDB_REPLICATED_APPLY=full` restores the legacy full rehydrate.

@@ -30,10 +30,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
-    agent_alias_key, agent_record_key, agent_skill_binding_key, artifact_by_sha256_key,
+    agent_alias_key, agent_record_key, artifact_by_sha256_key,
     artifact_record_key, event_by_id_key, event_key, record_by_namespace_key, record_commit_key,
     record_index_outbox_key, record_key, session_alias_key, session_record_key,
-    session_segment_key, skill_record_key, skill_unique_key, tenant_alias_key, tenant_record_key,
+    session_segment_key, tenant_alias_key, tenant_record_key,
 };
 use agentdb_storage::Error as StorageError;
 use agentdb_storage::{
@@ -62,10 +62,7 @@ use crate::record::SearchableRecord;
 use crate::runtime::{ExportConsumer, ExportLedgerItem, RecordEdge, TenantMetaEntry};
 use crate::segment::SessionSegment;
 use crate::session::Session;
-use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
-
-type SkillUniqueRecord = ((String, String, String), String);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AppendLogBatch {
@@ -2292,15 +2289,6 @@ impl Persist {
         Ok(max_seq)
     }
 
-    fn get_json_row<T: serde::de::DeserializeOwned>(&self, key: String) -> KvResult<Option<T>> {
-        match self.kv.get(key.as_bytes())? {
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|err| {
-                agentdb_storage::Error::Other(format!("row at {key} does not decode: {err}"))
-            })?)),
-            None => Ok(None),
-        }
-    }
-
     fn get_string_row(&self, key: String) -> KvResult<Option<String>> {
         Ok(self
             .kv
@@ -2310,7 +2298,7 @@ impl Persist {
 
     // ----- primary-record envelope encryption -----
     //
-    // Tenant/agent/session/record/skill primary rows are sealed under the tenant
+    // Tenant/agent/session/record primary rows are sealed under the tenant
     // Metadata DEK, mirroring the artifact path. Each row's AAD binds its
     // `(tenant, object_kind, object_id)`, so a ciphertext cannot be moved to a
     // different record. When the keyring is disabled these route through the
@@ -2443,7 +2431,7 @@ impl Persist {
     /// pass simply re-runs. A no-op when the keyring is disabled.
     ///
     /// Covers every Metadata-DEK-sealed KV row for the tenant — its own record,
-    /// its agent/session/record/skill/artifact primary rows, its session events,
+    /// its agent/session/record/artifact primary rows, its session events,
     /// and its export-ledger entries. Each row is *decrypted under its recorded
     /// version before being re-sealed*, so a wrong context (a mapping bug) fails
     /// that single row loudly (counted in `errors`) rather than corrupting it.
@@ -2463,7 +2451,6 @@ impl Persist {
             (format!("record/agent/{tenant_id}/"), MetadataObjectKind::Agent),
             (format!("record/session/{tenant_id}/"), MetadataObjectKind::Session),
             (format!("record/searchable/{tenant_id}/"), MetadataObjectKind::Record),
-            (format!("record/skill/{tenant_id}/"), MetadataObjectKind::Skill),
             (format!("record/artifact/{tenant_id}/"), MetadataObjectKind::Artifact),
         ];
 
@@ -2541,7 +2528,6 @@ impl Persist {
             format!("record/agent/{tenant_id}/"),
             format!("record/session/{tenant_id}/"),
             format!("record/searchable/{tenant_id}/"),
-            format!("record/skill/{tenant_id}/"),
             format!("record/artifact/{tenant_id}/"),
             format!("event/{tenant_id}/"),
             export_ledger_tenant_prefix(tenant_id),
@@ -3053,113 +3039,6 @@ impl Persist {
         self.write_ops(ops)
     }
 
-    /// Atomic write of a V2.3 skill record plus its
-    /// `(tenant_id, name, version)` uniqueness index.
-    pub fn put_skill(&self, skill: &Skill) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = vec![
-            WriteOp::Put {
-                key: skill_record_key(skill.tenant_id.as_str(), skill.skill_id.as_str())
-                    .into_bytes(),
-                value: self.encrypt_primary_row(
-                    skill.tenant_id.as_str(),
-                    MetadataObjectKind::Skill,
-                    skill.skill_id.as_str(),
-                    skill,
-                )?,
-            },
-            WriteOp::Put {
-                key: skill_unique_key(skill.tenant_id.as_str(), &skill.name, &skill.version)
-                    .into_bytes(),
-                value: skill.skill_id.as_str().as_bytes().to_vec(),
-            },
-        ];
-        ops.extend(self.export_ledger_item_put_ops(export_item_from_value(
-            "skill",
-            skill.tenant_id.clone(),
-            None,
-            None,
-            skill.skill_id.as_str().to_string(),
-            skill.created_at_ms,
-            skill.deleted_at_ms,
-            serde_json::to_value(skill).expect("skill serializes"),
-        ))?);
-        self.write_ops(ops)
-    }
-
-    pub fn purge_skill(&self, skill: &Skill, reason: &str, deleted_at_ms: u64) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = vec![
-            WriteOp::Delete {
-                key: skill_record_key(skill.tenant_id.as_str(), skill.skill_id.as_str())
-                    .into_bytes(),
-            },
-            WriteOp::Delete {
-                key: skill_unique_key(skill.tenant_id.as_str(), &skill.name, &skill.version)
-                    .into_bytes(),
-            },
-        ];
-        ops.extend(self.export_ledger_item_put_ops(export_tombstone_item(
-            "skill",
-            skill.tenant_id.clone(),
-            None,
-            None,
-            skill.skill_id.as_str().to_string(),
-            deleted_at_ms,
-            reason,
-            serde_json::to_value(skill).expect("skill serializes"),
-        ))?);
-        self.write_ops(ops)
-    }
-
-    pub fn put_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = vec![WriteOp::Put {
-            key: agent_skill_binding_key(
-                binding.tenant_id.as_str(),
-                binding.agent_id.as_str(),
-                binding.skill_id.as_str(),
-            )
-            .into_bytes(),
-            value: serde_json::to_vec(binding).expect("agent skill binding serializes"),
-        }];
-        ops.extend(self.export_ledger_item_put_ops(export_item_from_value(
-            "skill_binding",
-            binding.tenant_id.clone(),
-            Some(binding.agent_id.clone()),
-            None,
-            format!("{}:{}", binding.agent_id, binding.skill_id),
-            binding.bound_at_ms,
-            binding.deleted_at_ms,
-            serde_json::to_value(binding).expect("agent skill binding serializes"),
-        ))?);
-        self.write_ops(ops)
-    }
-
-    pub fn purge_agent_skill_binding(
-        &self,
-        binding: &AgentSkillBinding,
-        reason: &str,
-        deleted_at_ms: u64,
-    ) -> KvResult<()> {
-        let mut ops = vec![WriteOp::Delete {
-            key: agent_skill_binding_key(
-                binding.tenant_id.as_str(),
-                binding.agent_id.as_str(),
-                binding.skill_id.as_str(),
-            )
-            .into_bytes(),
-        }];
-        ops.extend(self.export_ledger_item_put_ops(export_tombstone_item(
-            "skill_binding",
-            binding.tenant_id.clone(),
-            Some(binding.agent_id.clone()),
-            None,
-            format!("{}:{}", binding.agent_id, binding.skill_id),
-            deleted_at_ms,
-            reason,
-            serde_json::to_value(binding).expect("agent skill binding serializes"),
-        ))?);
-        self.write_ops(ops)
-    }
-
     pub fn put_idempotency(&self, full_key: &str, rec: &IdempotencyRecord) -> KvResult<()> {
         self.write_ops(vec![WriteOp::Put {
             key: format!("record/idempotency/{full_key}").into_bytes(),
@@ -3340,100 +3219,6 @@ impl Persist {
         Ok(out)
     }
 
-    pub fn get_skill_row(&self, tenant_id: &str, skill_id: &str) -> KvResult<Option<Skill>> {
-        self.get_encrypted_json_row(
-            skill_record_key(tenant_id, skill_id),
-            tenant_id,
-            MetadataObjectKind::Skill,
-            skill_id,
-        )
-    }
-
-    /// Value of the `(tenant, name, version)` uniqueness row: the skill id.
-    pub fn get_skill_unique_row(
-        &self,
-        tenant_id: &str,
-        name: &str,
-        version: &str,
-    ) -> KvResult<Option<String>> {
-        self.get_string_row(skill_unique_key(tenant_id, name, version))
-    }
-
-    pub fn get_agent_skill_binding_row(
-        &self,
-        tenant_id: &str,
-        agent_id: &str,
-        skill_id: &str,
-    ) -> KvResult<Option<AgentSkillBinding>> {
-        self.get_json_row(agent_skill_binding_key(tenant_id, agent_id, skill_id))
-    }
-
-    pub fn scan_tenant_skills(&self, tenant_id: &str) -> KvResult<Vec<Skill>> {
-        let prefix = format!("record/skill/{tenant_id}/");
-        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
-        let mut out = Vec::new();
-        for res in iter {
-            let (k, v) = res?;
-            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Skill)?);
-        }
-        Ok(out)
-    }
-
-    pub fn scan_tenant_agent_skill_bindings(
-        &self,
-        tenant_id: &str,
-    ) -> KvResult<Vec<AgentSkillBinding>> {
-        let prefix = format!("record/agent_skill/{tenant_id}/");
-        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
-        let mut out = Vec::new();
-        for res in iter {
-            let (_k, v) = res?;
-            out.push(serde_json::from_slice(&v).expect("agent skill binding decodes"));
-        }
-        Ok(out)
-    }
-
-    pub fn scan_all_skills(&self) -> KvResult<Vec<Skill>> {
-        let iter = self.kv.scan_prefix(b"record/skill/")?;
-        let mut out = Vec::new();
-        for res in iter {
-            let (k, v) = res?;
-            out.push(self.decrypt_primary_scan_value(&k, &v, MetadataObjectKind::Skill)?);
-        }
-        Ok(out)
-    }
-
-    pub fn scan_all_skill_uniques(&self) -> KvResult<Vec<SkillUniqueRecord>> {
-        let prefix = b"record/skill_unique/";
-        let iter = self.kv.scan_prefix(prefix)?;
-        let mut out = Vec::new();
-        for res in iter {
-            let (k, v) = res?;
-            let suffix =
-                std::str::from_utf8(&k[prefix.len()..]).expect("skill_unique key suffix is utf8");
-            let mut split = suffix.splitn(3, '/');
-            let tenant = split.next().expect("tenant_id segment").to_string();
-            let name = split.next().expect("name segment").to_string();
-            let version = split.next().expect("version segment").to_string();
-            let skill_id = std::str::from_utf8(&v)
-                .expect("skill_unique value is utf8")
-                .to_string();
-            out.push(((tenant, name, version), skill_id));
-        }
-        Ok(out)
-    }
-
-    pub fn scan_all_agent_skill_bindings(&self) -> KvResult<Vec<AgentSkillBinding>> {
-        let iter = self.kv.scan_prefix(b"record/agent_skill/")?;
-        let mut out = Vec::new();
-        for res in iter {
-            let (_k, v) = res?;
-            let binding: AgentSkillBinding =
-                serde_json::from_slice(&v).expect("agent skill binding decodes");
-            out.push(binding);
-        }
-        Ok(out)
-    }
 }
 
 #[cfg(test)]

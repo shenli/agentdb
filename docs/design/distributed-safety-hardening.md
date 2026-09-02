@@ -374,7 +374,7 @@ This hardening plan does not add:
 - a production-cluster support claim without operator procedures and SLOs
 
 AgentDB remains a runtime-state database for sessions, events, artifacts,
-records, skills, context, replay, forks, lifecycle, and export.
+records, context, replay, forks, lifecycle, and export.
 
 ## Program Exit Criteria
 

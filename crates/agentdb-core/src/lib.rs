@@ -32,7 +32,6 @@ pub mod record;
 pub mod runtime;
 pub mod segment;
 pub mod session;
-pub mod skill;
 pub mod tablet_state;
 pub mod tenant;
 
@@ -63,7 +62,6 @@ pub use segment::{
     SessionSegment, SessionSegmentFile,
 };
 pub use session::{Lifecycle, NewSession, Session, SnapshotLayer, SnapshotRef};
-pub use skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 pub use tablet_state::{
     decode_sst_snapshot_payload, encode_sst_snapshot_payload, is_sst_snapshot_payload,
     DecodedSstSnapshot, LoggedTabletStateMachine, SstSnapshotMeta, TabletApplyResult,
