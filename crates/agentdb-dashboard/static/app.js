@@ -13,6 +13,7 @@ const state = {
   selectedEventId: null,
   sessionStorage: null,
   storageSummary: null,
+  diskBudget: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -243,6 +244,9 @@ async function loadTenants() {
 async function loadOverview() {
   try {
     state.storageSummary = await request("/api/storage/summary", { requireIds: false });
+    state.diskBudget = await request("/api/storage/disk", { requireIds: false }).catch(
+      () => null
+    );
     await loadTenants();
     const tenants = state.tenants.slice();
     const agentPairs = await Promise.all(
@@ -698,6 +702,23 @@ function renderOverview() {
   $("overviewArchiveBundleCount").textContent = String(
     state.storageSummary?.archive_manifest_count || 0
   );
+  const diskEl = $("overviewDiskUsage");
+  if (diskEl) {
+    const disk = state.diskBudget;
+    const toGiB = (bytes) => (bytes || 0) / (1024 * 1024 * 1024);
+    if (disk && disk.budget_bytes > 0) {
+      diskEl.textContent = `${toGiB(disk.used_bytes).toFixed(1)} / ${toGiB(
+        disk.budget_bytes
+      ).toFixed(0)} GiB`;
+      diskEl.classList.toggle("over-budget", !!disk.over_soft_budget);
+      diskEl.title = disk.over_soft_budget
+        ? "Over the advisory disk budget (writes are not blocked)."
+        : "Advisory disk budget; writes are never blocked.";
+    } else {
+      diskEl.textContent = "—";
+      diskEl.classList.remove("over-budget");
+    }
+  }
   $("overviewTenant").textContent = cfg.tenantId || "-";
   $("overviewSession").textContent = cfg.sessionId || "-";
   $("overviewEventCount").textContent = String(state.events.length);

@@ -678,7 +678,15 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
         })
-        .with_tablet_store_status(tablet_store_status(&config));
+        .with_tablet_store_status(tablet_store_status(&config))
+        .with_disk_budget(
+            if config.in_memory { 0 } else { config.disk_budget_bytes },
+            if config.in_memory {
+                Vec::new()
+            } else {
+                disk_usage_paths(&config)
+            },
+        );
     state.transport_faults = transport_faults.clone();
     // Linearizable read barrier: on by default, disabled by
     // AGENTDB_READ_BARRIER=off. It only engages on replicated tablets
@@ -1077,6 +1085,9 @@ struct ResolvedServeConfig {
     bind: SocketAddr,
     data_dir: PathBuf,
     content_dir: PathBuf,
+    /// Advisory disk budget for the data directory, in bytes. Surfaced in the
+    /// startup banner and the `/api/storage/disk` endpoint; never blocks writes.
+    disk_budget_bytes: u64,
     kv_backend: KvBackendKind,
     tablet_store_layout: TabletStoreLayoutKind,
     tablet_store_root_dir: PathBuf,
@@ -1302,6 +1313,7 @@ struct ResolvedObjectStoreConfig {
 impl ResolvedServeConfig {
     fn from_serve_opts(opts: ServeOpts) -> anyhow::Result<Self> {
         let file = load_config(opts.config.as_ref())?;
+        let disk_budget_bytes = resolve_disk_budget_bytes(&file);
         let bind = opts.bind.or(file.server.bind).unwrap_or_else(default_bind);
         let data_dir = opts
             .data_dir
@@ -1399,6 +1411,7 @@ impl ResolvedServeConfig {
             bind,
             data_dir,
             content_dir,
+            disk_budget_bytes,
             kv_backend,
             tablet_store_layout,
             tablet_store_root_dir,
@@ -1459,6 +1472,7 @@ impl ResolvedServeConfig {
 
     fn from_doctor_opts(opts: DoctorOpts) -> anyhow::Result<Self> {
         let file = load_config(opts.config.as_ref())?;
+        let disk_budget_bytes = resolve_disk_budget_bytes(&file);
         let bind = opts.bind.or(file.server.bind).unwrap_or_else(default_bind);
         let data_dir = opts
             .data_dir
@@ -1556,6 +1570,7 @@ impl ResolvedServeConfig {
             bind,
             data_dir,
             content_dir,
+            disk_budget_bytes,
             kv_backend,
             tablet_store_layout,
             tablet_store_root_dir,
@@ -1644,6 +1659,9 @@ struct ServerFileConfig {
 struct StorageFileConfig {
     data_dir: Option<PathBuf>,
     content_dir: Option<PathBuf>,
+    /// Advisory disk budget for the data directory, in GiB. Defaults to 20.
+    /// Surfaced in the startup banner and `/api/storage/disk`; never blocks.
+    disk_budget_gib: Option<f64>,
     #[serde(default)]
     kv: KvFileConfig,
     #[serde(default)]
@@ -2459,6 +2477,28 @@ fn default_data_dir() -> PathBuf {
     agentdb_home()
 }
 
+/// Default advisory disk budget for the data directory (GiB).
+const DEFAULT_DISK_BUDGET_GIB: f64 = 20.0;
+
+fn resolve_disk_budget_bytes(file: &FileConfig) -> u64 {
+    let gib = file
+        .storage
+        .disk_budget_gib
+        .filter(|g| *g > 0.0)
+        .unwrap_or(DEFAULT_DISK_BUDGET_GIB);
+    (gib * 1024.0 * 1024.0 * 1024.0) as u64
+}
+
+/// Directories whose on-disk size counts toward the disk budget: the data dir,
+/// plus the content dir when it lives outside the data dir.
+fn disk_usage_paths(config: &ResolvedServeConfig) -> Vec<PathBuf> {
+    let mut paths = vec![config.data_dir.clone()];
+    if !config.content_dir.starts_with(&config.data_dir) {
+        paths.push(config.content_dir.clone());
+    }
+    paths
+}
+
 /// The default config path: `<agentdb_home>/agentdb.toml`.
 fn default_config_path() -> PathBuf {
     agentdb_home().join(DEFAULT_CONFIG_PATH)
@@ -2484,6 +2524,13 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
     }
     println!("  health:    http://{}/health/ready", config.bind);
     println!("  dashboard: http://{}/dashboard/", config.bind);
+    if !config.in_memory {
+        println!(
+            "  disk budget: {:.0} GiB (advisory; see http://{}/api/storage/disk)",
+            config.disk_budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            config.bind
+        );
+    }
     println!(
         "  external api auth: {}",
         if config.api_auth_token.is_some() {
@@ -6904,6 +6951,8 @@ mod tests {
         // independent of the working directory; content derives from it.
         assert_eq!(config.data_dir, default_data_dir());
         assert_eq!(config.content_dir, default_data_dir().join("content"));
+        // Advisory disk budget defaults to 20 GiB.
+        assert_eq!(config.disk_budget_bytes, 20 * 1024 * 1024 * 1024);
         assert_eq!(
             config.tablet_store_layout,
             TabletStoreLayoutKind::GroupedRocksDb
@@ -6940,6 +6989,18 @@ mod tests {
         let file: FileConfig = toml::from_str(text).expect("cluster example config parses");
         assert_eq!(file.deployment.mode.as_deref(), Some("cluster"));
         assert!(file.storage.object_store.is_some());
+    }
+
+    #[test]
+    fn disk_budget_defaults_and_overrides() {
+        let gib = 1024u64 * 1024 * 1024;
+        let mut file = FileConfig::default();
+        assert_eq!(super::resolve_disk_budget_bytes(&file), 20 * gib);
+        file.storage.disk_budget_gib = Some(5.0);
+        assert_eq!(super::resolve_disk_budget_bytes(&file), 5 * gib);
+        // A non-positive value falls back to the default rather than 0/unbounded.
+        file.storage.disk_budget_gib = Some(0.0);
+        assert_eq!(super::resolve_disk_budget_bytes(&file), 20 * gib);
     }
 
     #[test]

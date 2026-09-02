@@ -316,6 +316,12 @@ pub struct AppState {
     /// (single-node, or the `AGENTDB_READ_BARRIER=off` kill switch)
     /// serves reads without it.
     pub read_barrier_timeout: Option<std::time::Duration>,
+    /// Advisory disk budget for the data directory in bytes (0 = unset, e.g.
+    /// in-memory). Reported by `/api/storage/disk`; never blocks writes.
+    pub disk_budget_bytes: u64,
+    /// Directories whose on-disk size counts toward the disk budget (data dir
+    /// and, if separate, the content dir).
+    pub disk_usage_paths: Vec<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -343,7 +349,16 @@ impl AppState {
             operational: Arc::new(crate::operational::OperationalRegistry::default()),
             transport_faults: None,
             read_barrier_timeout: None,
+            disk_budget_bytes: 0,
+            disk_usage_paths: Vec::new(),
         }
+    }
+
+    /// Set the advisory disk budget and the directories that count toward it.
+    pub fn with_disk_budget(mut self, budget_bytes: u64, paths: Vec<std::path::PathBuf>) -> Self {
+        self.disk_budget_bytes = budget_bytes;
+        self.disk_usage_paths = paths;
+        self
     }
 
     pub fn with_meta(mut self, meta: MetaStore) -> Self {

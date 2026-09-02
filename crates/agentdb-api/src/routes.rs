@@ -244,6 +244,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/restores", post(validate_admin_restore))
         .route("/api/me", get(get_me))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
+        .route("/api/storage/disk", get(get_disk_budget))
         .route("/api/tenants", get(list_tenants).post(create_tenant))
         .route(
             "/api/tenants/:tenant_id",
@@ -4663,6 +4664,51 @@ async fn get_fleet_storage_summary(
     State(s): State<AppState>,
 ) -> Json<agentdb_core::FleetStorageSummary> {
     Json(s.runtime.fleet_storage_summary().await)
+}
+
+/// `GET /api/storage/disk` — the advisory disk budget for the data directory and
+/// its current on-disk usage. This never blocks writes; over the soft threshold
+/// it is a signal for the operator (and the dashboard) only.
+async fn get_disk_budget(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let budget = s.disk_budget_bytes;
+    let paths = s.disk_usage_paths.clone();
+    // The size walk is blocking I/O; keep it off the async worker.
+    let used = tokio::task::spawn_blocking(move || {
+        paths.iter().map(|p| dir_size_bytes(p)).sum::<u64>()
+    })
+    .await
+    .unwrap_or(0);
+    let fraction = if budget > 0 {
+        used as f64 / budget as f64
+    } else {
+        0.0
+    };
+    const SOFT_THRESHOLD: f64 = 0.8;
+    Json(serde_json::json!({
+        "budget_bytes": budget,
+        "used_bytes": used,
+        "used_fraction": fraction,
+        "soft_threshold_fraction": SOFT_THRESHOLD,
+        "over_soft_budget": budget > 0 && fraction >= SOFT_THRESHOLD,
+        "advisory": true,
+    }))
+}
+
+/// Total size of a directory tree in bytes (best-effort: unreadable entries are
+/// skipped).
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        match entry.metadata() {
+            Ok(meta) if meta.is_dir() => total += dir_size_bytes(&entry.path()),
+            Ok(meta) => total += meta.len(),
+            Err(_) => {}
+        }
+    }
+    total
 }
 
 /// `GET /api/admin/recovery` — the recovery-root health view: manifest-backup
