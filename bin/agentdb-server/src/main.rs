@@ -100,7 +100,9 @@ enum Cmd {
 
 #[derive(Parser, Debug)]
 struct ServeOpts {
-    /// Path to a TOML config file. Defaults to `agentdb.toml` when it exists.
+    /// Path to a TOML config file. Defaults to `<agentdb_home>/agentdb.toml`
+    /// (then a cwd-local `agentdb.toml`) when either exists, where agentdb_home
+    /// is `$AGENTDB_HOME`, `$XDG_DATA_HOME/agentdb`, or `~/.agentdb`.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -2387,8 +2389,14 @@ fn resolve_config_path(path: Option<&PathBuf>) -> Option<PathBuf> {
     match path {
         Some(path) => Some(path.clone()),
         None => {
-            let default = PathBuf::from(DEFAULT_CONFIG_PATH);
-            default.exists().then_some(default)
+            // Prefer the machine-scoped config; fall back to a cwd-local
+            // `agentdb.toml` for local development convenience.
+            let home_config = default_config_path();
+            if home_config.exists() {
+                return Some(home_config);
+            }
+            let cwd_config = PathBuf::from(DEFAULT_CONFIG_PATH);
+            cwd_config.exists().then_some(cwd_config)
         }
     }
 }
@@ -2399,8 +2407,33 @@ fn default_bind() -> SocketAddr {
         .expect("default bind address must parse")
 }
 
+/// The machine-scoped AgentDB home directory, holding runtime state, content,
+/// and the default config. Resolution order: `$AGENTDB_HOME`, then
+/// `$XDG_DATA_HOME/agentdb`, then `~/.agentdb`. Falls back to `./agentdb-data`
+/// only when no home can be resolved. Because this does not depend on the
+/// process's working directory, the server opens the *same* database regardless
+/// of which shell it is launched from — unlike the old `./data` default.
+fn agentdb_home() -> PathBuf {
+    let non_empty = |var: &str| std::env::var_os(var).filter(|v| !v.is_empty());
+    if let Some(explicit) = non_empty("AGENTDB_HOME") {
+        return PathBuf::from(explicit);
+    }
+    if let Some(xdg) = non_empty("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("agentdb");
+    }
+    if let Some(home) = non_empty("HOME") {
+        return PathBuf::from(home).join(".agentdb");
+    }
+    PathBuf::from("./agentdb-data")
+}
+
 fn default_data_dir() -> PathBuf {
-    PathBuf::from("./data")
+    agentdb_home()
+}
+
+/// The default config path: `<agentdb_home>/agentdb.toml`.
+fn default_config_path() -> PathBuf {
+    agentdb_home().join(DEFAULT_CONFIG_PATH)
 }
 
 fn print_startup_banner(config: &ResolvedServeConfig) {
@@ -6639,15 +6672,17 @@ mod tests {
 
         assert_eq!(config.deployment_mode, DeploymentMode::SingleNode);
         assert_eq!(config.bind, default_bind());
-        assert_eq!(config.data_dir, PathBuf::from("./data"));
-        assert_eq!(config.content_dir, PathBuf::from("./data/content"));
+        // The default data dir is machine-scoped (see `agentdb_home`), so it is
+        // independent of the working directory; content derives from it.
+        assert_eq!(config.data_dir, default_data_dir());
+        assert_eq!(config.content_dir, default_data_dir().join("content"));
         assert_eq!(
             config.tablet_store_layout,
             TabletStoreLayoutKind::GroupedRocksDb
         );
         assert_eq!(
             config.tablet_store_root_dir,
-            PathBuf::from("./data/tablet-stores")
+            default_data_dir().join("tablet-stores")
         );
         assert_eq!(config.tablet_store_tablets_per_domain, 32);
         assert_eq!(config.tablet_store_max_open_domains, 16);
