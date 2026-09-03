@@ -89,6 +89,26 @@ function bindSearchControls() {
       }
     });
   });
+
+  // Reconnect when the bearer token is entered. On a token-secured instance the
+  // overview loads once on page open — before a token exists — and the token is
+  // never persisted (cleared on reload), so without this the fleet panels stay
+  // empty. Re-run the current view's loaders (debounced) once a token is typed.
+  const tokenEl = $("token");
+  if (tokenEl) {
+    let tokenReloadTimer = null;
+    tokenEl.addEventListener("input", () => {
+      if (tokenReloadTimer) clearTimeout(tokenReloadTimer);
+      tokenReloadTimer = setTimeout(() => {
+        if (!tokenEl.value.trim()) return;
+        if (isSessionView()) {
+          loadSessionView();
+        } else {
+          loadOverview();
+        }
+      }, 400);
+    });
+  }
 }
 
 function dispatch(action) {
