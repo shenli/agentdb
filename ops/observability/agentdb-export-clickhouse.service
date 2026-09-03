@@ -12,8 +12,6 @@ ExecStart=/usr/local/bin/agentdbctl export clickhouse run \
   --tenant-id ${AGENTDB_EXPORT_TENANT_ID} \
   --clickhouse-url ${CLICKHOUSE_URL} \
   --consumer ${AGENTDB_EXPORT_CONSUMER} \
-  --lease-owner ${AGENTDB_EXPORT_LEASE_OWNER} \
-  --lease-ms ${AGENTDB_EXPORT_LEASE_MS} \
   --include ${AGENTDB_EXPORT_INCLUDE} \
   --mode ${AGENTDB_EXPORT_MODE} \
   --limit ${AGENTDB_EXPORT_LIMIT} \

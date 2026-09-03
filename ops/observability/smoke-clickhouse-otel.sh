@@ -53,7 +53,6 @@ if [[ -n "$TENANT_ID" ]]; then
       "$AGENTDBCTL" export clickhouse run \
         --tenant-id "$TENANT_ID" \
         --consumer "${AGENTDB_EXPORT_SMOKE_CONSUMER:-smoke-clickhouse}" \
-        --lease-owner "${AGENTDB_EXPORT_SMOKE_LEASE_OWNER:-smoke-clickhouse-$$}" \
         --mode native,otel \
         --backfill \
         --max-batches "${AGENTDB_EXPORT_SMOKE_MAX_BATCHES:-1}" >/dev/null

@@ -312,7 +312,11 @@ struct Cli {
     token: Option<String>,
 
     /// Output format. Use `json` for scripts and AI agents.
-    #[arg(short = 'o', long, global = true, default_value = "table")]
+    ///
+    /// The long flag is `--format` (with `-o` retained) so it does not collide
+    /// with the `export jsonl run --output <file>` sink path, which owns the
+    /// `--output` long name.
+    #[arg(short = 'o', long = "format", global = true, default_value = "table")]
     output: Output,
 
     #[command(subcommand)]
@@ -918,12 +922,11 @@ struct ClickHouseRunArgs {
     agent_id: Option<String>,
     #[arg(long)]
     session_id: Option<String>,
+    /// Client-side checkpoint key. Names the local resume checkpoint row
+    /// (in the `agentdb_export_checkpoints` ClickHouse table), not a server
+    /// consumer.
     #[arg(long)]
     consumer: Option<String>,
-    #[arg(long, default_value = "agentdbctl")]
-    lease_owner: String,
-    #[arg(long, default_value_t = 30_000)]
-    lease_ms: u64,
     #[arg(long)]
     from_cursor: Option<String>,
     /// First-page snapshot boundary required when resuming a metadata backfill.
@@ -997,7 +1000,9 @@ struct JsonlRunArgs {
     #[arg(long)]
     tenant_id: String,
     /// Local path, "-", file:// URI, or object-store URI such as s3://bucket/path.jsonl.
-    #[arg(long)]
+    // Distinct clap id so this sink path does not collide with the global
+    // `-o/--format` output-format arg (both fields are named `output`).
+    #[arg(long = "output", id = "jsonl_output")]
     output: String,
     #[arg(long, default_value = "tenant")]
     scope: String,
@@ -1005,12 +1010,14 @@ struct JsonlRunArgs {
     agent_id: Option<String>,
     #[arg(long)]
     session_id: Option<String>,
+    /// Client-side checkpoint key. Names the local resume checkpoint (a small
+    /// JSON file beside the output), not a server consumer.
     #[arg(long)]
     consumer: Option<String>,
-    #[arg(long, default_value = "agentdbctl-jsonl")]
-    lease_owner: String,
-    #[arg(long, default_value_t = 30_000)]
-    lease_ms: u64,
+    /// Local checkpoint file for resume-cursor persistence. Defaults to
+    /// `<output>.checkpoint`; skipped for "-"/stdout and object-store URIs.
+    #[arg(long)]
+    checkpoint: Option<PathBuf>,
     #[arg(long)]
     from_cursor: Option<String>,
     /// First-page snapshot boundary required when resuming a metadata backfill.
@@ -1049,7 +1056,9 @@ struct ParquetFromJsonlArgs {
     #[arg(long)]
     input: String,
     /// Local path or object-store URI for the Parquet output.
-    #[arg(long)]
+    // Distinct clap id so it does not collide with the global `-o/--format`
+    // output-format arg (both fields are named `output`).
+    #[arg(long = "output", id = "parquet_output")]
     output: String,
     /// DuckDB executable to invoke.
     #[arg(long, default_value = "duckdb")]
@@ -1765,19 +1774,25 @@ async fn clickhouse_write_smoke(url: &str) -> Result<Value> {
 }
 
 async fn clickhouse_status(api: &Api, args: ClickHouseStatusArgs) -> Result<Value> {
-    let agentdb = if let Some(consumer) = &args.consumer {
-        api.get(&format!(
-            "/api/tenants/{}/exports/consumers/{}",
-            query_component(&args.tenant_id),
-            query_component(consumer)
-        ))
-        .await?
-    } else {
-        api.get(&format!(
+    // Health / high-watermark comes from the export status route (not deleted).
+    let agentdb = api
+        .get(&format!(
             "/api/tenants/{}/exports/status",
             query_component(&args.tenant_id)
         ))
-        .await?
+        .await?;
+    // The durable resume cursor now lives client-side in the checkpoint table.
+    let checkpoint = match (&args.consumer, args.clickhouse_url.as_deref()) {
+        (Some(consumer), Some(url)) => {
+            let cursor = clickhouse_read_checkpoint(url, consumer, &args.tenant_id).await?;
+            json!({ "consumer": consumer, "cursor": cursor })
+        }
+        (Some(consumer), None) => json!({
+            "consumer": consumer,
+            "cursor": Value::Null,
+            "message": "--clickhouse-url or CLICKHOUSE_URL not supplied; cannot read checkpoint"
+        }),
+        (None, _) => Value::Null,
     };
     let clickhouse = if let Some(url) = args.clickhouse_url.as_deref() {
         let schema = clickhouse_schema_status(url).await?;
@@ -1827,6 +1842,7 @@ async fn clickhouse_status(api: &Api, args: ClickHouseStatusArgs) -> Result<Valu
         "tenant_id": args.tenant_id,
         "consumer": args.consumer,
         "agentdb": agentdb,
+        "checkpoint": checkpoint,
         "clickhouse": clickhouse
     }))
 }
@@ -2034,99 +2050,93 @@ async fn clickhouse_scalar_u64(url: &str, sql: &str) -> Result<u64> {
         .with_context(|| format!("ClickHouse scalar response was not u64: {response:?}"))
 }
 
-async fn ensure_claimed_export_consumer(
-    api: &Api,
-    args: &ClickHouseRunArgs,
+/// Read the durable resume cursor for a client-side checkpoint from the
+/// `agentdb_export_checkpoints` ClickHouse table. Returns `None` when no
+/// checkpoint row exists yet.
+async fn clickhouse_read_checkpoint(
+    url: &str,
     consumer: &str,
-) -> Result<Value> {
-    let include = vec!["events".to_string()];
-    ensure_claimed_export_consumer_for(
-        api,
-        &args.tenant_id,
-        consumer,
-        &args.scope,
-        args.agent_id.as_deref(),
-        args.session_id.as_deref(),
-        &include,
-        &args.lease_owner,
-        args.lease_ms,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn ensure_claimed_export_consumer_for(
-    api: &Api,
     tenant_id: &str,
-    consumer: &str,
-    scope: &str,
-    agent_id: Option<&str>,
-    session_id: Option<&str>,
-    include: &[String],
-    lease_owner: &str,
-    lease_ms: u64,
-) -> Result<Value> {
-    let include = if include.is_empty() {
-        vec!["events".to_string()]
+) -> Result<Option<String>> {
+    let sql = format!(
+        "SELECT cursor FROM agentdb_export_checkpoints WHERE consumer = {} AND tenant_id = {} ORDER BY updated_at_ms DESC LIMIT 1",
+        sql_string(consumer),
+        sql_string(tenant_id)
+    );
+    let text = clickhouse_query(url, &sql).await?;
+    let trimmed = text.trim();
+    Ok(if trimmed.is_empty() {
+        None
     } else {
-        include.to_vec()
-    };
-    api.post(
-        &format!(
-            "/api/tenants/{}/exports/consumers",
-            query_component(tenant_id)
-        ),
-        json!({
-            "name": consumer,
-            "scope": scope,
-            "agent_id": agent_id,
-            "session_id": session_id,
-            "include": include
-        }),
-    )
-    .await?;
-    api.post(
-        &format!(
-            "/api/tenants/{}/exports/consumers/{}/claim",
-            query_component(tenant_id),
-            query_component(consumer)
-        ),
-        json!({
-            "lease_owner": lease_owner,
-            "lease_ms": lease_ms
-        }),
-    )
-    .await
+        Some(trimmed.to_string())
+    })
 }
 
-async fn ack_empty_metadata_snapshot(
-    api: &Api,
+/// Persist the latest resume cursor for a client-side checkpoint into the
+/// `agentdb_export_checkpoints` ClickHouse table (ReplacingMergeTree keyed by
+/// `(consumer, tenant_id)`, newest `updated_at_ms` wins).
+async fn clickhouse_write_checkpoint(
+    url: &str,
+    consumer: &str,
     tenant_id: &str,
-    consumer: Option<&str>,
-    lease_owner: &str,
-    snapshot_high_watermark: Option<&str>,
-    dry_run: bool,
+    cursor: &str,
 ) -> Result<()> {
-    let (Some(consumer), Some(snapshot_high_watermark)) = (consumer, snapshot_high_watermark)
-    else {
-        return Ok(());
-    };
-    if dry_run {
-        return Ok(());
+    let row = json!({
+        "consumer": consumer,
+        "tenant_id": tenant_id,
+        "cursor": cursor,
+        "updated_at_ms": now_ms()
+    });
+    let body = format!(
+        "INSERT INTO agentdb_export_checkpoints (consumer, tenant_id, cursor, updated_at_ms) FORMAT JSONEachRow\n{}\n",
+        serde_json::to_string(&row)?
+    );
+    clickhouse_query(url, &body).await?;
+    Ok(())
+}
+
+/// Resolve the local checkpoint file for a JSONL export run. Explicit
+/// `--checkpoint` wins; otherwise it is derived as `<output>.checkpoint` for
+/// local paths, and skipped for `-`/stdout and object-store/`scheme://` URIs.
+fn jsonl_checkpoint_path(args: &JsonlRunArgs) -> Option<PathBuf> {
+    if let Some(path) = &args.checkpoint {
+        return Some(path.clone());
     }
-    api.post(
-        &format!(
-            "/api/tenants/{}/exports/consumers/{}/ack",
-            query_component(tenant_id),
-            query_component(consumer)
-        ),
-        json!({
-            "cursor": Value::Null,
-            "snapshot_high_watermark": snapshot_high_watermark,
-            "lease_owner": lease_owner
-        }),
-    )
-    .await?;
+    if args.output == "-" || args.output.contains("://") {
+        return None;
+    }
+    Some(PathBuf::from(format!("{}.checkpoint", args.output)))
+}
+
+/// Read the durable resume cursor from a local JSONL checkpoint file.
+fn read_jsonl_checkpoint(path: &std::path::Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let value: Value = serde_json::from_str(&text)
+                .with_context(|| format!("parse checkpoint file {}", path.display()))?;
+            Ok(value
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::to_string))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(anyhow::Error::from(error).context(format!("read checkpoint file {}", path.display())))
+        }
+    }
+}
+
+/// Atomically persist the latest resume cursor to a local JSONL checkpoint file.
+fn write_jsonl_checkpoint(path: &std::path::Path, cursor: &str) -> Result<()> {
+    let body = serde_json::to_vec_pretty(&json!({
+        "cursor": cursor,
+        "updated_at_ms": now_ms()
+    }))?;
+    let tmp = path.with_extension("checkpoint.tmp");
+    std::fs::write(&tmp, &body)
+        .with_context(|| format!("write checkpoint file {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("commit checkpoint file {}", path.display()))?;
     Ok(())
 }
 
@@ -2142,12 +2152,9 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
     let mut filtered_items = 0_u64;
     let mut inserted_rows = 0_u64;
     if let Some(consumer) = &args.consumer {
-        let claimed = ensure_claimed_export_consumer(api, &args, consumer).await?;
-        if cursor.is_none() && !metadata_backfill {
-            cursor = claimed
-                .get("last_acked_cursor")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+        if cursor.is_none() && !metadata_backfill && !args.dry_run {
+            cursor =
+                clickhouse_read_checkpoint(&args.clickhouse_url, consumer, &args.tenant_id).await?;
         }
     }
     let mut batches = 0_u64;
@@ -2173,26 +2180,52 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                 } else {
                     args.include.clone()
                 };
-                api.post(
-                    &format!(
-                        "/api/tenants/{}/exports/backfill",
-                        query_component(&args.tenant_id)
-                    ),
-                    json!({
-                        "scope": args.scope.clone(),
-                        "agent_id": args.agent_id.clone(),
-                        "session_id": args.session_id.clone(),
-                        "include": include.clone(),
-                        "from_cursor": cursor.clone(),
-                        "snapshot_high_watermark": backfill_high_watermark.clone(),
-                        "limit": args.limit
-                    }),
-                )
-                .await?
+                if metadata_backfill {
+                    // Metadata-object snapshots still use the server's snapshot
+                    // branch (cursors + snapshot_high_watermark); `changes` does
+                    // not implement it.
+                    api.post(
+                        &format!(
+                            "/api/tenants/{}/exports/backfill",
+                            query_component(&args.tenant_id)
+                        ),
+                        json!({
+                            "scope": args.scope.clone(),
+                            "agent_id": args.agent_id.clone(),
+                            "session_id": args.session_id.clone(),
+                            "include": include.clone(),
+                            "from_cursor": cursor.clone(),
+                            "snapshot_high_watermark": backfill_high_watermark.clone(),
+                            "limit": args.limit
+                        }),
+                    )
+                    .await?
+                } else {
+                    api.get(&changes_backfill_path(
+                        &args.tenant_id,
+                        &args.scope,
+                        args.agent_id.as_deref(),
+                        args.session_id.as_deref(),
+                        &include.join(","),
+                        cursor.as_deref(),
+                        backfill_high_watermark.as_deref(),
+                        args.limit,
+                    ))
+                    .await?
+                }
             }
             ExportRunPhase::Watch => {
-                api.get(&export_watch_path(&args, cursor.as_deref()))
-                    .await?
+                api.get(&changes_tail_path(
+                    &args.tenant_id,
+                    &args.scope,
+                    args.agent_id.as_deref(),
+                    args.session_id.as_deref(),
+                    &changes_include(&args.include),
+                    cursor.as_deref(),
+                    args.limit,
+                    args.poll_interval_ms,
+                ))
+                .await?
             }
         };
         if phase == ExportRunPhase::Backfill {
@@ -2227,18 +2260,6 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
             filtered_items.saturating_add(raw_item_count.saturating_sub(items.len()) as u64);
         if raw_item_count == 0 {
             if phase == ExportRunPhase::Backfill {
-                if metadata_backfill {
-                    let snapshot_high_watermark = backfill_high_watermark.as_deref();
-                    ack_empty_metadata_snapshot(
-                        api,
-                        &args.tenant_id,
-                        args.consumer.as_deref(),
-                        &args.lease_owner,
-                        snapshot_high_watermark,
-                        args.dry_run,
-                    )
-                    .await?;
-                }
                 cursor = backfill_high_watermark.clone();
                 if args.tail {
                     phase = ExportRunPhase::Watch;
@@ -2321,26 +2342,15 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                 .get("complete")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-        let ack_cursor = if metadata_backfill && !backfill_complete {
-            None
-        } else {
-            cursor.as_deref()
-        };
-        if let (Some(consumer), Some(ack_cursor)) = (&args.consumer, ack_cursor) {
-            if !args.dry_run {
-                api.post(
-                    &format!(
-                        "/api/tenants/{}/exports/consumers/{}/ack",
-                        query_component(&args.tenant_id),
-                        query_component(consumer)
-                    ),
-                    json!({
-                        "cursor": ack_cursor,
-                        "snapshot_high_watermark": response
-                            .get("snapshot_high_watermark")
-                            .and_then(Value::as_str),
-                        "lease_owner": args.lease_owner.clone()
-                    }),
+        // Persist the client-side resume checkpoint for the events path. Metadata
+        // snapshots re-run from scratch each time, so they carry no checkpoint.
+        if let (Some(consumer), Some(checkpoint_cursor)) = (&args.consumer, cursor.as_deref()) {
+            if !args.dry_run && !metadata_backfill {
+                clickhouse_write_checkpoint(
+                    &args.clickhouse_url,
+                    consumer,
+                    &args.tenant_id,
+                    checkpoint_cursor,
                 )
                 .await?;
             }
@@ -2447,24 +2457,16 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
         args.backfill && !include.is_empty() && !include.iter().any(|item| item == "events");
     let mut cursor = args.from_cursor.clone();
     let mut backfill_high_watermark = args.snapshot_high_watermark.clone();
-    if let Some(consumer) = &args.consumer {
-        let claimed = ensure_claimed_export_consumer_for(
-            api,
-            &args.tenant_id,
-            consumer,
-            &args.scope,
-            args.agent_id.as_deref(),
-            args.session_id.as_deref(),
-            &include,
-            &args.lease_owner,
-            args.lease_ms,
-        )
-        .await?;
-        if cursor.is_none() && !metadata_backfill {
-            cursor = claimed
-                .get("last_acked_cursor")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+    // Client-side resume checkpoint. `--consumer` names the checkpoint; the
+    // cursor persists to a local file derived from the output (or --checkpoint).
+    let checkpoint_path = if args.consumer.is_some() {
+        jsonl_checkpoint_path(&args)
+    } else {
+        None
+    };
+    if let Some(path) = &checkpoint_path {
+        if cursor.is_none() && !metadata_backfill && !args.dry_run {
+            cursor = read_jsonl_checkpoint(path)?;
         }
     }
     let mut batches = 0_u64;
@@ -2485,26 +2487,52 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
         }
         let response = match phase {
             ExportRunPhase::Backfill => {
-                api.post(
-                    &format!(
-                        "/api/tenants/{}/exports/backfill",
-                        query_component(&args.tenant_id)
-                    ),
-                    json!({
-                        "scope": args.scope.clone(),
-                        "agent_id": args.agent_id.clone(),
-                        "session_id": args.session_id.clone(),
-                        "include": include.clone(),
-                        "from_cursor": cursor.clone(),
-                        "snapshot_high_watermark": backfill_high_watermark.clone(),
-                        "limit": args.limit
-                    }),
-                )
-                .await?
+                if metadata_backfill {
+                    // Metadata-object snapshots still use the server's snapshot
+                    // branch (cursors + snapshot_high_watermark); `changes` does
+                    // not implement it.
+                    api.post(
+                        &format!(
+                            "/api/tenants/{}/exports/backfill",
+                            query_component(&args.tenant_id)
+                        ),
+                        json!({
+                            "scope": args.scope.clone(),
+                            "agent_id": args.agent_id.clone(),
+                            "session_id": args.session_id.clone(),
+                            "include": include.clone(),
+                            "from_cursor": cursor.clone(),
+                            "snapshot_high_watermark": backfill_high_watermark.clone(),
+                            "limit": args.limit
+                        }),
+                    )
+                    .await?
+                } else {
+                    api.get(&changes_backfill_path(
+                        &args.tenant_id,
+                        &args.scope,
+                        args.agent_id.as_deref(),
+                        args.session_id.as_deref(),
+                        &include.join(","),
+                        cursor.as_deref(),
+                        backfill_high_watermark.as_deref(),
+                        args.limit,
+                    ))
+                    .await?
+                }
             }
             ExportRunPhase::Watch => {
-                api.get(&jsonl_export_watch_path(&args, cursor.as_deref()))
-                    .await?
+                api.get(&changes_tail_path(
+                    &args.tenant_id,
+                    &args.scope,
+                    args.agent_id.as_deref(),
+                    args.session_id.as_deref(),
+                    &include.join(","),
+                    cursor.as_deref(),
+                    args.limit,
+                    args.poll_interval_ms,
+                ))
+                .await?
             }
         };
         if phase == ExportRunPhase::Backfill {
@@ -2539,18 +2567,6 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
             filtered_items.saturating_add(raw_item_count.saturating_sub(items.len()) as u64);
         if raw_item_count == 0 {
             if phase == ExportRunPhase::Backfill {
-                if metadata_backfill {
-                    let snapshot_high_watermark = backfill_high_watermark.as_deref();
-                    ack_empty_metadata_snapshot(
-                        api,
-                        &args.tenant_id,
-                        args.consumer.as_deref(),
-                        &args.lease_owner,
-                        snapshot_high_watermark,
-                        args.dry_run,
-                    )
-                    .await?;
-                }
                 cursor = backfill_high_watermark.clone();
                 if args.tail {
                     phase = ExportRunPhase::Watch;
@@ -2578,28 +2594,11 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
                 .get("complete")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-        let ack_cursor = if metadata_backfill && !backfill_complete {
-            None
-        } else {
-            cursor.as_deref()
-        };
-        if let (Some(consumer), Some(ack_cursor)) = (&args.consumer, ack_cursor) {
-            if !args.dry_run {
-                api.post(
-                    &format!(
-                        "/api/tenants/{}/exports/consumers/{}/ack",
-                        query_component(&args.tenant_id),
-                        query_component(consumer)
-                    ),
-                    json!({
-                        "cursor": ack_cursor,
-                        "snapshot_high_watermark": response
-                            .get("snapshot_high_watermark")
-                            .and_then(Value::as_str),
-                        "lease_owner": args.lease_owner.clone()
-                    }),
-                )
-                .await?;
+        // Persist the client-side resume checkpoint for the events path. Metadata
+        // snapshots re-run from scratch each time, so they carry no checkpoint.
+        if let (Some(path), Some(checkpoint_cursor)) = (&checkpoint_path, cursor.as_deref()) {
+            if !args.dry_run && !metadata_backfill {
+                write_jsonl_checkpoint(path, checkpoint_cursor)?;
             }
         }
         write_metrics_output(
@@ -2909,46 +2908,74 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn export_watch_path(args: &ClickHouseRunArgs, cursor: Option<&str>) -> String {
-    let limit = args.limit.to_string();
-    let include = if args.include.is_empty() {
+/// Normalize an `include` list into the comma-separated form the `changes`
+/// endpoint expects, defaulting to `events` when empty.
+fn changes_include(include: &[String]) -> String {
+    if include.is_empty() {
         "events".to_string()
     } else {
-        args.include.join(",")
-    };
+        include.join(",")
+    }
+}
+
+/// Build the tail (non-backfill) `GET /api/tenants/{t}/changes` path. Reads
+/// through the current high watermark with an optional `wait_ms` long-poll.
+#[allow(clippy::too_many_arguments)]
+fn changes_tail_path(
+    tenant_id: &str,
+    scope: &str,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    include: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    wait_ms: u64,
+) -> String {
+    let limit = limit.to_string();
+    let wait_ms = wait_ms.to_string();
     let pairs = [
-        ("scope", Some(args.scope.as_str())),
-        ("agent_id", args.agent_id.as_deref()),
-        ("session_id", args.session_id.as_deref()),
-        ("include", Some(include.as_str())),
+        ("scope", Some(scope)),
+        ("agent_id", agent_id),
+        ("session_id", session_id),
+        ("include", Some(include)),
         ("from_cursor", cursor),
         ("limit", Some(limit.as_str())),
+        ("wait_ms", Some(wait_ms.as_str())),
     ];
     format!(
-        "/api/tenants/{}/exports/watch{}",
-        query_component(&args.tenant_id),
+        "/api/tenants/{}/changes{}",
+        query_component(tenant_id),
         query_pairs_encoded(&pairs)
     )
 }
 
-fn jsonl_export_watch_path(args: &JsonlRunArgs, cursor: Option<&str>) -> String {
-    let limit = args.limit.to_string();
-    let include = if args.include.is_empty() {
-        "events".to_string()
-    } else {
-        args.include.join(",")
-    };
+/// Build the events-backfill `GET /api/tenants/{t}/changes?backfill=true` path.
+/// Pins the read to `snapshot_high_watermark` and reports `complete`.
+#[allow(clippy::too_many_arguments)]
+fn changes_backfill_path(
+    tenant_id: &str,
+    scope: &str,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    include: &str,
+    cursor: Option<&str>,
+    snapshot_high_watermark: Option<&str>,
+    limit: usize,
+) -> String {
+    let limit = limit.to_string();
     let pairs = [
-        ("scope", Some(args.scope.as_str())),
-        ("agent_id", args.agent_id.as_deref()),
-        ("session_id", args.session_id.as_deref()),
-        ("include", Some(include.as_str())),
+        ("backfill", Some("true")),
+        ("scope", Some(scope)),
+        ("agent_id", agent_id),
+        ("session_id", session_id),
+        ("include", Some(include)),
         ("from_cursor", cursor),
+        ("snapshot_high_watermark", snapshot_high_watermark),
         ("limit", Some(limit.as_str())),
     ];
     format!(
-        "/api/tenants/{}/exports/watch{}",
-        query_component(&args.tenant_id),
+        "/api/tenants/{}/changes{}",
+        query_component(tenant_id),
         query_pairs_encoded(&pairs)
     )
 }
@@ -4420,63 +4447,36 @@ mod tests {
     }
 
     #[test]
-    fn builds_encoded_export_watch_path() {
-        let args = ClickHouseRunArgs {
-            tenant_id: "ten_1".into(),
-            clickhouse_url: "http://clickhouse:8123/agentdb".into(),
-            scope: "session".into(),
-            agent_id: None,
-            session_id: Some("ses_1".into()),
-            consumer: None,
-            lease_owner: "agentdbctl".into(),
-            lease_ms: 30_000,
-            from_cursor: Some("v2:0001:ses_1:0002:cell=cell-a".into()),
-            snapshot_high_watermark: None,
-            limit: 500,
-            include: vec![],
-            mode: vec!["native".into()],
-            backfill: false,
-            tail: false,
-            max_batches: None,
-            poll_interval_ms: 1000,
-            max_retries: 3,
-            retry_initial_backoff_ms: 250,
-            privacy: ExportPrivacyArgs::default(),
-            metrics_output: None,
-            dry_run: false,
-        };
+    fn builds_encoded_changes_tail_path() {
         assert_eq!(
-            export_watch_path(&args, args.from_cursor.as_deref()),
-            "/api/tenants/ten_1/exports/watch?scope=session&session_id=ses_1&include=events&from_cursor=v2%3A0001%3Ases_1%3A0002%3Acell%3Dcell-a&limit=500"
+            changes_tail_path(
+                "ten_1",
+                "session",
+                None,
+                Some("ses_1"),
+                &changes_include(&[]),
+                Some("v2:0001:ses_1:0002:cell=cell-a"),
+                500,
+                2000,
+            ),
+            "/api/tenants/ten_1/changes?scope=session&session_id=ses_1&include=events&from_cursor=v2%3A0001%3Ases_1%3A0002%3Acell%3Dcell-a&limit=500&wait_ms=2000"
         );
     }
 
     #[test]
-    fn builds_encoded_jsonl_export_watch_path() {
-        let args = JsonlRunArgs {
-            tenant_id: "ten_1".into(),
-            output: "s3://agentdb-exports/ten_1/events.jsonl".into(),
-            scope: "agent".into(),
-            agent_id: Some("agt_1".into()),
-            session_id: None,
-            consumer: None,
-            lease_owner: "agentdbctl-jsonl".into(),
-            lease_ms: 30_000,
-            from_cursor: Some("ledger:ten_1/0001/event/evt_1".into()),
-            snapshot_high_watermark: None,
-            limit: 250,
-            include: vec!["events".into(), "sessions".into()],
-            backfill: false,
-            tail: false,
-            max_batches: None,
-            poll_interval_ms: 1000,
-            privacy: ExportPrivacyArgs::default(),
-            metrics_output: None,
-            dry_run: false,
-        };
+    fn builds_encoded_changes_backfill_path() {
         assert_eq!(
-            jsonl_export_watch_path(&args, args.from_cursor.as_deref()),
-            "/api/tenants/ten_1/exports/watch?scope=agent&agent_id=agt_1&include=events%2Csessions&from_cursor=ledger%3Aten_1%2F0001%2Fevent%2Fevt_1&limit=250"
+            changes_backfill_path(
+                "ten_1",
+                "agent",
+                Some("agt_1"),
+                None,
+                &changes_include(&["events".into(), "sessions".into()]),
+                Some("ledger:ten_1/0001/event/evt_1"),
+                Some("ledger:ten_1/0009"),
+                250,
+            ),
+            "/api/tenants/ten_1/changes?backfill=true&scope=agent&agent_id=agt_1&include=events%2Csessions&from_cursor=ledger%3Aten_1%2F0001%2Fevent%2Fevt_1&snapshot_high_watermark=ledger%3Aten_1%2F0009&limit=250"
         );
     }
 
