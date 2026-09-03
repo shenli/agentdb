@@ -24,6 +24,16 @@ def capture(client):
         calls.append((method, url, kwargs))
         if url.endswith("/api/me"):
             return response(status=404, body={"error": {"message": "not found"}})
+        if url.endswith("/api/sessions/open"):
+            return response(
+                body={
+                    "tenant_id": "ten_1",
+                    "agent_id": "agt_1",
+                    "session_id": "ses_1",
+                    "alias": "ticket-42",
+                    "next_seq": 0,
+                }
+            )
         if url.endswith("/api/tenants"):
             if method == "GET":
                 return response(body={"tenants": []})
@@ -94,6 +104,22 @@ def test_v2_urls_cover_core_flow():
     assert any("/watch" in url for url in urls)
 
 
+def test_open_session_is_a_single_request():
+    c = Client("http://x", auth=("u", "p"))
+    calls, patched = capture(c)
+    with patched:
+        db = AgentDB(_client=c)
+        session = db.open_session("acme", "sales-agent", "ticket-42")
+        assert session.session_id == "ses_1"
+        assert session.agent_id == "agt_1"
+
+    # One POST to /api/sessions/open — not the list/create/re-list dance.
+    assert len(calls) == 1
+    method, url, _ = calls[0]
+    assert method == "POST"
+    assert url.endswith("/api/sessions/open")
+
+
 def test_friendly_api_binds_workspace_agent_and_session_context():
     c = Client("http://x", auth=("u", "p"))
     calls, patched = capture(c)
@@ -162,6 +188,16 @@ def test_friendly_alias_handles_reuse_existing_agent_and_session_after_restart()
         calls.append((method, url, kwargs))
         if url.endswith("/api/me"):
             return response(status=404, body={"error": {"message": "not found"}})
+        if url.endswith("/api/sessions/open"):
+            return response(
+                body={
+                    "tenant_id": "ten_1",
+                    "agent_id": "agt_1",
+                    "session_id": "ses_1",
+                    "alias": "ticket-42",
+                    "next_seq": 0,
+                }
+            )
         if url.endswith("/api/tenants"):
             return response(body={"tenants": [{"tenant_id": "ten_1", "external_key": "acme"}]})
         if url.endswith("/agents"):

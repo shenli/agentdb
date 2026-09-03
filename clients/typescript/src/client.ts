@@ -208,6 +208,22 @@ export class AgentDB {
     return new Workspace(this.client, opts.tenantId).sessionById(sessionId, { agentId: opts.agentId });
   }
 
+  /**
+   * Open a session in one call: idempotently create-if-missing the workspace,
+   * agent, and session, and return a ready-to-use handle. Replaces the
+   * workspace/agent/session open dance with a single request.
+   */
+  async openSession(
+    workspace: string,
+    agent: string,
+    session: string,
+    opts: { policy?: Record<string, unknown>; config?: Record<string, unknown> } = {}
+  ): Promise<SessionHandle> {
+    const sess = await this.client.openSession(workspace, agent, session, opts);
+    const ws = new Workspace(this.client, sess.tenantId, { name: workspace });
+    return new SessionHandle(ws, sess);
+  }
+
   private async resolveTenant(name?: string): Promise<{ tenantId: TenantId; name?: string; data: Record<string, unknown> } | undefined> {
     let info: UserInfo | undefined;
     try {
@@ -529,6 +545,21 @@ export class Client {
       { alias: opts.alias ?? null }
     );
     return new Session(this, tenantId, String(data.session_id), { agentId: String(data.agent_id) });
+  }
+
+  async openSession(
+    workspace: string,
+    agent: string,
+    session: string,
+    opts: { policy?: unknown; config?: unknown } = {}
+  ): Promise<Session> {
+    const body: Record<string, unknown> = { workspace, agent, session };
+    if (opts.policy !== undefined) body.policy = opts.policy;
+    if (opts.config !== undefined) body.config = opts.config;
+    const data = await this._request("POST", "/api/sessions/open", body);
+    return new Session(this, String(data.tenant_id), String(data.session_id), {
+      agentId: String(data.agent_id),
+    });
   }
 
   async listSessions(tenantId: TenantId): Promise<Record<string, unknown>[]> {

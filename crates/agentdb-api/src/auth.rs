@@ -229,7 +229,13 @@ fn authorize_principal(
             let Some(tenant_id) = token.tenant_id.as_deref() else {
                 return Err("the bearer token has no tenant binding");
             };
-            if tenant_path_matches(path, tenant_id) || path == "/api/me" {
+            // `/api/sessions/open` is tenant-less in the path; the handler
+            // reconciles the body's workspace against this binding and rejects
+            // a mismatch, so a tenant-scoped token is allowed to reach it.
+            if tenant_path_matches(path, tenant_id)
+                || path == "/api/me"
+                || path == "/api/sessions/open"
+            {
                 Ok(ApiPrincipal::Tenant {
                     token_id: token.token_id.clone(),
                     tenant_id: tenant_id.to_string(),

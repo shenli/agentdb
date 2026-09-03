@@ -296,3 +296,30 @@ test("constructor rejects token + getToken combined", () => {
     /token.*getToken/
   );
 });
+
+test("openSession opens a session in a single request", async () => {
+  const calls: string[] = [];
+  const mockFetch = async (url: string | URL) => {
+    const raw = String(url);
+    calls.push(raw);
+    if (raw.endsWith("/api/sessions/open")) {
+      return json({
+        tenant_id: "ten_1",
+        agent_id: "agt_1",
+        session_id: "ses_1",
+        alias: "ticket-42",
+        next_seq: 0,
+      });
+    }
+    return json({});
+  };
+
+  const c = new Client({ baseUrl: "http://x", fetch: mockFetch as typeof globalThis.fetch });
+  const db = new AgentDB({ client: c });
+  const session = await db.openSession("acme", "sales-agent", "ticket-42");
+
+  assert.equal(session.sessionId, "ses_1");
+  // One POST to /api/sessions/open — not the list/create/re-list dance.
+  assert.equal(calls.length, 1);
+  assert.ok(String(calls[0]).endsWith("/api/sessions/open"));
+});

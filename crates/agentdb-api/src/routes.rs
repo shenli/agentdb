@@ -37,7 +37,7 @@ use agentdb_core::{
         SearchRequest, WatchRequest, WatchScope,
     },
     Agent, Artifact, ChangefeedItem, ErrorCode, Id, IdKind,
-    NewAgent, NewArtifact, NewSession, NewTenant, SourceRef, Tenant,
+    NewAgent, NewArtifact, NewSession, NewTenant, Session, SourceRef, Tenant,
 };
 use agentdb_meta::{
     cells, nodes, placement_scopes, tablet_movements, tablet_ranges, tablet_rebalance,
@@ -49,7 +49,7 @@ use crate::dto::{
     ContextBody, CreateAgentBody, CreateExportConsumerBody, CreateRecordBody,
     CreateSessionBody, CreateTenantBody, ExportBackfillBody,
     ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
-    ExportWatchResponse, FetchQuery, ForkSessionBody, IncludeDeletedQuery,
+    ExportWatchResponse, FetchQuery, ForkSessionBody, IncludeDeletedQuery, OpenSessionBody,
     PolicyWorkerRunBody, ReplayQuery, RestoreSessionStorageBody, RewindExportConsumerBody,
     SearchRecordsBody, SearchRecordsResponse, SweepBody, TenantMetaBody,
     TransitionSessionLifecycleBody, UpdateRecordBody, WatchQuery,
@@ -120,6 +120,7 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
         .route("/api/admin/backups", post(create_admin_backup))
         .route("/api/admin/restores", post(validate_admin_restore))
         .route("/api/me", get(get_me))
+        .route("/api/sessions/open", post(open_session))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
         .route("/api/storage/disk", get(get_disk_budget))
         .route("/api/tenants", get(list_tenants).post(create_tenant))
@@ -527,6 +528,140 @@ async fn get_me(
         }
     }
     Json(body)
+}
+
+/// `POST /api/sessions/open` — idempotently resolve-or-create a
+/// (workspace, agent, session) triple in one call and return the session.
+/// Replaces the SDK's list/create/catch-409/re-list loop at three levels with
+/// one request; every alias lookup is an O(1) resolve, not a scan. Repeating
+/// the call returns the same session, and concurrent openers converge (the
+/// loser of a create race re-resolves the winner's row).
+async fn open_session(
+    State(s): State<AppState>,
+    axum::Extension(principal): axum::Extension<crate::auth::ApiPrincipal>,
+    Json(body): Json<OpenSessionBody>,
+) -> Result<Json<Session>, ApiError> {
+    if body.workspace.is_empty() || body.agent.is_empty() || body.session.is_empty() {
+        return Err(ApiError(agentdb_core::Error::new(
+            ErrorCode::PolicyDenied,
+            "workspace, agent, and session are required",
+        )));
+    }
+    let rt = &s.runtime;
+
+    // 1. Workspace (tenant, keyed by external key).
+    let tenant = match rt.resolve_tenant_by_external_key(&body.workspace).await? {
+        Some(t) => t,
+        None => {
+            // Minting a new workspace is a Root/Admin action; a tenant-scoped
+            // token cannot create tenants and its workspace must already exist.
+            if matches!(principal, crate::auth::ApiPrincipal::Tenant { .. }) {
+                return Err(ApiError(agentdb_core::Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("workspace not found: {}", body.workspace),
+                )));
+            }
+            match rt
+                .create_tenant(NewTenant {
+                    external_key: body.workspace.clone(),
+                    policy: body.policy.clone(),
+                })
+                .await
+            {
+                Ok(t) => t,
+                Err(e) if e.code == ErrorCode::AliasConflict => rt
+                    .resolve_tenant_by_external_key(&body.workspace)
+                    .await?
+                    .ok_or_else(|| {
+                        agentdb_core::Error::new(ErrorCode::AliasConflict, "workspace open race")
+                    })?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+
+    // A tenant-scoped token may only open within the tenant it is bound to.
+    if let crate::auth::ApiPrincipal::Tenant { tenant_id, .. } = &principal {
+        if tenant.tenant_id.as_str() != tenant_id {
+            return Err(ApiError(agentdb_core::Error::new(
+                ErrorCode::PolicyDenied,
+                "the bearer token is scoped to a different workspace",
+            )));
+        }
+    }
+
+    // 2. Agent (by alias under the tenant).
+    let agent = match rt
+        .resolve_agent_by_alias(&tenant.tenant_id, &body.agent)
+        .await?
+    {
+        Some(a) => a,
+        None => match rt
+            .create_agent(NewAgent {
+                tenant_id: tenant.tenant_id.clone(),
+                alias: Some(body.agent.clone()),
+                config: body.config.clone(),
+            })
+            .await
+        {
+            Ok(a) => a,
+            Err(e) if e.code == ErrorCode::AliasConflict => rt
+                .resolve_agent_by_alias(&tenant.tenant_id, &body.agent)
+                .await?
+                .ok_or_else(|| {
+                    agentdb_core::Error::new(ErrorCode::AliasConflict, "agent open race")
+                })?,
+            Err(e) => return Err(e.into()),
+        },
+    };
+
+    // 3. Session (by alias under the tenant; the alias must belong to this
+    //    agent — session aliases are unique per tenant, not per agent).
+    let session = match rt
+        .resolve_session_by_alias(&tenant.tenant_id, &body.session)
+        .await?
+    {
+        Some(sess) if sess.agent_id == agent.agent_id => sess,
+        Some(_) => {
+            return Err(ApiError(agentdb_core::Error::new(
+                ErrorCode::AliasConflict,
+                "session alias already in use by another agent",
+            )))
+        }
+        None => match rt
+            .create_session(NewSession {
+                tenant_id: tenant.tenant_id.clone(),
+                agent_id: agent.agent_id.clone(),
+                alias: Some(body.session.clone()),
+            })
+            .await
+        {
+            Ok(sess) => sess,
+            Err(e) if e.code == ErrorCode::AliasConflict => {
+                match rt
+                    .resolve_session_by_alias(&tenant.tenant_id, &body.session)
+                    .await?
+                {
+                    Some(sess) if sess.agent_id == agent.agent_id => sess,
+                    Some(_) => {
+                        return Err(ApiError(agentdb_core::Error::new(
+                            ErrorCode::AliasConflict,
+                            "session alias already in use by another agent",
+                        )))
+                    }
+                    None => {
+                        return Err(ApiError(agentdb_core::Error::new(
+                            ErrorCode::AliasConflict,
+                            "session open race",
+                        )))
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
+        },
+    };
+
+    Ok(Json(session))
 }
 
 async fn list_admin_tokens(
@@ -7359,9 +7494,9 @@ fn payload_u64(payload: &serde_json::Value, key: &str) -> Option<u64> {
 /// - `Content-Type` — recorded on the artifact metadata. Absent → None.
 /// - `X-Sha256` (optional, hex) — caller-asserted digest. Mismatch with the
 ///   server's computed digest yields 422 HASH_MISMATCH.
-/// - `Idempotency-Key` (optional) — accepted but currently a no-op. Artifact
-///   idempotency is V2.1+ work; we don't fail just because the header was
-///   sent so existing clients keep working.
+/// - `Idempotency-Key` (optional) — deduplicates the upload. A retry with the
+///   same key and identical bytes returns the stored artifact; the same key
+///   with different bytes yields 409 IDEMPOTENCY_CONFLICT.
 ///
 /// Errors map per `crate::errors::status_for`:
 /// - body > 16 MB → 422 ARTIFACT_TOO_LARGE
