@@ -3,8 +3,7 @@
 //! `docs/reference/sandbox-snapshot-contract.md`.
 
 use agentdb_core::runtime::{
-    AppendRequest, ExportWatchRequest, ForkSessionRequest, NewSnapshotRef, Runtime, WatchRequest,
-    WatchScope,
+    AppendRequest, ExportWatchRequest, ForkSessionRequest, NewSnapshotRef, Runtime, WatchScope,
 };
 use agentdb_core::session::{SnapshotLayer, SnapshotRef};
 use agentdb_core::{NewAgent, NewSession, NewTenant};
@@ -314,11 +313,12 @@ async fn tenant_watch_emits_fork_edge_and_does_not_reemit_parent_events() {
     .unwrap();
 
     let items = rt
-        .watch(WatchRequest {
+        .export_watch(ExportWatchRequest {
             tenant_id: tenant.tenant_id.clone(),
             scope: WatchScope::Tenant,
             session_id: None,
             agent_id: None,
+            include: Vec::new(),
             from_cursor: None,
             limit: 100,
         })
@@ -326,30 +326,38 @@ async fn tenant_watch_emits_fork_edge_and_does_not_reemit_parent_events() {
         .unwrap();
 
     // 2 parent events + 1 child event + 1 fork-edge.
-    let fork_edges: Vec<_> = items.iter().filter_map(|i| i.fork_edge.as_ref()).collect();
+    let fork_edges: Vec<_> = items
+        .iter()
+        .filter(|i| i.item.object_type == "fork_edge")
+        .collect();
     assert_eq!(fork_edges.len(), 1, "exactly one fork-edge");
+    // A fork-edge item keys its child under `object_id` and its parent under
+    // `session_id` (so parent-scoped consumers discover the branch).
+    assert_eq!(fork_edges[0].item.object_id, child.session_id.as_str());
     assert_eq!(
-        fork_edges[0].child_session_id.as_str(),
-        child.session_id.as_str()
+        fork_edges[0].item.session_id.as_ref().map(|id| id.as_str()),
+        Some(parent.session_id.as_str())
     );
-    assert_eq!(
-        fork_edges[0].parent_session_id.as_str(),
-        parent.session_id.as_str()
-    );
-    assert_eq!(fork_edges[0].fork_point_seq, 1);
+    assert_eq!(fork_edges[0].item.data["fork_point_seq"], 1);
 
     // Each physical event appears exactly once; no parent re-emission on child.
     let child_events: Vec<_> = items
         .iter()
-        .filter_map(|i| i.event.as_ref())
-        .filter(|e| e.session_id.as_str() == child.session_id.as_str())
+        .filter(|i| {
+            i.item.object_type == "event"
+                && i.item.session_id.as_ref().map(|id| id.as_str())
+                    == Some(child.session_id.as_str())
+        })
         .collect();
     assert_eq!(child_events.len(), 1, "child emits only its own event");
-    assert_eq!(child_events[0].seq, 0);
+    assert_eq!(child_events[0].item.seq, Some(0));
     let parent_events: Vec<_> = items
         .iter()
-        .filter_map(|i| i.event.as_ref())
-        .filter(|e| e.session_id.as_str() == parent.session_id.as_str())
+        .filter(|i| {
+            i.item.object_type == "event"
+                && i.item.session_id.as_ref().map(|id| id.as_str())
+                    == Some(parent.session_id.as_str())
+        })
         .collect();
     assert_eq!(parent_events.len(), 2);
 }
@@ -369,11 +377,12 @@ async fn session_watch_on_parent_discovers_child_via_fork_edge() {
         .unwrap();
 
     let items = rt
-        .watch(WatchRequest {
+        .export_watch(ExportWatchRequest {
             tenant_id: tenant.tenant_id.clone(),
             scope: WatchScope::Session,
             session_id: Some(parent.session_id.clone()),
             agent_id: None,
+            include: Vec::new(),
             from_cursor: None,
             limit: 100,
         })
@@ -381,10 +390,8 @@ async fn session_watch_on_parent_discovers_child_via_fork_edge() {
         .unwrap();
 
     assert!(
-        items.iter().any(|i| i
-            .fork_edge
-            .as_ref()
-            .is_some_and(|e| e.child_session_id.as_str() == child.session_id.as_str())),
+        items.iter().any(|i| i.item.object_type == "fork_edge"
+            && i.item.object_id == child.session_id.as_str()),
         "parent session-scope feed announces the child via a fork-edge"
     );
 }
@@ -396,11 +403,12 @@ async fn fork_edge_is_gap_free_across_resume_and_pagination() {
 
     // Cursor captured BEFORE the fork exists.
     let pre_fork = rt
-        .watch(WatchRequest {
+        .export_watch(ExportWatchRequest {
             tenant_id: tenant.tenant_id.clone(),
             scope: WatchScope::Tenant,
             session_id: None,
             agent_id: None,
+            include: Vec::new(),
             from_cursor: None,
             limit: 100,
         })
@@ -433,25 +441,25 @@ async fn fork_edge_is_gap_free_across_resume_and_pagination() {
 
     // An old cursor from before the fork still discovers the child + fork-edge.
     let after = rt
-        .watch(WatchRequest {
+        .export_watch(ExportWatchRequest {
             tenant_id: tenant.tenant_id.clone(),
             scope: WatchScope::Tenant,
             session_id: None,
             agent_id: None,
+            include: Vec::new(),
             from_cursor: Some(pre_fork_cursor),
             limit: 100,
         })
         .await
         .unwrap();
     assert!(
-        after.iter().any(|i| i.fork_edge.is_some()),
+        after.iter().any(|i| i.item.object_type == "fork_edge"),
         "fork-edge discovered after resume"
     );
     assert!(
-        after.iter().any(|i| i
-            .event
-            .as_ref()
-            .is_some_and(|e| e.session_id.as_str() == child.session_id.as_str())),
+        after.iter().any(|i| i.item.object_type == "event"
+            && i.item.session_id.as_ref().map(|id| id.as_str())
+                == Some(child.session_id.as_str())),
         "child event discovered after resume"
     );
 
@@ -461,11 +469,12 @@ async fn fork_edge_is_gap_free_across_resume_and_pagination() {
     let mut fork_edge_count = 0;
     loop {
         let page = rt
-            .watch(WatchRequest {
+            .export_watch(ExportWatchRequest {
                 tenant_id: tenant.tenant_id.clone(),
                 scope: WatchScope::Tenant,
                 session_id: None,
                 agent_id: None,
+                include: Vec::new(),
                 from_cursor: cursor.clone(),
                 limit: 1,
             })
@@ -476,7 +485,7 @@ async fn fork_edge_is_gap_free_across_resume_and_pagination() {
         }
         for item in &page {
             assert!(cursors.insert(item.cursor.clone()), "duplicate cursor");
-            if item.fork_edge.is_some() {
+            if item.item.object_type == "fork_edge" {
                 fork_edge_count += 1;
             }
         }
@@ -496,11 +505,12 @@ async fn export_watch_in_memory_skips_fork_edges_without_stalling_small_pages() 
     append_n(&rt, &tenant, &agent, &parent, 2).await;
 
     let pre_fork = rt
-        .watch(WatchRequest {
+        .export_watch(ExportWatchRequest {
             tenant_id: tenant.tenant_id.clone(),
             scope: WatchScope::Tenant,
             session_id: None,
             agent_id: None,
+            include: Vec::new(),
             from_cursor: None,
             limit: 100,
         })

@@ -433,8 +433,9 @@ async fn export_watch_scope_never_leaks_other_tenants_or_agents() {
 #[tokio::test]
 async fn export_backfill_pages_event_snapshots_and_rejects_unknown_includes() {
     // Use the durable-ledger path even though the backing store itself is
-    // in-memory. Runtime::in_memory intentionally exports only event frontiers,
-    // so it cannot prove metadata snapshot-to-tail handoff for record writes.
+    // in-memory. Runtime::in_memory's ledger intentionally records only event
+    // and fork-edge items, so it cannot prove metadata snapshot-to-tail handoff
+    // for record writes.
     let runtime = Runtime::with_kv(
         Arc::new(InMemoryKvStore::new()),
         Arc::new(InMemoryContentBackend::default()),

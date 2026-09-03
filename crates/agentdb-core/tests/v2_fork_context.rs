@@ -1,7 +1,7 @@
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{
-    AppendRequest, ContextInclude, ContextRequest, ExportWatchRequest, FetchRequest,
-    ForkSessionRequest, Runtime, RuntimeRouteContext, SearchRequest, WatchRequest, WatchScope,
+    AppendRequest, ContextInclude, ContextRequest, ExportWatchRequest, ForkSessionRequest, Runtime,
+    RuntimeRouteContext, SearchRequest, WatchScope,
 };
 use agentdb_core::{NewAgent, NewSession, NewTenant, RUNTIME_PRIMARY_TABLET_ID};
 use agentdb_storage::{
@@ -355,24 +355,27 @@ async fn tenant_and_agent_watch_return_ordered_cursors_without_duplicates() {
     .unwrap();
 
     let tenant_items = rt
-        .watch(WatchRequest {
+        .export_watch(ExportWatchRequest {
             tenant_id: tenant.tenant_id.clone(),
             scope: WatchScope::Tenant,
             session_id: None,
             agent_id: None,
+            include: Vec::new(),
             from_cursor: None,
             limit: 10,
         })
         .await
         .unwrap();
     assert_eq!(tenant_items.len(), 2);
+    assert!(tenant_items[0].cursor.starts_with("ledger:"));
 
     let after_first = rt
-        .watch(WatchRequest {
+        .export_watch(ExportWatchRequest {
             tenant_id: tenant.tenant_id.clone(),
             scope: WatchScope::Agent,
             session_id: None,
             agent_id: Some(agent.agent_id.clone()),
+            include: Vec::new(),
             from_cursor: Some(tenant_items[0].cursor.clone()),
             limit: 10,
         })
@@ -381,72 +384,17 @@ async fn tenant_and_agent_watch_return_ordered_cursors_without_duplicates() {
     assert_eq!(after_first.len(), 1);
     assert_eq!(
         after_first[0]
-            .event
-            .as_ref()
-            .expect("watch item carries event")
-            .kind,
+            .item
+            .data
+            .get("kind")
+            .and_then(|kind| kind.as_str())
+            .expect("export item carries event kind"),
         "second"
     );
 }
 
 #[tokio::test]
-async fn watch_accepts_legacy_v2_item_cursor_after_frontier_upgrade() {
-    let (rt, tenant, agent, session) = seed().await;
-    rt.append(AppendRequest::simple(
-        &tenant,
-        &agent,
-        &session,
-        "first",
-        serde_json::json!({}),
-    ))
-    .await
-    .unwrap();
-    rt.append(AppendRequest::simple(
-        &tenant,
-        &agent,
-        &session,
-        "second",
-        serde_json::json!({}),
-    ))
-    .await
-    .unwrap();
-
-    let events = rt
-        .fetch_from_seq(FetchRequest {
-            tenant_id: tenant.tenant_id.clone(),
-            session_id: session.session_id.clone(),
-            from_seq: 0,
-            limit: 10,
-        })
-        .await
-        .unwrap();
-    let legacy_cursor = format!(
-        "v2:{:020}:{}:{:020}:cell=none:scope=none:tablet=none:epoch=none:applied=none",
-        events[0].created_at_ms, events[0].session_id, events[0].seq
-    );
-
-    let resumed = rt
-        .watch(WatchRequest {
-            tenant_id: tenant.tenant_id.clone(),
-            scope: WatchScope::Session,
-            session_id: Some(session.session_id.clone()),
-            agent_id: Some(agent.agent_id.clone()),
-            from_cursor: Some(legacy_cursor),
-            limit: 10,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(resumed.len(), 1);
-    assert_eq!(resumed[0].event.as_ref().unwrap().kind, "second");
-    assert!(resumed[0].cursor.starts_with("frontier:v1:"));
-    assert!(resumed[0]
-        .cursor
-        .contains(&format!("{}@2", session.session_id)));
-}
-
-#[tokio::test]
-async fn watch_cursor_includes_tablet_context_and_applied_index() {
+async fn export_watch_cursor_includes_tablet_context_and_applied_index() {
     let kv = Arc::new(InMemoryKvStore::new());
     let lifecycle = Arc::new(PrefixScopedTabletStore::new(kv.clone()));
     let log: Arc<dyn ReplicatedLog + Send + Sync> = Arc::new(SingleNodeReplicatedLog::new(
@@ -504,11 +452,12 @@ async fn watch_cursor_includes_tablet_context_and_applied_index() {
     };
     let items = rt
         .with_route_context(route_context, async {
-            rt.watch(WatchRequest {
+            rt.export_watch(ExportWatchRequest {
                 tenant_id: tenant.tenant_id.clone(),
                 scope: WatchScope::Session,
                 session_id: Some(session.session_id.clone()),
                 agent_id: Some(agent.agent_id.clone()),
+                include: vec!["events".into()],
                 from_cursor: None,
                 limit: 10,
             })
@@ -517,6 +466,9 @@ async fn watch_cursor_includes_tablet_context_and_applied_index() {
         .await
         .unwrap();
 
+    // Route context now travels on the feed item's fields rather than being
+    // baked into the cursor string; the cursor itself is the durable `ledger:`
+    // sequence shared with the persisted export path.
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].cell_id.as_deref(), Some("cell-a"));
     assert_eq!(
@@ -526,22 +478,18 @@ async fn watch_cursor_includes_tablet_context_and_applied_index() {
     assert_eq!(items[0].tablet_id, Some(RUNTIME_PRIMARY_TABLET_ID));
     assert_eq!(items[0].tablet_epoch, Some(9));
     assert!(items[0].applied_index.unwrap_or_default() > 0);
-    assert!(items[0].cursor.starts_with("frontier:v1:"));
+    assert!(items[0].cursor.starts_with("ledger:"));
     assert!(items[0]
         .cursor
-        .contains(&format!("{}@1", session.session_id)));
-    assert!(items[0].cursor.contains("cell=cell-a"));
-    assert!(items[0].cursor.contains("scope=tenant/tablet-watch"));
-    assert!(items[0].cursor.contains("tablet=1"));
-    assert!(items[0].cursor.contains("epoch=9"));
-    assert!(items[0].cursor.contains("applied="));
+        .contains(session.session_id.as_str()));
 
     let resumed_without_route_context = rt
-        .watch(WatchRequest {
+        .export_watch(ExportWatchRequest {
             tenant_id: tenant.tenant_id.clone(),
             scope: WatchScope::Session,
             session_id: Some(session.session_id.clone()),
             agent_id: Some(agent.agent_id.clone()),
+            include: vec!["events".into()],
             from_cursor: Some(items[0].cursor.clone()),
             limit: 10,
         })

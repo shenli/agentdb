@@ -11,7 +11,7 @@ use agentdb_core::artifact::NewArtifact;
 use agentdb_core::errors::ErrorCode;
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{
-    AppendRequest, FetchRequest, ForkSessionRequest, Runtime, WatchRequest, WatchScope,
+    AppendRequest, ExportWatchRequest, FetchRequest, ForkSessionRequest, Runtime, WatchScope,
 };
 use agentdb_core::session::{Lifecycle, NewSession};
 use agentdb_core::tenant::NewTenant;
@@ -196,14 +196,15 @@ async fn every_funnel_survives_full_cache_eviction() {
         "tiered history readable after eviction"
     );
 
-    // Session-scoped watch on a cold cache.
+    // Session-scoped export changefeed on a cold cache.
     rt.debug_evict_metadata_caches().await;
     let items = rt
-        .watch(WatchRequest {
+        .export_watch(ExportWatchRequest {
             tenant_id: t.tenant_id.clone(),
             scope: WatchScope::Session,
             session_id: Some(s.session_id.clone()),
             agent_id: None,
+            include: Vec::new(),
             from_cursor: None,
             limit: 10,
         })

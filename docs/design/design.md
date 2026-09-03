@@ -219,7 +219,9 @@ Fork-aware feeds are feeds over a DAG of per-session sub-streams. Each physical
 event is emitted once on the session where it was written. A fork emits a
 `fork_edge` control item carrying `(parent_id, fork_point_seq, child_id)` so
 consumers can discover and follow child streams without duplicating parent
-history. Opaque frontier cursors track per-session next-sequence positions.
+history. A single append-ordered export ledger — durable in persistent
+runtimes, in-memory in dev runtimes — assigns every event and fork-edge a
+monotonic `ledger:` cursor for resumable reads.
 
 Observability export is the durable sink boundary. Export endpoints serve
 tenant-scoped envelopes for events and runtime metadata, support backfill plus

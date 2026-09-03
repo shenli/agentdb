@@ -269,8 +269,8 @@ agentdbctl nodes delete node-a
 The first supported observability sink is ClickHouse over HTTP. The initial
 implementation exports event and runtime metadata envelopes, supports event
 backfill, supports tenant-scope metadata snapshot backfill, and keeps its resume
-cursor in a client-side checkpoint. Persistent AgentDB runtimes use durable
-ledger cursors for export; in-memory/dev runtimes use `frontier:v1` cursors.
+cursor in a client-side checkpoint. Both persistent and in-memory/dev AgentDB
+runtimes use durable `ledger:` cursors for export.
 Runtime soft deletes are exported as tombstone envelopes. Export is
 currently supported only on single-tablet runtimes; metadata-backed clustered
 routing returns HTTP 422 rather than exposing an incomplete tablet-local feed.
