@@ -325,6 +325,27 @@ class Workspace:
             **kwargs,
         )
 
+    def search_events(
+        self,
+        q: str,
+        *,
+        session: Optional[SessionId] = None,
+        agent: Optional[AgentId] = None,
+        kind: Optional[str] = None,
+        limit: int = 20,
+    ) -> list:
+        """Search this workspace's durable event log by text. Pass `session` or
+        `agent` to narrow the scope. See `Client.search_events`."""
+
+        return self._client.search_events(
+            self.tenant_id,
+            q,
+            session_id=session,
+            agent_id=agent,
+            kind=kind,
+            limit=limit,
+        )
+
     def storage_summary(self) -> dict:
         return self._client.get_tenant_storage_summary(self.tenant_id)
 
@@ -819,6 +840,33 @@ class Client:
         if wait_ms is not None:
             params["wait_ms"] = str(wait_ms)
         return self._request("GET", f"/api/tenants/{_quote(tenant_id)}/changes", params=params)
+
+    def search_events(
+        self,
+        tenant_id: TenantId,
+        q: str,
+        *,
+        session_id: Optional[SessionId] = None,
+        agent_id: Optional[AgentId] = None,
+        kind: Optional[str] = None,
+        limit: int = 20,
+    ) -> list:
+        """Scoped, text-only search over the durable event log
+        (`GET .../events/search`). Narrow with `session_id` or `agent_id` for
+        bounded cost; omit both to search the whole tenant. Returns the
+        `matches` list, each `{"event": ..., "score": ...}`."""
+
+        params: dict = {"q": q, "limit": str(limit)}
+        if session_id:
+            params["session_id"] = session_id
+        if agent_id:
+            params["agent_id"] = agent_id
+        if kind:
+            params["kind"] = kind
+        data = self._request(
+            "GET", f"/api/tenants/{_quote(tenant_id)}/events/search", params=params
+        )
+        return data.get("matches", [])
 
     def get_session_storage(self, tenant_id: TenantId, session_id: SessionId) -> dict:
         return self._request(

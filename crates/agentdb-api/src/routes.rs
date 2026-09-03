@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use agentdb_core::{
     record::{NewRecord, SearchableRecord},
     runtime::{
-        AppendRequest, ContextInclude, ContextRequest, ExportFeedItem, ExportWatchRequest,
-        FetchRequest, ForkSessionRequest, RecordUpdate, SearchRequest, WatchScope,
+        AppendRequest, ContextInclude, ContextRequest, EventSearchRequest, ExportFeedItem,
+        ExportWatchRequest, FetchRequest, ForkSessionRequest, RecordUpdate, SearchRequest,
+        WatchScope,
     },
     Agent, Artifact, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewTenant, Session, SourceRef, Tenant,
@@ -45,7 +46,7 @@ use agentdb_meta::{
 use crate::dto::{
     AppendAndFetchBody, AppendBody, ChangesQuery, ChangesResponse,
     ContextBody, CreateAgentBody, CreateRecordBody,
-    CreateSessionBody, CreateTenantBody, ExportBackfillBody,
+    CreateSessionBody, CreateTenantBody, EventSearchQuery, EventSearchResponse, ExportBackfillBody,
     ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
     FetchQuery, ForkSessionBody, IncludeDeletedQuery, OpenSessionBody,
     PolicyWorkerRunBody, ReplayQuery, RestoreSessionStorageBody,
@@ -113,6 +114,7 @@ pub fn route_catalog() -> &'static [(Stability, &'static str)] {
         (Core, "/api/tenants/:tenant_id/artifacts/:artifact_id"),
         (Core, "/api/tenants/:tenant_id/artifacts/:artifact_id/blob"),
         (Core, "/api/tenants/:tenant_id/changes"),
+        (Core, "/api/tenants/:tenant_id/events/search"),
         // --- Labs surface (behind `labs`; absent from the quickstart) ---
         (Labs, "/api/tenants/:tenant_id/records"),
         (Labs, "/api/tenants/:tenant_id/records/search"),
@@ -227,6 +229,10 @@ pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
             get(replay_session),
         )
         .route("/api/tenants/:tenant_id/changes", get(changes))
+        .route(
+            "/api/tenants/:tenant_id/events/search",
+            get(search_events),
+        )
         .route(
             "/api/tenants/:tenant_id/exports/backfill",
             post(export_backfill),
@@ -8369,6 +8375,45 @@ async fn get_record(
         .get_record_with_options(&tid, &rid, q.include_deleted)
         .await?;
     Ok(Json(rec))
+}
+
+/// `GET /api/tenants/:tenant_id/events/search`
+///
+/// Scoped, text-only search over the durable event log. This is a core
+/// capability (an agent querying its own past sessions); the record-search
+/// index is a separate Labs feature. Query params:
+/// - `q` (required): whitespace-tokenized, case-insensitive query over event
+///   kind + payload text
+/// - `session_id` / `agent_id` (optional): narrow the scope; omit both to
+///   search the whole tenant
+/// - `kind` (optional): exact event-kind filter
+/// - `limit` (default 20, capped at 100)
+async fn search_events(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Query(query): Query<EventSearchQuery>,
+) -> Result<Json<EventSearchResponse>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let session_id = query
+        .session_id
+        .as_deref()
+        .map(|id| parse_id_or(id, IdKind::Session, ErrorCode::SessionNotFound))
+        .transpose()?;
+    let agent_id = query
+        .agent_id
+        .as_deref()
+        .map(|id| parse_id_or(id, IdKind::Agent, ErrorCode::AgentNotFound))
+        .transpose()?;
+    let req = EventSearchRequest {
+        tenant_id: tid,
+        session_id,
+        agent_id,
+        query: query.q,
+        kind: query.kind,
+        limit: query.limit.clamp(1, 100),
+    };
+    let matches = s.runtime.search_events(req).await?;
+    Ok(Json(EventSearchResponse { matches }))
 }
 
 /// `GET /api/tenants/:tenant_id/records/search`

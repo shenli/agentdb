@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use agentdb_core::record::{IndexingPolicy, RecordStatus};
-use agentdb_core::runtime::{MetadataFilter, RecordSearchMatch};
+use agentdb_core::runtime::{EventSearchMatch, MetadataFilter, RecordSearchMatch};
 use agentdb_core::{ArtifactRef, CredentialRef, SourceRef};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -558,6 +558,33 @@ fn default_context_include() -> Vec<String> {
 #[derive(Debug, Serialize)]
 pub struct SearchRecordsResponse {
     pub matches: Vec<RecordSearchMatch>,
+}
+
+/// Query parameters for `GET /api/tenants/{t}/events/search`. Scope narrows to
+/// a single session (`session_id`) or one agent's sessions (`agent_id`);
+/// omitting both searches the whole tenant.
+#[derive(Debug, Deserialize)]
+pub struct EventSearchQuery {
+    /// Whitespace-tokenized, case-insensitive query over event kind + payload.
+    pub q: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Optional exact `kind` filter.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default = "default_event_search_limit")]
+    pub limit: usize,
+}
+
+fn default_event_search_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Serialize)]
+pub struct EventSearchResponse {
+    pub matches: Vec<EventSearchMatch>,
 }
 
 #[derive(Debug, Deserialize)]

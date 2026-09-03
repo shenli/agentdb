@@ -76,6 +76,11 @@ pub fn is_system_tenant(tenant_id: &str) -> bool {
 const DEFAULT_PERSISTED_HOT_EVENT_CACHE_PER_SESSION: u64 = 2_048;
 static PERSISTED_HOT_EVENT_CACHE_PER_SESSION: OnceLock<u64> = OnceLock::new();
 
+/// Upper bound on events scanned by a single `search_events` request. Event
+/// search is an unindexed scan, so this caps worst-case work; a tenant-wide
+/// query over a larger history is best-effort over the newest events.
+const EVENT_SEARCH_MAX_SCAN: usize = 10_000;
+
 static APPEND_PATH_PROFILE: OnceLock<Option<AppendPathProfile>> = OnceLock::new();
 static SESSION_APPEND_COALESCE_PROFILE: OnceLock<Option<SessionAppendCoalesceProfile>> =
     OnceLock::new();
@@ -9650,6 +9655,32 @@ pub struct RecordSearchMatch {
     pub components: RecordSearchScoreComponents,
 }
 
+/// A scoped, text-only search over the durable event log. Unlike record search
+/// (a Labs index feature), this is a core capability: an agent asking about its
+/// own past sessions. It is an unindexed scan over the events in scope, so
+/// callers narrow with `session_id`/`agent_id` for bounded cost.
+#[derive(Debug, Clone)]
+pub struct EventSearchRequest {
+    pub tenant_id: Id,
+    /// Scope to a single session. Takes precedence over `agent_id`.
+    pub session_id: Option<Id>,
+    /// Scope to one agent's sessions when `session_id` is absent.
+    pub agent_id: Option<Id>,
+    /// Whitespace-tokenized, case-insensitive query matched against event kind
+    /// and payload text. An empty query returns no matches.
+    pub query: String,
+    /// Optional exact `kind` filter applied before text matching.
+    pub kind: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventSearchMatch {
+    pub event: EventEnvelope,
+    /// Number of distinct query tokens present in the event's searchable text.
+    pub score: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 struct CandidateScore {
     score: f32,
@@ -10745,6 +10776,102 @@ impl Runtime {
         }
     }
 
+    /// Scoped, text-only search over the durable event log. Resolves the scope
+    /// sessions (one session, one agent's sessions, or the whole tenant),
+    /// scans their events newest-session-first up to a bounded budget, and
+    /// ranks matches by how many query tokens they contain, then recency.
+    ///
+    /// This is an unindexed scan by design — the event log is the durable
+    /// substrate, and a narrow scope (session/agent) keeps it cheap. The scan
+    /// is bounded by [`EVENT_SEARCH_MAX_SCAN`]; a tenant-wide search over a very
+    /// large history is best-effort over the newest events within that budget.
+    pub async fn search_events(&self, req: EventSearchRequest) -> Result<Vec<EventSearchMatch>> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
+        if req.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tokens: Vec<String> = req
+            .query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Resolve the sessions in scope, newest first, so a bounded scan spends
+        // its budget on the most recent history.
+        let mut sessions: Vec<Session> = if let Some(session_id) = req.session_id.as_ref() {
+            self.ensure_session_cached(&req.tenant_id, session_id).await?;
+            let session = self.get_session(&req.tenant_id, session_id).await?;
+            vec![session]
+        } else {
+            if let Some(agent_id) = req.agent_id.as_ref() {
+                // 404 an unknown agent rather than silently returning nothing.
+                self.get_agent(&req.tenant_id, agent_id).await?;
+            }
+            self.authoritative_tenant_sessions(&req.tenant_id)
+                .await?
+                .into_iter()
+                .filter(|session| {
+                    session.deleted_at_ms.is_none()
+                        && session.tenant_id.as_str() == req.tenant_id.as_str()
+                        && req
+                            .agent_id
+                            .as_ref()
+                            .is_none_or(|agent_id| session.agent_id.as_str() == agent_id.as_str())
+                })
+                .collect()
+        };
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at_ms));
+
+        let mut matches: Vec<EventSearchMatch> = Vec::new();
+        let mut scanned = 0usize;
+        'sessions: for session in sessions {
+            let events = self
+                .fetch_from_seq(FetchRequest {
+                    tenant_id: req.tenant_id.clone(),
+                    session_id: session.session_id.clone(),
+                    from_seq: 0,
+                    limit: usize::MAX,
+                })
+                .await?;
+            for event in events {
+                if scanned >= EVENT_SEARCH_MAX_SCAN {
+                    break 'sessions;
+                }
+                scanned += 1;
+                if event.deleted_at_ms.is_some() {
+                    continue;
+                }
+                if req.kind.as_ref().is_some_and(|kind| &event.kind != kind) {
+                    continue;
+                }
+                let haystack = event_search_haystack(&event);
+                let score = tokens
+                    .iter()
+                    .filter(|token| haystack.contains(token.as_str()))
+                    .count() as u32;
+                if score == 0 {
+                    continue;
+                }
+                matches.push(EventSearchMatch { event, score });
+            }
+        }
+
+        // Rank by token coverage, then recency, then seq for a stable order.
+        matches.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then(right.event.created_at_ms.cmp(&left.event.created_at_ms))
+                .then(right.event.seq.cmp(&left.event.seq))
+        });
+        matches.truncate(req.limit);
+        Ok(matches)
+    }
+
     /// Search the (tenant, namespace) scope and return records only. Call
     /// [`Runtime::search_record_matches`] when ranking/debug metadata is needed.
     pub async fn search_records(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
@@ -11471,6 +11598,15 @@ fn push_budgeted<T: Serialize>(used: &mut usize, max_bytes: usize, value: &T) ->
     }
     *used += bytes;
     true
+}
+
+/// Lowercased searchable text for an event: its `kind` plus its JSON payload
+/// rendered as text. Substring token matching over this powers `search_events`.
+fn event_search_haystack(event: &EventEnvelope) -> String {
+    let mut haystack = event.kind.to_lowercase();
+    haystack.push(' ');
+    haystack.push_str(&event.payload.to_string().to_lowercase());
+    haystack
 }
 
 fn validate_export_include(include: &[String]) -> Result<()> {

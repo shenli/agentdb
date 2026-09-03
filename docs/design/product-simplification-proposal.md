@@ -507,10 +507,11 @@ Answers reflect the inventory; the team should confirm them.
 5. **Can subscribe, watch, and export be one cursor contract?** Yes. The export
    ledger already carries every event in commit order; watch's only unique feature
    is the `fork_edge` item, which the changefeed keeps.
-6. **Does scoped event search belong in core?** Recommended yes, for events only.
-   The persona's payoff is asking an agent about its own past sessions, and that
-   should not require Labs. Record search, vector search, and record indexes stay
-   in Labs.
+6. **Does scoped event search belong in core?** Yes, for events only —
+   **now shipped** as `GET /api/tenants/{t}/events/search` (a scoped, unindexed
+   text scan) plus `search_events`/`searchEvents` in both SDKs. The persona's
+   payoff is asking an agent about its own past sessions, and that should not
+   require Labs. Record search, vector search, and record indexes stay in Labs.
 
 ## Appendix A: Route Classification
 
