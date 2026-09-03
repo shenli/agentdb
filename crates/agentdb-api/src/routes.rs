@@ -31,10 +31,8 @@ use serde::{Deserialize, Serialize};
 use agentdb_core::{
     record::{NewRecord, SearchableRecord},
     runtime::{
-        AckExportConsumerRequest, AppendRequest, ClaimExportConsumerRequest, ContextInclude,
-        ContextRequest, CreateExportConsumerRequest, ExportFeedItem, ExportWatchRequest,
-        FetchRequest, ForkSessionRequest, RecordUpdate, RewindExportConsumerRequest,
-        SearchRequest, WatchRequest, WatchScope,
+        AppendRequest, ContextInclude, ContextRequest, ExportFeedItem, ExportWatchRequest,
+        FetchRequest, ForkSessionRequest, RecordUpdate, SearchRequest, WatchRequest, WatchScope,
     },
     Agent, Artifact, ChangefeedItem, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewTenant, Session, SourceRef, Tenant,
@@ -45,13 +43,12 @@ use agentdb_meta::{
 };
 
 use crate::dto::{
-    AckExportConsumerBody, AppendAndFetchBody, AppendBody, ChangesQuery, ChangesResponse,
-    ClaimExportConsumerBody,
-    ContextBody, CreateAgentBody, CreateExportConsumerBody, CreateRecordBody,
+    AppendAndFetchBody, AppendBody, ChangesQuery, ChangesResponse,
+    ContextBody, CreateAgentBody, CreateRecordBody,
     CreateSessionBody, CreateTenantBody, ExportBackfillBody,
     ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
     ExportWatchResponse, FetchQuery, ForkSessionBody, IncludeDeletedQuery, OpenSessionBody,
-    PolicyWorkerRunBody, ReplayQuery, RestoreSessionStorageBody, RewindExportConsumerBody,
+    PolicyWorkerRunBody, ReplayQuery, RestoreSessionStorageBody,
     SearchRecordsBody, SearchRecordsResponse, SweepBody, TenantMetaBody,
     TransitionSessionLifecycleBody, UpdateRecordBody, WatchQuery,
 };
@@ -239,26 +236,6 @@ pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
             post(export_backfill),
         )
         .route("/api/tenants/:tenant_id/exports/status", get(export_status))
-        .route(
-            "/api/tenants/:tenant_id/exports/consumers",
-            post(create_export_consumer),
-        )
-        .route(
-            "/api/tenants/:tenant_id/exports/consumers/:name",
-            get(get_export_consumer),
-        )
-        .route(
-            "/api/tenants/:tenant_id/exports/consumers/:name/claim",
-            post(claim_export_consumer),
-        )
-        .route(
-            "/api/tenants/:tenant_id/exports/consumers/:name/ack",
-            post(ack_export_consumer),
-        )
-        .route(
-            "/api/tenants/:tenant_id/exports/consumers/:name/rewind",
-            post(rewind_export_consumer),
-        )
         .route(
             "/api/tenants/:tenant_id/artifacts",
             post(create_artifact)
@@ -850,42 +827,19 @@ async fn revoke_admin_token(
 
 async fn get_admin_exports(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     require_single_tablet_export(&s)?;
-    let consumers = s.runtime.list_export_consumer_statuses().await?;
-    let pending_items_total: usize = consumers
-        .iter()
-        .map(|consumer| consumer.pending_items)
-        .sum();
-    let max_lag_ms = consumers
-        .iter()
-        .filter_map(|consumer| consumer.lag_ms)
-        .max();
-    let oldest_pending_created_at_ms = consumers
-        .iter()
-        .filter_map(|consumer| consumer.pending_oldest_created_at_ms)
-        .min();
-    let leased_consumer_count = consumers
-        .iter()
-        .filter(|consumer| consumer.lease_active)
-        .count();
-    let mut tenant_ids = BTreeMap::new();
-    for consumer in &consumers {
-        tenant_ids
-            .entry(consumer.consumer.tenant_id.as_str().to_string())
-            .or_insert_with(|| consumer.consumer.tenant_id.clone());
-    }
-    let mut oldest_retained_cursors = Vec::new();
-    for (tenant_id_string, tenant_id) in tenant_ids {
-        oldest_retained_cursors.push(serde_json::json!({
-            "tenant_id": tenant_id_string,
+    let mut tenants = Vec::new();
+    for tenant in s.runtime.list_tenants().await {
+        let tenant_id = tenant.tenant_id;
+        tenants.push(serde_json::json!({
+            "tenant_id": tenant_id.as_str().to_string(),
+            "high_watermark": s.runtime.export_high_watermark(&tenant_id).await?,
             "oldest_available_cursor": s.runtime.export_oldest_available_cursor(&tenant_id).await?,
-            "high_watermark": s.runtime.export_high_watermark(&tenant_id).await?
         }));
     }
     Ok(Json(serde_json::json!({
         "export_version": "2026-05-14",
         "mode": "durable_ledger",
         "durable_ledger": s.runtime.durable_export_ledger_enabled(),
-        "managed_consumers": true,
         "supported_object_types": [
             "event",
             "tenant",
@@ -894,17 +848,7 @@ async fn get_admin_exports(State(s): State<AppState>) -> Result<Json<serde_json:
             "artifact",
             "record"
         ],
-        "consumer_count": consumers.len(),
-        "metrics": {
-            "consumer_count": consumers.len(),
-            "leased_consumer_count": leased_consumer_count,
-            "unleased_consumer_count": consumers.len().saturating_sub(leased_consumer_count),
-            "pending_items_total": pending_items_total,
-            "max_lag_ms": max_lag_ms,
-            "oldest_pending_created_at_ms": oldest_pending_created_at_ms,
-            "oldest_retained_cursors": oldest_retained_cursors
-        },
-        "consumers": consumers
+        "tenants": tenants
     })))
 }
 
@@ -7470,7 +7414,6 @@ async fn export_status(
         tenant_id,
         mode: "durable_ledger",
         durable_ledger: s.runtime.durable_export_ledger_enabled(),
-        managed_consumers: true,
         supported_object_types: vec![
             "event",
             "tenant",
@@ -7482,106 +7425,6 @@ async fn export_status(
         oldest_available_cursor,
         high_watermark,
     }))
-}
-
-async fn create_export_consumer(
-    State(s): State<AppState>,
-    Path(tenant_id): Path<String>,
-    Json(body): Json<CreateExportConsumerBody>,
-) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
-    require_single_tablet_export(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let session_id = body
-        .session_id
-        .as_deref()
-        .map(|raw| parse_id_or(raw, IdKind::Session, ErrorCode::SessionNotFound))
-        .transpose()?;
-    let agent_id = body
-        .agent_id
-        .as_deref()
-        .map(|raw| parse_id_or(raw, IdKind::Agent, ErrorCode::AgentNotFound))
-        .transpose()?;
-    let consumer = s
-        .runtime
-        .create_export_consumer(CreateExportConsumerRequest {
-            tenant_id: tid,
-            consumer_name: body.name,
-            scope: parse_watch_scope(&body.scope),
-            agent_id,
-            session_id,
-            include: body.include,
-        })
-        .await?;
-    Ok(Json(consumer))
-}
-
-async fn get_export_consumer(
-    State(s): State<AppState>,
-    Path((tenant_id, name)): Path<(String, String)>,
-) -> Result<Json<agentdb_core::runtime::ExportConsumerStatus>, ApiError> {
-    require_single_tablet_export(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    Ok(Json(
-        s.runtime.get_export_consumer_status(&tid, &name).await?,
-    ))
-}
-
-async fn claim_export_consumer(
-    State(s): State<AppState>,
-    Path((tenant_id, name)): Path<(String, String)>,
-    Json(body): Json<ClaimExportConsumerBody>,
-) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
-    require_single_tablet_export(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let consumer = s
-        .runtime
-        .claim_export_consumer(ClaimExportConsumerRequest {
-            tenant_id: tid,
-            consumer_name: name,
-            lease_owner: body.lease_owner,
-            lease_ms: body.lease_ms,
-        })
-        .await?;
-    Ok(Json(consumer))
-}
-
-async fn ack_export_consumer(
-    State(s): State<AppState>,
-    Path((tenant_id, name)): Path<(String, String)>,
-    Json(body): Json<AckExportConsumerBody>,
-) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
-    require_single_tablet_export(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let consumer = s
-        .runtime
-        .ack_export_consumer(AckExportConsumerRequest {
-            tenant_id: tid,
-            consumer_name: name,
-            cursor: body.cursor,
-            snapshot_high_watermark: body.snapshot_high_watermark,
-            lease_owner: body.lease_owner,
-        })
-        .await?;
-    Ok(Json(consumer))
-}
-
-async fn rewind_export_consumer(
-    State(s): State<AppState>,
-    Path((tenant_id, name)): Path<(String, String)>,
-    Json(body): Json<RewindExportConsumerBody>,
-) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
-    require_single_tablet_export(&s)?;
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let consumer = s
-        .runtime
-        .rewind_export_consumer(RewindExportConsumerRequest {
-            tenant_id: tid,
-            consumer_name: name,
-            cursor: body.cursor,
-            lease_owner: body.lease_owner,
-        })
-        .await?;
-    Ok(Json(consumer))
 }
 
 fn require_single_tablet_export(s: &AppState) -> Result<(), ApiError> {

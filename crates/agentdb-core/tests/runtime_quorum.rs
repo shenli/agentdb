@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use agentdb_core::record::{IndexingMode, IndexingPolicy, NewRecord, RecordStatus};
 use agentdb_core::runtime::{
-    AckExportConsumerRequest, AppendRequest, CreateExportConsumerRequest, ExportWatchRequest,
-    RecordUpdate, Runtime, SearchRequest, WatchScope,
+    AppendRequest, ExportWatchRequest, RecordUpdate, Runtime, SearchRequest, WatchScope,
 };
 use agentdb_core::tenant::NewTenant;
 use agentdb_core::{NewAgent, NewSession, RUNTIME_PRIMARY_TABLET_ID};
@@ -795,37 +794,6 @@ async fn runtime_tablet_snapshot_preserves_export_ledger_high_watermark_and_cons
             assert_eq!(feed.len(), 1);
             assert_eq!(feed[0].item.data["kind"], "snapshot-event");
 
-            seed_runtime
-                .create_export_consumer(CreateExportConsumerRequest {
-                    tenant_id: tenant.tenant_id.clone(),
-                    consumer_name: "clickhouse".into(),
-                    scope: WatchScope::Tenant,
-                    agent_id: None,
-                    session_id: None,
-                    include: vec!["events".into()],
-                })
-                .await
-                .unwrap();
-            seed_runtime
-                .ack_export_consumer(AckExportConsumerRequest {
-                    tenant_id: tenant.tenant_id.clone(),
-                    consumer_name: "clickhouse".into(),
-                    cursor: Some(feed[0].cursor.clone()),
-                    snapshot_high_watermark: Some(feed[0].cursor.clone()),
-                    lease_owner: None,
-                })
-                .await
-                .unwrap();
-            let status = seed_runtime
-                .get_export_consumer_status(&tenant.tenant_id, "clickhouse")
-                .await
-                .unwrap();
-            assert_eq!(status.pending_items, 0);
-            assert_eq!(
-                status.high_watermark.as_deref(),
-                Some(feed[0].cursor.as_str())
-            );
-
             let high_watermark = seed_runtime
                 .export_high_watermark(&tenant.tenant_id)
                 .await
@@ -885,29 +853,6 @@ async fn runtime_tablet_snapshot_preserves_export_ledger_high_watermark_and_cons
             assert_eq!(restored_feed.len(), 1);
             assert_eq!(restored_feed[0].cursor, event_cursor);
             assert_eq!(restored_feed[0].item.data["kind"], "snapshot-event");
-
-            let restored_consumer = restored_runtime
-                .get_export_consumer(&tenant.tenant_id, "clickhouse")
-                .await
-                .unwrap();
-            assert_eq!(
-                restored_consumer.last_acked_cursor.as_deref(),
-                Some(event_cursor.as_str())
-            );
-            assert_eq!(
-                restored_consumer.snapshot_high_watermark.as_deref(),
-                Some(event_cursor.as_str())
-            );
-
-            let restored_status = restored_runtime
-                .get_export_consumer_status(&tenant.tenant_id, "clickhouse")
-                .await
-                .unwrap();
-            assert_eq!(restored_status.pending_items, 0);
-            assert_eq!(
-                restored_status.high_watermark.as_deref(),
-                Some(event_cursor.as_str())
-            );
         })
         .await;
 }

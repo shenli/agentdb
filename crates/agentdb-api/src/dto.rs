@@ -186,44 +186,6 @@ pub struct ExportBackfillBody {
     pub limit: usize,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CreateExportConsumerBody {
-    pub name: String,
-    #[serde(default = "default_watch_scope")]
-    pub scope: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub agent_id: Option<String>,
-    #[serde(default)]
-    pub include: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ClaimExportConsumerBody {
-    pub lease_owner: String,
-    #[serde(default = "default_export_lease_ms")]
-    pub lease_ms: u64,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct AckExportConsumerBody {
-    #[serde(default)]
-    pub cursor: Option<String>,
-    #[serde(default)]
-    pub snapshot_high_watermark: Option<String>,
-    #[serde(default)]
-    pub lease_owner: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct RewindExportConsumerBody {
-    #[serde(default)]
-    pub cursor: Option<String>,
-    #[serde(default)]
-    pub lease_owner: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct ExportWatchResponse {
     pub items: Vec<ExportEnvelope>,
@@ -253,7 +215,6 @@ pub struct ExportStatusResponse {
     pub tenant_id: String,
     pub mode: &'static str,
     pub durable_ledger: bool,
-    pub managed_consumers: bool,
     pub supported_object_types: Vec<&'static str>,
     pub oldest_available_cursor: Option<String>,
     pub high_watermark: Option<String>,
@@ -420,10 +381,6 @@ pub(crate) fn default_max_bytes() -> usize {
 
 fn default_fetch_limit() -> usize {
     100
-}
-
-fn default_export_lease_ms() -> u64 {
-    30_000
 }
 
 fn default_restore_target() -> String {

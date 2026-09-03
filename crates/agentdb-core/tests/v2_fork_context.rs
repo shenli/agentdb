@@ -1,7 +1,6 @@
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{
-    AckExportConsumerRequest, AppendRequest, ClaimExportConsumerRequest, ContextInclude,
-    ContextRequest, CreateExportConsumerRequest, ExportWatchRequest, FetchRequest,
+    AppendRequest, ContextInclude, ContextRequest, ExportWatchRequest, FetchRequest,
     ForkSessionRequest, Runtime, RuntimeRouteContext, SearchRequest, WatchRequest, WatchScope,
 };
 use agentdb_core::{NewAgent, NewSession, NewTenant, RUNTIME_PRIMARY_TABLET_ID};
@@ -549,88 +548,6 @@ async fn watch_cursor_includes_tablet_context_and_applied_index() {
         .await
         .unwrap();
     assert!(resumed_without_route_context.is_empty());
-}
-
-#[tokio::test]
-async fn export_consumers_survive_kv_rehydrate() {
-    let kv = Arc::new(InMemoryKvStore::new());
-    let content = Arc::new(InMemoryContentBackend::default());
-    let rt = Runtime::with_kv(kv.clone(), content.clone());
-    let tenant = rt
-        .create_tenant(NewTenant {
-            external_key: "export-consumer".into(),
-            policy: serde_json::json!({}),
-        })
-        .await
-        .unwrap();
-    let feed = rt
-        .export_watch(ExportWatchRequest {
-            tenant_id: tenant.tenant_id.clone(),
-            scope: WatchScope::Tenant,
-            session_id: None,
-            agent_id: None,
-            include: vec!["tenants".into()],
-            from_cursor: None,
-            limit: 10,
-        })
-        .await
-        .unwrap();
-    assert_eq!(feed.len(), 1);
-    let cursor = feed[0].cursor.clone();
-    let consumer = rt
-        .create_export_consumer(CreateExportConsumerRequest {
-            tenant_id: tenant.tenant_id.clone(),
-            consumer_name: "clickhouse".into(),
-            scope: WatchScope::Tenant,
-            agent_id: None,
-            session_id: None,
-            include: vec!["tenants".into()],
-        })
-        .await
-        .unwrap();
-    assert_eq!(consumer.consumer_name, "clickhouse");
-
-    rt.claim_export_consumer(ClaimExportConsumerRequest {
-        tenant_id: tenant.tenant_id.clone(),
-        consumer_name: "clickhouse".into(),
-        lease_owner: "worker-a".into(),
-        lease_ms: 60_000,
-    })
-    .await
-    .unwrap();
-    let fabricated = rt
-        .ack_export_consumer(AckExportConsumerRequest {
-            tenant_id: tenant.tenant_id.clone(),
-            consumer_name: "clickhouse".into(),
-            cursor: Some("v2:0001".into()),
-            snapshot_high_watermark: None,
-            lease_owner: Some("worker-a".into()),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(fabricated.code, agentdb_core::ErrorCode::InvalidCursor);
-    rt.ack_export_consumer(AckExportConsumerRequest {
-        tenant_id: tenant.tenant_id.clone(),
-        consumer_name: "clickhouse".into(),
-        cursor: None,
-        snapshot_high_watermark: Some(cursor.clone()),
-        lease_owner: Some("worker-a".into()),
-    })
-    .await
-    .unwrap();
-
-    let hydrated = Runtime::with_kv(kv, content);
-    let loaded = hydrated
-        .get_export_consumer(&tenant.tenant_id, "clickhouse")
-        .await
-        .unwrap();
-    assert_eq!(loaded.scope, WatchScope::Tenant);
-    assert_eq!(loaded.last_acked_cursor.as_deref(), Some(cursor.as_str()));
-    assert_eq!(
-        loaded.snapshot_high_watermark.as_deref(),
-        Some(cursor.as_str())
-    );
-    assert_eq!(loaded.lease_owner.as_deref(), Some("worker-a"));
 }
 
 #[tokio::test]

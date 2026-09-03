@@ -59,7 +59,7 @@ use crate::artifact::Artifact;
 use crate::event::EventEnvelope;
 use crate::idempotency::IdempotencyRecord;
 use crate::record::SearchableRecord;
-use crate::runtime::{ExportConsumer, ExportLedgerItem, TenantMetaEntry};
+use crate::runtime::{ExportLedgerItem, TenantMetaEntry};
 use crate::segment::SessionSegment;
 use crate::session::Session;
 use crate::tenant::Tenant;
@@ -86,10 +86,6 @@ fn append_log_session_prefix(tenant_id: &str, session_id: &str) -> String {
 
 fn append_log_tenant_prefix(tenant_id: &str) -> String {
     format!("append_log/{tenant_id}/")
-}
-
-fn export_consumer_key(tenant_id: &str, consumer_name: &str) -> String {
-    format!("record/export_consumer/{tenant_id}/{consumer_name}")
 }
 
 static EXPORT_LEDGER_PENDING_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -2877,28 +2873,6 @@ impl Persist {
         let rec: IdempotencyRecord = serde_json::from_slice(&raw)
             .map_err(|err| StorageError::Other(format!("idempotency record decodes: {err}")))?;
         Ok(Some(rec))
-    }
-
-    pub async fn put_export_consumer_async(&self, consumer: &ExportConsumer) -> KvResult<()> {
-        self.write_ops_async(vec![WriteOp::Put {
-            key: export_consumer_key(consumer.tenant_id.as_str(), consumer.consumer_name.as_str())
-                .into_bytes(),
-            value: serde_json::to_vec(consumer).expect("export consumer serializes"),
-        }])
-        .await
-    }
-
-    pub fn scan_all_export_consumers(&self) -> KvResult<Vec<ExportConsumer>> {
-        let prefix = b"record/export_consumer/";
-        let iter = self.kv.scan_prefix(prefix)?;
-        let mut out = Vec::new();
-        for res in iter {
-            let (_k, v) = res?;
-            let consumer: ExportConsumer =
-                serde_json::from_slice(&v).expect("export consumer decodes");
-            out.push(consumer);
-        }
-        Ok(out)
     }
 
     /// Atomic write of a V2.2 searchable record's primary row plus the
