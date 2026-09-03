@@ -172,7 +172,7 @@ def assert_watch_contains(tenant_id, session_id, expected):
 def assert_export_contains(tenant_id, session_id, expected):
     page = request(
         "GET",
-        f"/api/tenants/{tenant_id}/exports/watch?scope=session&session_id={session_id}&include=events&limit=100",
+        f"/api/tenants/{tenant_id}/changes?scope=session&session_id={session_id}&include=events&limit=100",
     )
     items = page.get("items", [])
     seqs = {

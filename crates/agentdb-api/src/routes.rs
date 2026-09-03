@@ -47,7 +47,7 @@ use crate::dto::{
     ContextBody, CreateAgentBody, CreateRecordBody,
     CreateSessionBody, CreateTenantBody, ExportBackfillBody,
     ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
-    ExportWatchResponse, FetchQuery, ForkSessionBody, IncludeDeletedQuery, OpenSessionBody,
+    FetchQuery, ForkSessionBody, IncludeDeletedQuery, OpenSessionBody,
     PolicyWorkerRunBody, ReplayQuery, RestoreSessionStorageBody,
     SearchRecordsBody, SearchRecordsResponse, SweepBody, TenantMetaBody,
     TransitionSessionLifecycleBody, UpdateRecordBody, WatchQuery,
@@ -133,7 +133,6 @@ pub fn route_catalog() -> &'static [(Stability, &'static str)] {
         (Internal, "/api/tenants/:tenant_id/agents"),
         (Internal, "/api/tenants/:tenant_id/meta/:key"),
         (Internal, "/api/tenants/:tenant_id/watch"),
-        (Internal, "/api/tenants/:tenant_id/exports/watch"),
         (Internal, "/api/admin/tokens"),
         (Internal, "/api/admin/backups"),
         (Internal, "/api/admin/recovery"),
@@ -230,7 +229,6 @@ pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
         )
         .route("/api/tenants/:tenant_id/changes", get(changes))
         .route("/api/tenants/:tenant_id/watch", get(watch))
-        .route("/api/tenants/:tenant_id/exports/watch", get(export_watch))
         .route(
             "/api/tenants/:tenant_id/exports/backfill",
             post(export_backfill),
@@ -7035,47 +7033,6 @@ async fn changes(
             complete: None,
         }));
     }
-}
-
-async fn export_watch(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-    Path(tenant_id): Path<String>,
-    Query(q): Query<WatchQuery>,
-) -> Result<Json<ExportWatchResponse>, ApiError> {
-    require_single_tablet_export(&s)?;
-    let req = export_watch_request_from_query(&tenant_id, q)?;
-    let req_tenant_id = req.tenant_id.clone();
-    let runtime = s.runtime.clone();
-    let high_watermark = runtime.export_high_watermark(&req_tenant_id).await?;
-    let through_cursor = high_watermark.clone();
-    let items = with_route_tablet_context(runtime.clone(), &headers, async move {
-        match through_cursor.as_deref() {
-            Some(through_cursor) => {
-                runtime
-                    .export_watch_through(req, Some(through_cursor))
-                    .await
-            }
-            None => Ok(Vec::new()),
-        }
-    })
-    .await?;
-    let observed_at_ms = current_ms();
-    let envelopes = items
-        .into_iter()
-        .map(|item| export_envelope_from_changefeed(item, observed_at_ms))
-        .collect::<Result<Vec<_>, _>>()?;
-    let next_cursor = envelopes.last().map(|item| item.cursor.clone());
-    let oldest_available_cursor = s
-        .runtime
-        .export_oldest_available_cursor(&req_tenant_id)
-        .await?;
-    Ok(Json(ExportWatchResponse {
-        high_watermark,
-        next_cursor,
-        oldest_available_cursor,
-        items: envelopes,
-    }))
 }
 
 async fn export_backfill(
