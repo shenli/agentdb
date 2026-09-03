@@ -76,7 +76,7 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
 `data.payload` with a SHA-256 fingerprint, and `drop` writes a null payload.
 `--metrics-output` is refreshed after each processed batch and includes rows,
 filtered items, sink insert rows, retry attempts, rows per second, and the last
-cursor. Use `status --consumer` for AgentDB-side lag and lease state.
+cursor. Use `status --consumer` for AgentDB-side lag and the checkpoint cursor.
 
 ## Local Exporter Baseline
 
@@ -97,8 +97,8 @@ network round trips, projection mode, payload size, and batch sizing.
 ## Expected Performance Model
 
 The exporter is outside the hot append path. Runtime writes commit to AgentDB
-first; export workers later read durable envelopes, transform them, write the
-sink, and ack the managed consumer cursor.
+first; export workers later read the changefeed, transform the envelopes, write
+the sink, and advance the client-side checkpoint cursor.
 
 ```text
 throughput = min(source_read,
@@ -132,7 +132,7 @@ Expected single-node shape:
 | Large payloads or heavy redaction/hash | CPU/network-bound | seconds possible |
 
 Cluster throughput scales by tenant and consumer parallelism, not by making one
-consumer infinitely fast. One tenant/consumer remains ordered and acked
+consumer infinitely fast. One tenant/consumer remains ordered and checkpointed
 serially. Many tenants can be exported by multiple workers across nodes or
 cells until ClickHouse ingest, network, or exporter CPU becomes the shared
 bottleneck.
@@ -147,13 +147,13 @@ Recommended initial SLO targets:
 |---|---:|
 | Export freshness, same-AZ sink | p95 under 2s |
 | Export freshness, remote sink | p95 under 5s |
-| Failover RTO | `lease_ms + poll_interval_ms + insert_time` |
+| Failover RTO | `restart_time + poll_interval_ms + insert_time` |
 | RPO | zero for committed events retained in the export ledger |
 
-With the default `lease_ms=30000` and `poll_interval_ms=1000`, exporter
-failover RTO is roughly 31s plus the active insert time. Faster HA is possible
-with shorter leases, but the lease must stay comfortably above ClickHouse insert
-p99 so healthy workers do not lose ownership during slow batches.
+With a single supervised exporter, failover RTO is the process restart time
+plus one poll interval plus the active insert time; on restart the exporter
+resumes from its client-side checkpoint, so no committed rows are skipped or
+double-inserted beyond the in-flight batch.
 
 Future real-world tests should cover persistent AgentDB, AWS ClickHouse or
 ClickHouse Cloud, 1/10/100 tenants, many sessions per tenant, payload sizes of
@@ -281,7 +281,7 @@ The current implementation exports event and runtime metadata envelopes from
 durable `ledger:...` cursors; in-memory/dev runtimes return `v2:...` event
 watch cursors. It is suitable for local validation of schema, ClickHouse
 reachability, cursor resume, metadata snapshot backfill, tombstone handling,
-consumer leases, JSONL archival, and dashboard queries.
+checkpoint persistence, JSONL archival, and dashboard queries.
 
 `--mode otel` writes event-derived rows into `agentdb_otel_logs` and
 `agentdb_otel_traces` only. `--mode native,otel` writes the native raw/event
@@ -293,36 +293,39 @@ ClickStack itself can be run as the full ClickHouse-provided stack or as
 HyperDX against an existing ClickHouse database. The AgentDB path is deliberately
 direct-to-ClickHouse: AgentDB exports the rows, and HyperDX reads the
 ClickStack-compatible views. This keeps AgentDB appends independent from the
-OpenTelemetry Collector and preserves the managed export-consumer ack boundary.
+OpenTelemetry Collector and preserves the exporter's checkpoint boundary.
 
-## HA Connector Pattern
+## Resume And Availability
 
-Run two or more tailing workers with the same consumer name and distinct lease
-owners:
+The exporter reads the tenant changefeed (`GET /api/tenants/{t}/changes`) and
+holds its own resume cursor: after each written batch it upserts the batch's
+`next_cursor` into the `agentdb_export_checkpoints` ClickHouse table, keyed by
+`(consumer, tenant_id)`. On restart it seeds from that checkpoint, so a crash or
+redeploy resumes exactly where it left off — no server-side consumer or lease.
 
 ```text
-                 same consumer: prod-clickhouse
+                 consumer name = checkpoint key: prod-clickhouse
 
-  worker-a  ---- claim lease ----> AgentDB export consumer
-      |                              last_acked_cursor
-      | insert then ack              lease_owner=worker-a
+  exporter  ---- GET /changes?from_cursor=... ----> AgentDB (stateless changefeed)
+      |            (resume cursor from the checkpoint table)
+      | insert batch, then upsert checkpoint
       v
-  ClickHouse
-
-  worker-b  ---- standby claim after lease expiry
+  ClickHouse: <data tables> + agentdb_export_checkpoints(consumer, tenant_id, cursor)
 ```
 
 Recommended production shape:
 
-- Use `--consumer prod-clickhouse` for every worker that feeds the same
-  ClickHouse tables.
-- Set a unique `--lease-owner`, for example the pod name or instance id.
-- Keep `--lease-ms` comfortably above expected ClickHouse insert latency.
+- Run **one exporter per `(consumer, tenant)`**. Two exporters sharing a
+  consumer name and tenant would race the same checkpoint row (last write wins)
+  and double-insert; partition by tenant or by consumer name instead.
+- For failover, run a single active instance under a supervisor (systemd,
+  Kubernetes Deployment with `replicas: 1`); on restart it resumes from the
+  checkpoint. RTO is restart time plus one poll interval.
 - Use `--max-retries` and `--retry-initial-backoff-ms` to absorb transient
   ClickHouse failures. Retries reuse a stable per-table batch id derived from
   the exported cursor range.
-- Alert on increasing `lag_ms`, `pending_items`, expired leases, and stale
-  `high_watermark`.
+- Alert on a growing gap between the checkpoint cursor and the changefeed
+  `high_watermark` (visible via `status`), and on export error rate.
 - Never ack before ClickHouse accepts the batch. The ClickHouse tables use
   stable ids so retrying an already inserted batch is safe.
 

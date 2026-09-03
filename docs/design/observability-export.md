@@ -181,8 +181,9 @@ should be easy for humans and reliable for coding agents.
 
 ### Agent Experience
 
-- Every command supports `--output json`.
-- `doctor --output json` returns stable machine-readable check IDs:
+- Every command supports `-o json` (the global output-format flag; the long
+  form is `--format json`, since `--output` names the export sink path).
+- `doctor -o json` returns stable machine-readable check IDs:
   `agentdb_reachable`, `clickhouse_reachable`, `schema_current`,
   `can_insert`, `can_query`, `consumer_cursor_valid`, `lag_within_slo`.
 - Errors carry stable codes and remediation text.
@@ -1051,7 +1052,7 @@ formalized.
 - Cursor expiry returns a structured error.
 - Tenant/agent/session scopes never leak cross-tenant data.
 - Restore and tablet movement preserve or rebuild export cursor state.
-- `agentdbctl export clickhouse doctor --output json` remains stable.
+- `agentdbctl export clickhouse doctor -o json` remains stable.
 - ClickHouse schema migrations are idempotent.
 - ClickHouse connector crash after insert but before ack does not create
   duplicate query-facing rows after restart.
