@@ -69,6 +69,7 @@ Health and admin:
 ```text
 GET  /health/live
 GET  /health/ready
+GET  /metrics
 GET  /api/admin/tokens
 POST /api/admin/tokens
 DELETE /api/admin/tokens/{token_id}
@@ -105,6 +106,14 @@ returns `503 Service Unavailable` while the local node is draining or cluster
 routing state is unsafe; use readiness to remove a node from traffic and
 liveness only to decide whether the process should be restarted. Neither
 endpoint requires API authentication.
+
+`/metrics` serves Prometheus text-format runtime metrics (also unauthenticated,
+outside `/api/`): `agentdb_up`, `agentdb_build_info`, fleet gauges
+(`agentdb_tenants`, `agentdb_sessions`, `agentdb_active_sessions`,
+`agentdb_sessions_by_lifecycle{lifecycle=...}`), sealed/archived byte counts, and
+the advisory disk budget (`agentdb_disk_budget_bytes` / `agentdb_disk_used_bytes`).
+The fleet summary enumerates sessions and the disk gauge walks the data dir, so
+keep the scrape interval modest on large single-node fleets.
 
 Node maintenance body:
 

@@ -131,6 +131,7 @@ pub fn route_catalog() -> &'static [(Stability, &'static str)] {
         (Labs, "/api/tenants/:tenant_id/policy/lifecycle-sweep"),
         (Labs, "/api/tenants/:tenant_id/policy/gc-sweep"),
         // --- Internal / operator machinery (no SDK or quickstart obligation) ---
+        (Internal, "/metrics"),
         (Internal, "/api/tenants"),
         (Internal, "/api/tenants/:tenant_id/agents"),
         (Internal, "/api/tenants/:tenant_id/meta/:key"),
@@ -148,6 +149,7 @@ pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
     let mut router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
+        .route("/metrics", get(metrics))
         .route(
             "/api/admin/tokens",
             get(list_admin_tokens).post(mint_admin_token),
@@ -499,6 +501,90 @@ async fn health_ready(State(s): State<AppState>) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+/// `GET /metrics` — Prometheus text-format runtime metrics (operator machinery;
+/// unauthenticated like `/health`, since it is outside `/api/`). Exposes fleet
+/// counts, lifecycle distribution, sealed/archived bytes, and the advisory disk
+/// budget. The fleet summary enumerates sessions and the disk gauge walks the
+/// data dir, so keep the scrape interval modest on large single-node fleets.
+async fn metrics(State(s): State<AppState>) -> impl axum::response::IntoResponse {
+    use std::fmt::Write as _;
+
+    let summary = s.runtime.fleet_storage_summary().await;
+    let budget = s.disk_budget_bytes;
+    let paths = s.disk_usage_paths.clone();
+    let used = tokio::task::spawn_blocking(move || paths.iter().map(|p| dir_size_bytes(p)).sum::<u64>())
+        .await
+        .unwrap_or(0);
+    let lc = &summary.lifecycle_counts;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP agentdb_up 1 when the server is serving.");
+    let _ = writeln!(out, "# TYPE agentdb_up gauge");
+    let _ = writeln!(out, "agentdb_up 1");
+    let _ = writeln!(out, "# HELP agentdb_build_info Build information.");
+    let _ = writeln!(out, "# TYPE agentdb_build_info gauge");
+    let _ = writeln!(
+        out,
+        "agentdb_build_info{{version=\"{}\"}} 1",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    for (name, help, value) in [
+        ("agentdb_tenants", "Number of tenants.", summary.tenant_count as u64),
+        ("agentdb_sessions", "Number of sessions.", summary.session_count as u64),
+        (
+            "agentdb_active_sessions",
+            "Number of active sessions.",
+            summary.active_session_count as u64,
+        ),
+        (
+            "agentdb_sealed_segments",
+            "Number of sealed log segments.",
+            summary.sealed_segment_count as u64,
+        ),
+        (
+            "agentdb_archive_manifests",
+            "Number of archive manifests.",
+            summary.archive_manifest_count as u64,
+        ),
+        ("agentdb_sealed_bytes", "Bytes in sealed segments.", summary.sealed_bytes),
+        ("agentdb_archived_bytes", "Bytes in archives.", summary.archived_bytes),
+        (
+            "agentdb_disk_budget_bytes",
+            "Advisory disk budget in bytes (0 = unset).",
+            budget,
+        ),
+        (
+            "agentdb_disk_used_bytes",
+            "Measured on-disk size of the data directories.",
+            used,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} gauge");
+        let _ = writeln!(out, "{name} {value}");
+    }
+
+    let _ = writeln!(out, "# HELP agentdb_sessions_by_lifecycle Sessions by lifecycle tier.");
+    let _ = writeln!(out, "# TYPE agentdb_sessions_by_lifecycle gauge");
+    for (tier, value) in [
+        ("warm", lc.warm),
+        ("cold", lc.cold),
+        ("archive", lc.archive),
+        ("derivative_only", lc.derivative_only),
+    ] {
+        let _ = writeln!(out, "agentdb_sessions_by_lifecycle{{lifecycle=\"{tier}\"}} {value}");
+    }
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
 }
 
 #[derive(Debug, Deserialize)]
