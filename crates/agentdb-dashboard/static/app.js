@@ -96,18 +96,22 @@ function bindSearchControls() {
   // empty. Re-run the current view's loaders (debounced) once a token is typed.
   const tokenEl = $("token");
   if (tokenEl) {
+    const reloadForToken = () => {
+      if (!tokenEl.value.trim()) return;
+      if (isSessionView()) {
+        loadSessionView();
+      } else {
+        loadOverview();
+      }
+    };
     let tokenReloadTimer = null;
+    // `input` (debounced) covers typing/paste; `change` covers blur and
+    // password-manager autofill, which may not fire `input`.
     tokenEl.addEventListener("input", () => {
       if (tokenReloadTimer) clearTimeout(tokenReloadTimer);
-      tokenReloadTimer = setTimeout(() => {
-        if (!tokenEl.value.trim()) return;
-        if (isSessionView()) {
-          loadSessionView();
-        } else {
-          loadOverview();
-        }
-      }, 400);
+      tokenReloadTimer = setTimeout(reloadForToken, 400);
     });
+    tokenEl.addEventListener("change", reloadForToken);
   }
 }
 
@@ -937,8 +941,39 @@ function empty(text) {
 }
 
 function fail(err) {
+  const message = String(err && err.message ? err.message : err);
+  // On a token-secured instance the dashboard's eager load runs before a token
+  // is entered, so it 401s. Show a prompt (not a raw error), and reveal the
+  // Bearer token field — it lives inside the collapsed "Advanced API controls"
+  // section, so it's easy to miss. Entering the token reloads (see
+  // bindSearchControls).
+  if (/^401\b/.test(message) && !$("token").value.trim()) {
+    setConnection("enter token");
+    setRaw(
+      "This instance requires a bearer token. Paste it into the Bearer token field (just revealed) to connect."
+    );
+    revealTokenField();
+    return;
+  }
   setConnection("error");
-  setRaw(String(err && err.message ? err.message : err));
+  setRaw(message);
+}
+
+let tokenFieldRevealed = false;
+// Open the collapsed "Advanced API controls" section and focus the token field,
+// once, so a first-time visitor to a secured instance can find where to
+// authenticate instead of staring at a 401.
+function revealTokenField() {
+  if (tokenFieldRevealed) return;
+  tokenFieldRevealed = true;
+  const tokenEl = $("token");
+  if (!tokenEl) return;
+  const details = tokenEl.closest("details");
+  if (details) details.open = true;
+  try {
+    tokenEl.scrollIntoView({ block: "center", behavior: "smooth" });
+  } catch (_) {}
+  tokenEl.focus();
 }
 
 function setConnection(text) {
