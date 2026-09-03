@@ -94,16 +94,6 @@ def _runtime_version_from_dict(d: dict) -> str:
     return ""
 
 
-@dataclasses.dataclass
-class WatchItem:
-    cursor: str
-    event: Event
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "WatchItem":
-        return cls(cursor=d["cursor"], event=Event.from_dict(d["event"]))
-
-
 class AgentDB:
     """Developer-friendly AgentDB entry point.
 
@@ -316,24 +306,6 @@ class Workspace:
         agent_id: Optional[AgentId] = None,
     ) -> "SessionHandle":
         return self.session(session_id, agent_id=agent_id)
-
-    def watch(
-        self,
-        *,
-        scope: str = "tenant",
-        session_id: Optional[SessionId] = None,
-        agent_id: Optional[AgentId] = None,
-        from_cursor: Optional[str] = None,
-        limit: int = 100,
-    ) -> List[WatchItem]:
-        return self._client.watch(
-            self.tenant_id,
-            scope=scope,
-            session_id=session_id,
-            agent_id=agent_id,
-            from_cursor=from_cursor,
-            limit=limit,
-        )
 
     def changes(
         self,
@@ -811,29 +783,6 @@ class Client:
         body = self._with_record_commit_seq(tenant_id, body)
         data = self._request("POST", f"/api/tenants/{_quote(tenant_id)}/records/search", json=body)
         return data.get("matches", [])
-
-    def watch(
-        self,
-        tenant_id: TenantId,
-        *,
-        scope: str = "tenant",
-        session_id: Optional[SessionId] = None,
-        agent_id: Optional[AgentId] = None,
-        from_cursor: Optional[str] = None,
-        limit: int = 100,
-    ) -> List[WatchItem]:
-        params = {
-            "scope": scope,
-            "limit": str(limit),
-        }
-        if session_id:
-            params["session_id"] = session_id
-        if agent_id:
-            params["agent_id"] = agent_id
-        if from_cursor:
-            params["from_cursor"] = from_cursor
-        data = self._request("GET", f"/api/tenants/{_quote(tenant_id)}/watch", params=params)
-        return [WatchItem.from_dict(item) for item in data]
 
     def changes(
         self,

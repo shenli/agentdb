@@ -158,17 +158,6 @@ def item_seq(item):
             return event["seq"]
     return None
 
-def assert_watch_contains(tenant_id, session_id, expected):
-    items = request(
-        "GET",
-        f"/api/tenants/{tenant_id}/watch?scope=session&session_id={session_id}&limit=100",
-    )
-    seqs = {item_seq(item) for item in items}
-    missing = [seq for seq in expected if seq not in seqs]
-    if missing:
-        raise AssertionError(f"watch missing seqs {missing}; response={items}")
-    return items
-
 def assert_export_contains(tenant_id, session_id, expected):
     page = request(
         "GET",
@@ -239,7 +228,6 @@ if phase == "old-write":
     append_event(tenant_id, agent_id, session_id, 0, "old")
     append_event(tenant_id, agent_id, session_id, 1, "old")
     events = assert_events(tenant_id, session_id, [0, 1])
-    assert_watch_contains(tenant_id, session_id, [0, 1])
     assert_export_contains(tenant_id, session_id, [0, 1])
     state = {
         "tenant_external_key": tenant_external_key,
@@ -259,19 +247,15 @@ elif phase == "new-verify":
     agent_id = state["agent_id"]
     session_id = state["session_id"]
     before = assert_events(tenant_id, session_id, [0, 1])
-    assert_watch_contains(tenant_id, session_id, [0, 1])
     assert_export_contains(tenant_id, session_id, [0, 1])
     append_event(tenant_id, agent_id, session_id, 2, "new")
     after = assert_events(tenant_id, session_id, [0, 1, 2])
-    assert_watch_contains(tenant_id, session_id, [0, 1, 2])
     assert_export_contains(tenant_id, session_id, [0, 1, 2])
     sdk_result = assert_python_sdk_compat(state, [0, 1, 2])
     assert_events(tenant_id, session_id, [0, 1, 2, 3])
-    assert_watch_contains(tenant_id, session_id, [0, 1, 2, 3])
     assert_export_contains(tenant_id, session_id, [0, 1, 2, 3])
     final_expected = [0, 1, 2, 3]
     final_events = assert_events(tenant_id, session_id, final_expected)
-    assert_watch_contains(tenant_id, session_id, final_expected)
     assert_export_contains(tenant_id, session_id, final_expected)
     write_metrics(
         state,

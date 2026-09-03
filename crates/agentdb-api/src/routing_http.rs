@@ -1285,7 +1285,7 @@ mod tests {
         let mut incoming = HeaderMap::new();
         insert_header(&mut incoming, HDR_FORWARDED_FOR, "edge-a");
 
-        let req = prepare_forward_request(&target, "/api/tenants/ten_1/watch", &incoming, "node-b")
+        let req = prepare_forward_request(&target, "/api/tenants/ten_1/changes", &incoming, "node-b")
             .unwrap();
 
         assert_eq!(
@@ -1303,7 +1303,7 @@ mod tests {
         let mut incoming = HeaderMap::new();
         insert_header(&mut incoming, HDR_FORWARDED_BY, "node-a");
 
-        let err = prepare_forward_request(&target, "/api/tenants/ten_1/watch", &incoming, "node-b")
+        let err = prepare_forward_request(&target, "/api/tenants/ten_1/changes", &incoming, "node-b")
             .unwrap_err();
 
         assert_eq!(err.status, StatusCode::MISDIRECTED_REQUEST);
@@ -1318,7 +1318,7 @@ mod tests {
     #[test]
     fn route_runtime_disabled_serves_local_without_headers() {
         let runtime = RouteRuntime::disabled();
-        let outcome = runtime.guard("/api/tenants/ten_1/watch", &HeaderMap::new());
+        let outcome = runtime.guard("/api/tenants/ten_1/changes", &HeaderMap::new());
 
         let RouteGuardOutcome::ServeLocal(headers) = outcome else {
             panic!("expected local");
@@ -1329,12 +1329,12 @@ mod tests {
     #[test]
     fn route_runtime_fixed_forward_prepares_request() {
         let runtime = RouteRuntime::fixed("node-local", decision(RouteAction::Forward, None));
-        let outcome = runtime.guard("/api/tenants/ten_1/watch", &HeaderMap::new());
+        let outcome = runtime.guard("/api/tenants/ten_1/changes", &HeaderMap::new());
 
         let RouteGuardOutcome::Forward(req) = outcome else {
             panic!("expected forward");
         };
-        assert_eq!(req.uri, "http://node-a:8080/api/tenants/ten_1/watch");
+        assert_eq!(req.uri, "http://node-a:8080/api/tenants/ten_1/changes");
         assert_eq!(
             req.headers[HDR_FORWARDED_BY].to_str().unwrap(),
             "node-local"
@@ -1347,7 +1347,7 @@ mod tests {
             "node-local",
             decision(RouteAction::Reject, Some(RouteReason::WrongLocation)),
         );
-        let outcome = runtime.guard("/api/tenants/ten_1/watch", &HeaderMap::new());
+        let outcome = runtime.guard("/api/tenants/ten_1/changes", &HeaderMap::new());
 
         let RouteGuardOutcome::Reject(rejection) = outcome else {
             panic!("expected rejection");

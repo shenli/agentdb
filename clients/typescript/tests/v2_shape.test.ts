@@ -24,7 +24,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
     if (raw.includes("/replay-prefix")) return json({ events: [] });
     if (raw.includes("/replay")) return json({ events: [] });
     if (raw.endsWith("/context")) return json({ events: [], records: [] });
-    if (raw.includes("/watch")) return json([]);
+    if (raw.includes("/changes")) return json({ items: [], next_cursor: null });
     if (raw.endsWith("/artifacts")) return json({ artifact_id: "art_1" });
     if (raw.endsWith("/records/search")) return json({ matches: [] });
     if (raw.endsWith("/records")) return json({ record_id: "rec_1" });
@@ -41,7 +41,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
   await session.replay();
   await session.materializeReplayPrefix();
   await session.context({ include: ["recent_events", "records"] });
-  await c.watch(String(tenant.tenant_id));
+  await c.changes(String(tenant.tenant_id));
   await c.putArtifact(String(tenant.tenant_id), new Blob(["blob"]));
   await c.writeRecord(String(tenant.tenant_id), { namespace: ["mem"], text: "x" });
   await c.searchRecords(String(tenant.tenant_id), { namespace: ["mem"], text: "x" });
@@ -53,7 +53,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
   assert.ok(calls.some((url) => url.includes("/replay")));
   assert.ok(calls.some((url) => url.includes("/replay-prefix")));
   assert.ok(calls.some((url) => url.includes("/context")));
-  assert.ok(calls.some((url) => url.includes("/watch")));
+  assert.ok(calls.some((url) => url.includes("/changes")));
 });
 
 test("friendly SDK binds workspace agent session aliases and canonical ids", async () => {
@@ -107,7 +107,7 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
     }
     if (raw.endsWith("/records/search")) return json({ matches: [] });
     if (raw.endsWith("/records")) return json({ record_id: "rec_1" });
-    if (raw.includes("/watch")) return json([]);
+    if (raw.includes("/changes")) return json({ items: [], next_cursor: null });
     return json({});
   };
 
@@ -137,7 +137,7 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
   await db.sessionById(session.id, { tenantId: workspace.id, agentId: agent.id }).fetch();
   await workspace.records.write({ namespace: ["mem"], text: "x" });
   await workspace.records.search({ namespace: ["mem"], text: "x" });
-  await workspace.watch({ scope: "agent", agentId: agent.id });
+  await workspace.changes();
 
   assert.equal(user.ref().event_id, "evt_fetch");
   assert.deepEqual(appendResultRef(call), { event_id: "evt_1" });

@@ -23,7 +23,6 @@ from .client import (
     RecordId,
     SessionId,
     TenantId,
-    WatchItem,
 )
 from .errors import AgentDBError, from_response
 
@@ -203,26 +202,6 @@ class AsyncClient:
             "POST", f"/api/tenants/{_quote(tenant_id)}/records/search", json=body
         )
         return data.get("matches", [])
-
-    async def watch(
-        self,
-        tenant_id: TenantId,
-        *,
-        scope: str = "tenant",
-        session_id: Optional[SessionId] = None,
-        agent_id: Optional[AgentId] = None,
-        from_cursor: Optional[str] = None,
-        limit: int = 100,
-    ) -> List[WatchItem]:
-        params = {"scope": scope, "limit": str(limit)}
-        if session_id:
-            params["session_id"] = session_id
-        if agent_id:
-            params["agent_id"] = agent_id
-        if from_cursor:
-            params["from_cursor"] = from_cursor
-        data = await self._request("GET", f"/api/tenants/{_quote(tenant_id)}/watch", params=params)
-        return [WatchItem.from_dict(item) for item in data]
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         resp = await self._raw_request(method, path, **kwargs)

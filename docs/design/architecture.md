@@ -22,8 +22,8 @@ crates/agentdb-core       multi-tenant runtime semantics
                           tenants -> agents -> sessions -> events
                           artifacts, records, policy,
                           lifecycle, fork/replay, context
-                          watch/changefeed cursors
-                          export ledger and managed consumer cursors
+                          changefeed cursors
+                          export ledger cursors
                           record index outbox
         |
         +--> crates/agentdb-storage   KV + artifact content backends
@@ -112,15 +112,9 @@ POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
 POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
-GET  /api/tenants/{tenant_id}/watch
-GET  /api/tenants/{tenant_id}/exports/watch
+GET  /api/tenants/{tenant_id}/changes
 POST /api/tenants/{tenant_id}/exports/backfill
 GET  /api/tenants/{tenant_id}/exports/status
-POST /api/tenants/{tenant_id}/exports/consumers
-GET  /api/tenants/{tenant_id}/exports/consumers/{name}
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/claim
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/ack
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/rewind
 POST /api/tenants/{tenant_id}/artifacts
 GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}
 GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}/blob
@@ -220,10 +214,13 @@ conflicts.
 `append-and-fetch` is the hot path for agent loops: write the current turn and
 return recent context in one request.
 
-## Replay, Watch, Context
+## Replay, Changes, Context
 
 - `replay` reconstructs a fork-aware event view.
-- `watch` returns generalized tenant/session/agent changefeed items.
+- `changes` (`GET /api/tenants/{tenant_id}/changes`) is the single public
+  changefeed: commit-ordered tenant/session-scoped items over the export ledger.
+  It supersedes the removed public `watch` HTTP endpoint; the runtime watch
+  engine that feeds these cursors still exists internally.
 - `context` builds a budgeted pack from recent events, searched records, and
   policy.
 
@@ -236,22 +233,23 @@ append / lifecycle / record mutation
         +--> session replay stream
         |    ordered by session seq
         |
-        +--> watch/changefeed cursor
+        +--> changes/changefeed cursor
              tenant scope
              agent scope
              session scope
              dashboard / supervisor / evaluator consumers
 ```
 
-Long-held live push can be layered onto the watch cursor model.
+Long-held live push can be layered onto the changes cursor model.
 
 ## Observability Export
 
 The export surface is separate from the hot append path. Runtime mutations first
 commit to AgentDB; durable export envelopes are then available to external
-sinks through backfill/watch APIs. Named managed consumers store claim leases,
-last acked cursors, include filters, and lag status. Connectors must write the
-sink batch before acking AgentDB, so a crashed worker can replay the last
+sinks through the `changes` changefeed and the metadata-snapshot `backfill` API.
+Consumers hold their own resume cursor client-side (the changefeed is
+stateless). Connectors must write the sink batch before advancing that
+checkpoint, so a crashed worker can replay the last
 unacked cursor range.
 
 Persistent v2 export cursors carry a per-tenant sequence assigned at the
@@ -273,11 +271,11 @@ runtime mutation commits
         |
         +--> exports/backfill for snapshots and historical event ranges
         |
-        +--> exports/watch for tailing committed changes
+        +--> changes for tailing committed changes
                  |
                  v
-          managed consumer lease
-          last_acked_cursor
+          client-side checkpoint
+          (last next_cursor)
                  |
                  v
       agentdbctl export connectors

@@ -120,7 +120,7 @@ deployment choices, see [deployment.md](deployment.md).
 
 - [ ] Export capability has been checked for each production tenant.
 - [ ] ClickHouse, JSONL, or Parquet export path is documented if used.
-- [ ] Managed consumers have stable names and lease owners.
+- [ ] Exporters use a stable `--consumer` checkpoint key (one exporter per tenant).
 - [ ] Export lag and pending item checks are part of routine operations.
 - [ ] Privacy controls are configured before data leaves AgentDB when required.
 - [ ] Recovery procedure is documented:

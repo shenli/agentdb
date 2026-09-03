@@ -51,11 +51,6 @@ export interface AppendResult {
   ref(): Record<string, unknown>;
 }
 
-export interface WatchItem {
-  cursor: string;
-  event: Event;
-}
-
 export interface AppendOptions {
   kind?: string;
   agentId?: AgentId;
@@ -127,14 +122,6 @@ export interface ContextPackBuiltOptions {
 
 export interface SessionOptions {
   agentId?: AgentId;
-}
-
-export interface ClientSubscribeOptions {
-  scope?: "tenant" | "session" | "agent";
-  sessionId?: SessionId;
-  agentId?: AgentId;
-  fromCursor?: string;
-  limit?: number;
 }
 
 export interface ChangesOptions {
@@ -303,10 +290,6 @@ export class Workspace {
       this,
       this.client.session(this.id, sessionId, { agentId: opts.agentId })
     );
-  }
-
-  async watch(opts: ClientSubscribeOptions = {}): Promise<WatchItem[]> {
-    return await this.client.watch(this.id, opts);
   }
 
   /**
@@ -632,17 +615,6 @@ export class Client {
       this._withRecordCommitSeq(tenantId, body)
     );
     return Array.isArray(data.matches) ? data.matches : [];
-  }
-
-  async watch(tenantId: TenantId, opts: ClientSubscribeOptions = {}): Promise<WatchItem[]> {
-    const url = new URL(`${this.baseUrl}/api/tenants/${enc(tenantId)}/watch`);
-    url.searchParams.set("scope", opts.scope ?? "tenant");
-    url.searchParams.set("limit", String(opts.limit ?? 100));
-    if (opts.sessionId) url.searchParams.set("session_id", opts.sessionId);
-    if (opts.agentId) url.searchParams.set("agent_id", opts.agentId);
-    if (opts.fromCursor) url.searchParams.set("from_cursor", opts.fromCursor);
-    const data = await this._requestAbsolute("GET", url);
-    return Array.isArray(data) ? data.map(watchItemFromDict) : [];
   }
 
   /**
@@ -1099,11 +1071,6 @@ function arrayRecords(value: unknown): Record<string, unknown>[] {
 
 function stringOrUndefined(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
-}
-
-function watchItemFromDict(d: unknown): WatchItem {
-  const rec = d as Record<string, unknown>;
-  return { cursor: String(rec.cursor), event: eventFromDict(rec.event) };
 }
 
 function tenantFromUserInfo(

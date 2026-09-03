@@ -341,7 +341,7 @@ sudo systemctl enable --now agentdb-export-clickhouse.service
 ```
 
 Edit the env file first so `AGENTDB_EXPORT_TENANT_ID`,
-`AGENTDB_EXPORT_LEASE_OWNER`, and `CLICKHOUSE_URL` are deployment-specific.
+`AGENTDB_EXPORT_CONSUMER`, and `CLICKHOUSE_URL` are deployment-specific.
 
 Stop ClickHouse:
 

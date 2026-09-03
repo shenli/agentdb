@@ -55,7 +55,7 @@ canonical session ID without exposing `tenantId` to normal app code.
 ## Core Surface
 
 - `AgentDB.workspace`, `AgentDB.sessionById`
-- `Workspace.agent`, `Workspace.agentById`, `Workspace.sessionById`, `Workspace.watch`
+- `Workspace.agent`, `Workspace.agentById`, `Workspace.sessionById`, `Workspace.changes`
 - `Workspace.artifacts`, `Workspace.records`
 - `AgentHandle.session`, `AgentHandle.sessionById`
 - `SessionHandle.append`, `appendUser`, `modelMessage`, `toolCall`, `toolResult`, `contextPackBuilt`
@@ -68,7 +68,7 @@ The low-level tenant-scoped API remains available:
 - `Client.createTenant`, `createAgent`, `createSession`, `session`
 - `Session.append`, `appendAndFetch`, `fetch`, `fetchRecent`
 - `Session.replay`, `materializeReplayPrefix`, `fork`, `context`
-- `Client.watch`
+- `Client.changes`
 - `Client.putArtifact`, `getArtifact`, `getArtifactBlob`
 - `Client.writeRecord`, `searchRecords`
 
@@ -122,7 +122,7 @@ Concept mapping:
 | append and fetch | `session.appendAndFetch(...)` |
 | fork session | `session.fork(...)` |
 | build context | `session.context(...)` |
-| workspace/session watch | `workspace.watch(...)` |
+| workspace/session changefeed | `workspace.changes(...)` |
 
 Use `fromSeq: lastSeenSeq + 1` when reconnecting a subscription to avoid
 replaying events the harness has already processed. Persisting the last handled

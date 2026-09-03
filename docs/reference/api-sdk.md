@@ -254,7 +254,6 @@ GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
 POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 GET  /api/tenants/{tenant_id}/changes
-GET  /api/tenants/{tenant_id}/watch
 POST /api/tenants/{tenant_id}/exports/backfill
 GET  /api/tenants/{tenant_id}/exports/status
 GET  /api/admin/exports
@@ -279,22 +278,22 @@ export ledger with `next_cursor`, `high_watermark`, and
 optional `backfill=true` mode (a pinned `snapshot_high_watermark` plus a
 `complete` flag for paging history to the tail), and optional long-poll
 (`wait_ms`). Fork lineage arrives as an item with `object_type = "fork_edge"`.
-Records appear only when labs is enabled. `watch` and the `exports/*` routes are
-being superseded by `changes` and will be consolidated into it.
+Records appear only when labs is enabled. The `exports/*` routes are being
+consolidated into `changes`, which is now the single public changefeed (the
+former `GET /watch` endpoint has been removed in its favor).
 
 `changes` returns stable export envelopes for observability sinks.
 Persistent runtimes return durable ledger cursors (`ledger:...`) for events and
 metadata object mutations; in-memory/dev runtimes fall back to current event
-watch cursors (`frontier:v1:...`). Runtime `watch` accepts both frontier cursors
+changefeed cursors (`frontier:v1:...`). `changes` accepts both frontier cursors
 and older `v2:` item cursors for resume compatibility. Use the optional
 comma-separated `include` query parameter, for example
 `include=events,records`, to filter object types:
 
 Durable export is currently a single-tablet feature. When metadata-backed
 cluster routing is active (`routing.mode = snapshot`), the changefeed, export
-status, watch, backfill, and admin export status fail closed with HTTP 422 until
-a cross-tablet merge frontier exists. Ordinary runtime watch is still available
-in that evaluation mode.
+status, backfill, and admin export status fail closed with HTTP 422 until
+a cross-tablet merge frontier exists.
 
 ```json
 {
@@ -573,7 +572,6 @@ Workspace
   agent_by_id(agent_id, *, alias=None)
   session(alias=None, *, agent_id=None, session_id=None)
   session_by_id(session_id, *, agent_id=None)
-  watch(scope="tenant", agent_id=None, from_cursor=None, limit=100)
   changes(cursor=None, session=None, ...)
   artifacts.put/get/blob
   records.write/search
@@ -637,7 +635,7 @@ get_artifact(tenant_id, artifact_id)
 get_artifact_blob(tenant_id, artifact_id)
 write_record(tenant_id, **body)
 search_records(tenant_id, **body)
-watch(tenant_id, scope="tenant", agent_id=None, from_cursor=None, limit=100)
+changes(tenant_id, scope="tenant", session_id=None, agent_id=None, from_cursor=None, include=None, limit=100, backfill=False, snapshot_high_watermark=None, wait_ms=None)
 ```
 
 Async support mirrors the lower-level client through `AsyncClient` and
@@ -690,7 +688,6 @@ Workspace
   agent(alias?, opts?)
   agentById(agentId, opts?)
   sessionById(sessionId, opts?)
-  watch(opts?)
   changes(opts?)
   artifacts.put/get/blob
   records.write/search
@@ -744,7 +741,7 @@ getArtifact(tenantId, artifactId)
 getArtifactBlob(tenantId, artifactId)
 writeRecord(tenantId, body)
 searchRecords(tenantId, body)
-watch(tenantId, opts?)
+changes(tenantId, opts?)
 ```
 
 The TypeScript client mirrors Python's record visibility behavior: after

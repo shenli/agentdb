@@ -65,7 +65,6 @@ export type {
   ContextPackBuiltOptions,
   ClientOptions,
   ChangesOptions,
-  ClientSubscribeOptions,
   Event,
   ModelMessageOptions,
   SessionOptions,
@@ -79,7 +78,6 @@ export type {
   EventId,
   ArtifactId,
   RecordId,
-  WatchItem,
 } from "./client.js";
 
 export {
