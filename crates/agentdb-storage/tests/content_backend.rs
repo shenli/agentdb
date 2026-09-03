@@ -668,3 +668,65 @@ async fn managed_cache_chaos_flaky_mirror_never_loses_data() {
         );
     }
 }
+
+#[tokio::test]
+async fn reconcile_redrives_objects_the_mirror_is_missing() {
+    // Simulate an upload lost to a crash / exhausted retries: the bytes are
+    // durable in the local primary but the mirror never received them, and the
+    // in-memory upload queue that would have retried is gone.
+    let dir = tempfile::TempDir::new().unwrap();
+    let primary: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(dir.path()));
+    let mirror = in_memory();
+    let backend = AsyncMirrorContentBackend::new(primary.clone(), mirror.clone(), 8);
+
+    primary.put("ten_a", "art_lost", b"recover me").await.unwrap();
+    assert!(!mirror.head("ten_a", "art_lost").await.unwrap());
+
+    // Reconcile re-queues the missing object off the durable primary.
+    let report = backend.reconcile_unmirrored(1_000).await.unwrap();
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.already_mirrored, 0);
+    assert_eq!(report.requeued, 1);
+    assert_eq!(report.requeued_bytes, b"recover me".len() as u64);
+    assert_eq!(report.throttled, 0);
+    assert_eq!(report.errors, 0);
+
+    // The worker drains it into the mirror.
+    wait_for_mirror(&backend, 1).await;
+    assert!(mirror.head("ten_a", "art_lost").await.unwrap());
+    assert_eq!(mirror.get("ten_a", "art_lost").await.unwrap(), b"recover me");
+
+    // Idempotent: a second pass finds it already mirrored and re-queues nothing.
+    let report = backend.reconcile_unmirrored(1_000).await.unwrap();
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.already_mirrored, 1);
+    assert_eq!(report.requeued, 0);
+}
+
+#[tokio::test]
+async fn cache_sweep_redrives_unmirrored_objects_instead_of_only_retaining() {
+    // Managed-cache mode: an un-mirrored local object must be retained (never
+    // the only copy evicted) AND re-driven so it still reaches the mirror
+    // rather than accumulating as permanent, disk-leaking debt.
+    let dir = tempfile::TempDir::new().unwrap();
+    let primary: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(dir.path()));
+    let mirror = in_memory();
+    let backend = AsyncMirrorContentBackend::new(primary.clone(), mirror.clone(), 8)
+        .with_local_cache_ttl_ms(0);
+
+    primary.put("ten_a", "seg_only", b"unmirrored").await.unwrap();
+
+    let report = backend
+        .run_cache_sweep_once(now_wallclock_ms() + 10_000, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(report.evicted, 0, "never evict the only copy");
+    assert_eq!(report.retained_unmirrored, 1);
+    assert_eq!(report.requeued, 1, "re-drive the un-mirrored object");
+    assert_eq!(report.requeued_bytes, b"unmirrored".len() as u64);
+    // The local copy is retained...
+    assert!(primary.head("ten_a", "seg_only").await.unwrap());
+    // ...and the re-drive lands it in the mirror.
+    wait_for_mirror(&backend, 1).await;
+    assert!(mirror.head("ten_a", "seg_only").await.unwrap());
+}

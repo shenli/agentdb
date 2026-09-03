@@ -727,9 +727,38 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     }
     if let Some(content_mirror) = content_mirror {
         state = state.with_content_mirror(content_mirror.clone());
+        let list_limit = env_usize("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000).max(1);
+        // Startup re-drive: the async mirror queue lives only in memory, so a
+        // crash, an exhausted retry budget, or an object-store outage can leave
+        // a local object un-mirrored with nothing to retry it. The local
+        // primary is the durable record of what must be mirrored, so reconcile
+        // it against the mirror once on boot and re-queue anything missing.
+        {
+            let mirror = content_mirror.clone();
+            tokio::spawn(async move {
+                match mirror.reconcile_unmirrored(list_limit).await {
+                    Ok(report)
+                        if report.requeued > 0 || report.throttled > 0 || report.errors > 0 =>
+                    {
+                        tracing::info!(
+                            scanned = report.scanned,
+                            requeued = report.requeued,
+                            requeued_bytes = report.requeued_bytes,
+                            throttled = report.throttled,
+                            errors = report.errors,
+                            "content mirror startup reconcile re-queued un-mirrored objects"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+                    Err(error) => {
+                        tracing::warn!(?error, "content mirror startup reconcile failed");
+                    }
+                }
+            });
+        }
         if content_mirror.local_cache_ttl_ms().is_some() {
             let sweep_interval = Duration::from_millis(config.content_cache_sweep_interval_ms);
-            let list_limit = env_usize("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000).max(1);
             tracing::info!(
                 interval_ms = config.content_cache_sweep_interval_ms,
                 ttl_ms = ?content_mirror.local_cache_ttl_ms(),
@@ -742,17 +771,51 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         .run_cache_sweep_once(now_ms_i64(), list_limit)
                         .await
                     {
-                        Ok(report) if report.evicted > 0 => {
+                        // The sweep also re-drives un-mirrored objects, so log
+                        // when it either evicted or re-queued anything.
+                        Ok(report) if report.evicted > 0 || report.requeued > 0 => {
                             tracing::info!(
                                 scanned = report.scanned,
                                 evicted = report.evicted,
                                 retained_unmirrored = report.retained_unmirrored,
-                                "content cache sweep evicted cold local copies"
+                                requeued = report.requeued,
+                                requeued_bytes = report.requeued_bytes,
+                                "content cache sweep evicted cold local copies and re-drove un-mirrored objects"
                             );
                         }
                         Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(?error, "content cache sweep failed");
+                        }
+                    }
+                }
+            });
+        } else {
+            // Plain mirror (no managed cache) has no periodic cache sweep, so a
+            // dedicated reconcile loop provides the same ongoing re-drive that
+            // cache-mode deployments get from the sweep above.
+            let reconcile_interval =
+                Duration::from_millis(config.content_cache_sweep_interval_ms);
+            let mirror = content_mirror.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(reconcile_interval).await;
+                    match mirror.reconcile_unmirrored(list_limit).await {
+                        Ok(report) if report.requeued > 0 || report.errors > 0 => {
+                            tracing::info!(
+                                scanned = report.scanned,
+                                requeued = report.requeued,
+                                requeued_bytes = report.requeued_bytes,
+                                errors = report.errors,
+                                "content mirror reconcile re-queued un-mirrored objects"
+                            );
+                        }
+                        Ok(_) => {}
+                        // A primary without object listing can never reconcile;
+                        // stop the loop rather than spin.
+                        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => break,
+                        Err(error) => {
+                            tracing::warn!(?error, "content mirror reconcile failed");
                         }
                     }
                 }
