@@ -136,6 +136,13 @@ export interface ChangesOptions {
   waitMs?: number;
 }
 
+export interface EventSearchOptions {
+  sessionId?: SessionId;
+  agentId?: AgentId;
+  kind?: string;
+  limit?: number;
+}
+
 export interface UserInfo {
   tenant_id?: string;
   default_workspace?: string;
@@ -298,6 +305,14 @@ export class Workspace {
    */
   async changes(opts: ChangesOptions = {}): Promise<Record<string, unknown>> {
     return await this.client.changes(this.id, opts);
+  }
+
+  /**
+   * Search this workspace's durable event log by text. Pass `sessionId` or
+   * `agentId` to narrow the scope. See `Client.searchEvents`.
+   */
+  async searchEvents(q: string, opts: EventSearchOptions = {}): Promise<unknown[]> {
+    return await this.client.searchEvents(this.id, q, opts);
   }
 }
 
@@ -637,6 +652,27 @@ export class Client {
     if (opts.waitMs !== undefined) url.searchParams.set("wait_ms", String(opts.waitMs));
     const data = await this._requestAbsolute("GET", url);
     return (data ?? {}) as Record<string, unknown>;
+  }
+
+  /**
+   * Scoped, text-only search over the durable event log
+   * (`GET .../events/search`). Narrow with `sessionId` or `agentId` for bounded
+   * cost; omit both to search the whole tenant. Resolves to the `matches`
+   * array, each `{ event, score }`.
+   */
+  async searchEvents(
+    tenantId: TenantId,
+    q: string,
+    opts: EventSearchOptions = {},
+  ): Promise<unknown[]> {
+    const url = new URL(`${this.baseUrl}/api/tenants/${enc(tenantId)}/events/search`);
+    url.searchParams.set("q", q);
+    url.searchParams.set("limit", String(opts.limit ?? 20));
+    if (opts.sessionId) url.searchParams.set("session_id", opts.sessionId);
+    if (opts.agentId) url.searchParams.set("agent_id", opts.agentId);
+    if (opts.kind) url.searchParams.set("kind", opts.kind);
+    const data = await this._requestAbsolute("GET", url);
+    return ((data as Record<string, unknown>)?.matches ?? []) as unknown[];
   }
 
   async _request(method: string, path: string, json?: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {

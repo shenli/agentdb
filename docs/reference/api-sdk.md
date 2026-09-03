@@ -254,6 +254,7 @@ GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
 POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 GET  /api/tenants/{tenant_id}/changes
+GET  /api/tenants/{tenant_id}/events/search
 POST /api/tenants/{tenant_id}/exports/backfill
 GET  /api/tenants/{tenant_id}/exports/status
 GET  /api/admin/exports
@@ -341,6 +342,26 @@ foreign ledger boundary.
 
 Delete envelopes use `op = "delete"` and include `tombstone.reason`.
 Current reasons are `soft_delete`, `retention_gc`, and `tenant_purge`.
+
+### Event search
+
+`GET /api/tenants/{tenant_id}/events/search` is a core, text-only search over
+the durable event log — the "ask an agent about its own past sessions" path. It
+is distinct from the Labs record-search index: it scans the events in scope and
+ranks them by how many query tokens appear in the event kind and payload text.
+
+Query parameters:
+
+- `q` (required): whitespace-tokenized, case-insensitive query.
+- `session_id` / `agent_id` (optional): narrow the scope to one session or one
+  agent's sessions. Omit both to search the whole tenant.
+- `kind` (optional): exact event-kind filter.
+- `limit` (default 20, max 100).
+
+Because it is an unindexed scan, narrow the scope for large histories; a
+tenant-wide search is best-effort over the newest events within a fixed scan
+budget. The response is `{ "matches": [{ "event": {...}, "score": N }, ...] }`,
+ordered by token coverage then recency.
 
 Use `agentdbctl export clickhouse ...` for the first-party ClickHouse path.
 `migrate --apply` creates native raw/event/tombstone tables plus optional
@@ -572,6 +593,7 @@ Workspace
   session(alias=None, *, agent_id=None, session_id=None)
   session_by_id(session_id, *, agent_id=None)
   changes(cursor=None, session=None, ...)
+  search_events(q, *, session=None, agent=None, kind=None, limit=20)
   artifacts.put/get/blob
   records.write/search
 
@@ -635,6 +657,7 @@ get_artifact_blob(tenant_id, artifact_id)
 write_record(tenant_id, **body)
 search_records(tenant_id, **body)
 changes(tenant_id, scope="tenant", session_id=None, agent_id=None, from_cursor=None, include=None, limit=100, backfill=False, snapshot_high_watermark=None, wait_ms=None)
+search_events(tenant_id, q, *, session_id=None, agent_id=None, kind=None, limit=20)
 ```
 
 Async support mirrors the lower-level client through `AsyncClient` and
@@ -688,6 +711,7 @@ Workspace
   agentById(agentId, opts?)
   sessionById(sessionId, opts?)
   changes(opts?)
+  searchEvents(q, opts?)
   artifacts.put/get/blob
   records.write/search
 
@@ -741,6 +765,7 @@ getArtifactBlob(tenantId, artifactId)
 writeRecord(tenantId, body)
 searchRecords(tenantId, body)
 changes(tenantId, opts?)
+searchEvents(tenantId, q, opts?)
 ```
 
 The TypeScript client mirrors Python's record visibility behavior: after
