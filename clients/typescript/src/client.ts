@@ -137,6 +137,18 @@ export interface ClientSubscribeOptions {
   limit?: number;
 }
 
+export interface ChangesOptions {
+  scope?: "tenant" | "session" | "agent";
+  sessionId?: SessionId;
+  agentId?: AgentId;
+  fromCursor?: string;
+  include?: string;
+  limit?: number;
+  backfill?: boolean;
+  snapshotHighWatermark?: string;
+  waitMs?: number;
+}
+
 export interface UserInfo {
   tenant_id?: string;
   default_workspace?: string;
@@ -295,6 +307,14 @@ export class Workspace {
 
   async watch(opts: ClientSubscribeOptions = {}): Promise<WatchItem[]> {
     return await this.client.watch(this.id, opts);
+  }
+
+  /**
+   * Read a page of the workspace changefeed over the export ledger. Pass
+   * `sessionId` to scope to one session and `fromCursor` to resume.
+   */
+  async changes(opts: ChangesOptions = {}): Promise<Record<string, unknown>> {
+    return await this.client.changes(this.id, opts);
   }
 }
 
@@ -623,6 +643,28 @@ export class Client {
     if (opts.fromCursor) url.searchParams.set("from_cursor", opts.fromCursor);
     const data = await this._requestAbsolute("GET", url);
     return Array.isArray(data) ? data.map(watchItemFromDict) : [];
+  }
+
+  /**
+   * Read the unified changefeed (`GET .../changes`) over the export ledger.
+   * Returns a page object with `items`, `next_cursor`, `high_watermark`, and
+   * `oldest_available_cursor` (plus `snapshot_high_watermark`/`complete` in
+   * backfill mode).
+   */
+  async changes(tenantId: TenantId, opts: ChangesOptions = {}): Promise<Record<string, unknown>> {
+    const url = new URL(`${this.baseUrl}/api/tenants/${enc(tenantId)}/changes`);
+    url.searchParams.set("scope", opts.scope ?? "tenant");
+    url.searchParams.set("limit", String(opts.limit ?? 100));
+    if (opts.sessionId) url.searchParams.set("session_id", opts.sessionId);
+    if (opts.agentId) url.searchParams.set("agent_id", opts.agentId);
+    if (opts.fromCursor) url.searchParams.set("from_cursor", opts.fromCursor);
+    if (opts.include) url.searchParams.set("include", opts.include);
+    if (opts.backfill) url.searchParams.set("backfill", "true");
+    if (opts.snapshotHighWatermark)
+      url.searchParams.set("snapshot_high_watermark", opts.snapshotHighWatermark);
+    if (opts.waitMs !== undefined) url.searchParams.set("wait_ms", String(opts.waitMs));
+    const data = await this._requestAbsolute("GET", url);
+    return (data ?? {}) as Record<string, unknown>;
   }
 
   async _request(method: string, path: string, json?: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {

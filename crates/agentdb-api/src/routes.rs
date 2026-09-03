@@ -45,7 +45,8 @@ use agentdb_meta::{
 };
 
 use crate::dto::{
-    AckExportConsumerBody, AppendAndFetchBody, AppendBody, ClaimExportConsumerBody,
+    AckExportConsumerBody, AppendAndFetchBody, AppendBody, ChangesQuery, ChangesResponse,
+    ClaimExportConsumerBody,
     ContextBody, CreateAgentBody, CreateExportConsumerBody, CreateRecordBody,
     CreateSessionBody, CreateTenantBody, ExportBackfillBody,
     ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
@@ -114,6 +115,7 @@ pub fn route_catalog() -> &'static [(Stability, &'static str)] {
         (Core, "/api/tenants/:tenant_id/artifacts"),
         (Core, "/api/tenants/:tenant_id/artifacts/:artifact_id"),
         (Core, "/api/tenants/:tenant_id/artifacts/:artifact_id/blob"),
+        (Core, "/api/tenants/:tenant_id/changes"),
         // --- Labs surface (behind `labs`; absent from the quickstart) ---
         (Labs, "/api/tenants/:tenant_id/records"),
         (Labs, "/api/tenants/:tenant_id/records/search"),
@@ -227,6 +229,7 @@ pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
             "/api/tenants/:tenant_id/sessions/:session_id/replay",
             get(replay_session),
         )
+        .route("/api/tenants/:tenant_id/changes", get(changes))
         .route("/api/tenants/:tenant_id/watch", get(watch))
         .route("/api/tenants/:tenant_id/exports/watch", get(export_watch))
         .route(
@@ -6885,6 +6888,125 @@ async fn watch(
     Ok(Json(items))
 }
 
+/// `GET /api/tenants/{t}/changes` — the one public changefeed over the export
+/// ledger. Commit-ordered items with `next_cursor` / `high_watermark` /
+/// `oldest_available_cursor`, optional session scope and `include` filter, an
+/// optional `backfill` mode (a pinned snapshot boundary plus `complete`), and
+/// optional long-poll (`wait_ms`). The `fork_edge` control item flows through
+/// as an item with `object_type = "fork_edge"`.
+async fn changes(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<String>,
+    Query(q): Query<ChangesQuery>,
+) -> Result<Json<ChangesResponse>, ApiError> {
+    require_single_tablet_export(&s)?;
+
+    // Records are a Labs projection; keep them out of the default changefeed
+    // unless labs is enabled (records cannot be created with labs off anyway).
+    let include = match &q.include {
+        Some(inc) => Some(inc.clone()),
+        None if s.labs => None,
+        None => Some("events,tenants,agents,sessions,artifacts,fork_edges".to_string()),
+    };
+    let build_query = || WatchQuery {
+        scope: q.scope.clone(),
+        session_id: q.session_id.clone(),
+        agent_id: q.agent_id.clone(),
+        include: include.clone(),
+        from_cursor: q.from_cursor.clone(),
+        limit: q.limit,
+    };
+
+    let runtime = s.runtime.clone();
+
+    // Backfill: pin the read to a fixed snapshot boundary and report completion
+    // so a caller can page history to the tail before switching to tailing.
+    if q.backfill {
+        let req = export_watch_request_from_query(&tenant_id, build_query())?;
+        let req_tenant_id = req.tenant_id.clone();
+        let requested_limit = req.limit;
+        let snapshot_high_watermark = match &q.snapshot_high_watermark {
+            Some(hw) => {
+                validate_tenant_export_cursor(&runtime, &req_tenant_id, hw).await?;
+                Some(hw.clone())
+            }
+            None => runtime.export_high_watermark(&req_tenant_id).await?,
+        };
+        let through = snapshot_high_watermark.clone();
+        let rt = runtime.clone();
+        let items = with_route_tablet_context(runtime.clone(), &headers, async move {
+            match through.as_deref() {
+                Some(c) => rt.export_watch_through(req, Some(c)).await,
+                None => Ok(Vec::new()),
+            }
+        })
+        .await?;
+        let observed_at_ms = current_ms();
+        let complete = items.len() < requested_limit;
+        let envelopes = items
+            .into_iter()
+            .map(|item| export_envelope_from_changefeed_with_op(item, observed_at_ms, "snapshot"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = envelopes.last().map(|item| item.cursor.clone());
+        let oldest_available_cursor = s
+            .runtime
+            .export_oldest_available_cursor(&req_tenant_id)
+            .await?;
+        return Ok(Json(ChangesResponse {
+            items: envelopes,
+            next_cursor,
+            high_watermark: None,
+            oldest_available_cursor,
+            snapshot_high_watermark,
+            complete: Some(complete),
+        }));
+    }
+
+    // Tail: read through the current high watermark, optionally long-polling.
+    const POLL_INTERVAL_MS: u64 = 250;
+    const MAX_WAIT_MS: u64 = 30_000;
+    let deadline = q.wait_ms.filter(|&ms| ms > 0).map(|ms| {
+        std::time::Instant::now() + std::time::Duration::from_millis(ms.min(MAX_WAIT_MS))
+    });
+    loop {
+        let req = export_watch_request_from_query(&tenant_id, build_query())?;
+        let req_tenant_id = req.tenant_id.clone();
+        let high_watermark = runtime.export_high_watermark(&req_tenant_id).await?;
+        let through = high_watermark.clone();
+        let rt = runtime.clone();
+        let items = with_route_tablet_context(runtime.clone(), &headers, async move {
+            match through.as_deref() {
+                Some(c) => rt.export_watch_through(req, Some(c)).await,
+                None => Ok(Vec::new()),
+            }
+        })
+        .await?;
+
+        if items.is_empty() && deadline.is_some_and(|d| std::time::Instant::now() < d) {
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+            continue;
+        }
+
+        let observed_at_ms = current_ms();
+        let envelopes = items
+            .into_iter()
+            .map(|item| export_envelope_from_changefeed(item, observed_at_ms))
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = envelopes.last().map(|item| item.cursor.clone());
+        let oldest_available_cursor =
+            runtime.export_oldest_available_cursor(&req_tenant_id).await?;
+        return Ok(Json(ChangesResponse {
+            items: envelopes,
+            next_cursor,
+            high_watermark,
+            oldest_available_cursor,
+            snapshot_high_watermark: None,
+            complete: None,
+        }));
+    }
+}
+
 async fn export_watch(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -7483,6 +7605,7 @@ fn export_envelope_from_changefeed_with_op(
         "session" => "session",
         "artifact" => "artifact",
         "record" => "record",
+        "fork_edge" => "fork_edge",
         _ => "unknown",
     };
     let effective_op = if op == "snapshot" {

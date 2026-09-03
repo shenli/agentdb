@@ -104,6 +104,25 @@ def test_v2_urls_cover_core_flow():
     assert any("/watch" in url for url in urls)
 
 
+def test_changes_reads_the_changefeed():
+    c = Client("http://x", auth=("u", "p"))
+    calls = []
+
+    def fake(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return response(body={"items": [], "next_cursor": None, "high_watermark": None})
+
+    with patch.object(c._http, "request", side_effect=fake):
+        page = c.changes("ten_1", scope="tenant", from_cursor="cur1", limit=50)
+
+    assert page["items"] == []
+    method, url, kwargs = calls[0]
+    assert method == "GET"
+    assert url.endswith("/api/tenants/ten_1/changes")
+    assert kwargs["params"]["from_cursor"] == "cur1"
+    assert kwargs["params"]["scope"] == "tenant"
+
+
 def test_open_session_is_a_single_request():
     c = Client("http://x", auth=("u", "p"))
     calls, patched = capture(c)
