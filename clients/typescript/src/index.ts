@@ -64,6 +64,7 @@ export type {
   AppendResult,
   ContextPackBuiltOptions,
   ClientOptions,
+  ChangesOptions,
   ClientSubscribeOptions,
   Event,
   ModelMessageOptions,

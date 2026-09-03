@@ -259,6 +259,58 @@ pub struct ExportStatusResponse {
     pub high_watermark: Option<String>,
 }
 
+/// Query for `GET /api/tenants/{t}/changes` — the one public changefeed over the
+/// export ledger. Commit-ordered, cursor-based, optional session scope.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChangesQuery {
+    #[serde(default = "default_watch_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Comma-separated object-type filter (e.g. `events,sessions,artifacts`).
+    /// Empty = all core types. `records` is only honored when labs is enabled.
+    #[serde(default)]
+    pub include: Option<String>,
+    /// Resume point; omit to start from the oldest available item.
+    #[serde(default)]
+    pub from_cursor: Option<String>,
+    #[serde(default = "default_fetch_limit")]
+    pub limit: usize,
+    /// Backfill mode: pin the read to a fixed `snapshot_high_watermark` and
+    /// report `complete` so a caller can page history to the tail, then hand
+    /// off to tailing. On pages after the first, echo the returned
+    /// `snapshot_high_watermark` here.
+    #[serde(default)]
+    pub backfill: bool,
+    #[serde(default)]
+    pub snapshot_high_watermark: Option<String>,
+    /// Long-poll: when set and no items are ready, wait up to this many
+    /// milliseconds (capped) for new items before returning an empty page.
+    /// Ignored in backfill mode.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangesResponse {
+    pub items: Vec<ExportEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high_watermark: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_available_cursor: Option<String>,
+    /// Present only in backfill mode: the pinned ledger boundary to echo on the
+    /// next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_high_watermark: Option<String>,
+    /// Present only in backfill mode: true when this page reached the snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ExportEnvelope {
     pub export_version: &'static str,

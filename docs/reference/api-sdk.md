@@ -244,6 +244,7 @@ POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
 POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
+GET  /api/tenants/{tenant_id}/changes
 GET  /api/tenants/{tenant_id}/watch
 GET  /api/tenants/{tenant_id}/exports/watch
 POST /api/tenants/{tenant_id}/exports/backfill
@@ -268,6 +269,15 @@ Sandbox filesystem snapshots are coordinated through AgentDB snapshot refs and
 an external sandbox service. See
 `docs/reference/sandbox-snapshot-contract.md` for trigger ownership, restore,
 fork, retention, and dangling-ref behavior.
+
+`GET /changes` is the one public changefeed: commit-ordered items over the
+export ledger with `next_cursor`, `high_watermark`, and
+`oldest_available_cursor`, an optional session `scope`, an `include` filter, an
+optional `backfill=true` mode (a pinned `snapshot_high_watermark` plus a
+`complete` flag for paging history to the tail), and optional long-poll
+(`wait_ms`). Fork lineage arrives as an item with `object_type = "fork_edge"`.
+Records appear only when labs is enabled. `watch` and the `exports/*` routes are
+being superseded by `changes` and will be consolidated into it.
 
 `exports/watch` returns stable export envelopes for observability sinks.
 Persistent runtimes return durable ledger cursors (`ledger:...`) for events and
@@ -592,6 +602,7 @@ Workspace
   session(alias=None, *, agent_id=None, session_id=None)
   session_by_id(session_id, *, agent_id=None)
   watch(scope="tenant", agent_id=None, from_cursor=None, limit=100)
+  changes(cursor=None, session=None, ...)
   artifacts.put/get/blob
   records.write/search
 
@@ -708,6 +719,7 @@ Workspace
   agentById(agentId, opts?)
   sessionById(sessionId, opts?)
   watch(opts?)
+  changes(opts?)
   artifacts.put/get/blob
   records.write/search
 

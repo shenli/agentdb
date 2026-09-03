@@ -335,6 +335,24 @@ class Workspace:
             limit=limit,
         )
 
+    def changes(
+        self,
+        cursor: Optional[str] = None,
+        session: Optional[SessionId] = None,
+        **kwargs: Any,
+    ) -> dict:
+        """Read a page of the workspace changefeed. Pass `session` to scope to
+        one session and `cursor` to resume. See `Client.changes`."""
+
+        scope = "session" if session else "tenant"
+        return self._client.changes(
+            self.tenant_id,
+            scope=scope,
+            session_id=session,
+            from_cursor=cursor,
+            **kwargs,
+        )
+
     def storage_summary(self) -> dict:
         return self._client.get_tenant_storage_summary(self.tenant_id)
 
@@ -816,6 +834,42 @@ class Client:
             params["from_cursor"] = from_cursor
         data = self._request("GET", f"/api/tenants/{_quote(tenant_id)}/watch", params=params)
         return [WatchItem.from_dict(item) for item in data]
+
+    def changes(
+        self,
+        tenant_id: TenantId,
+        *,
+        scope: str = "tenant",
+        session_id: Optional[SessionId] = None,
+        agent_id: Optional[AgentId] = None,
+        from_cursor: Optional[str] = None,
+        include: Optional[str] = None,
+        limit: int = 100,
+        backfill: bool = False,
+        snapshot_high_watermark: Optional[str] = None,
+        wait_ms: Optional[int] = None,
+    ) -> dict:
+        """Read the unified changefeed (`GET .../changes`) over the export
+        ledger. Returns a page dict with `items`, `next_cursor`,
+        `high_watermark`, and `oldest_available_cursor` (plus
+        `snapshot_high_watermark`/`complete` in backfill mode)."""
+
+        params: dict = {"scope": scope, "limit": str(limit)}
+        if session_id:
+            params["session_id"] = session_id
+        if agent_id:
+            params["agent_id"] = agent_id
+        if from_cursor:
+            params["from_cursor"] = from_cursor
+        if include:
+            params["include"] = include
+        if backfill:
+            params["backfill"] = "true"
+        if snapshot_high_watermark:
+            params["snapshot_high_watermark"] = snapshot_high_watermark
+        if wait_ms is not None:
+            params["wait_ms"] = str(wait_ms)
+        return self._request("GET", f"/api/tenants/{_quote(tenant_id)}/changes", params=params)
 
     def get_session_storage(self, tenant_id: TenantId, session_id: SessionId) -> dict:
         return self._request(
