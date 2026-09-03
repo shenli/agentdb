@@ -133,6 +133,11 @@ struct ImportRunOpts {
     /// location.
     #[arg(long)]
     dir: Option<PathBuf>,
+    /// Config file (same as `serve`) — its `[storage]` section decides where
+    /// externalized artifact blobs go (local disk, or an object store).
+    /// Defaults to `<agentdb_home>/agentdb.toml` when present.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// What to do with events whose payload exceeds the inline limit: `skip`
     /// them (default), or `artifact` — store the payload as a content-addressed
     /// artifact (identical payloads dedup to one blob) and reference it from a
@@ -401,13 +406,47 @@ async fn import_cmd(opts: ImportOpts) -> anyhow::Result<()> {
     };
     let data_dir = run.data_dir.unwrap_or_else(default_data_dir);
     let large = run.large_events.into();
-    let runtime = open_import_runtime(&data_dir)?;
+    let runtime = open_import_runtime(&data_dir, run.config.as_ref())?;
     import::run(runtime, source, run.dir, large).await
+}
+
+/// Resolve the artifact content backend for the importer from the same config
+/// file `serve` reads, so externalized blobs land wherever the deployment keeps
+/// them — local disk, or (single-node object-store content) straight in the
+/// object store, keeping the local store small.
+fn resolve_import_content_config(
+    config_path: Option<&PathBuf>,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<ContentBackendConfig> {
+    let file = load_config(config_path)?;
+    let content_dir = file
+        .storage
+        .content_dir
+        .clone()
+        .unwrap_or_else(|| data_dir.join("content"));
+    let deployment_mode = resolve_deployment_mode(&file.deployment)?;
+    let content_backend = resolve_content_backend(&file.storage.content)?;
+    let object_store = resolve_object_store_config(
+        file.storage.object_store.as_ref(),
+        data_dir.join("object-store"),
+    )?;
+    let content_local_cache_ttl_ms =
+        resolve_content_cache_ttl(&file.storage.content, content_backend, deployment_mode);
+    Ok(ContentBackendConfig {
+        content_backend,
+        content_dir,
+        deployment_mode,
+        object_store,
+        content_local_cache_ttl_ms,
+    })
 }
 
 /// Open the persistent single-node store in-process for the offline importer.
 /// RocksDB is single-writer, so this fails fast if the server holds the lock.
-fn open_import_runtime(data_dir: &std::path::Path) -> anyhow::Result<Arc<agentdb_core::Runtime>> {
+fn open_import_runtime(
+    data_dir: &std::path::Path,
+    config_path: Option<&PathBuf>,
+) -> anyhow::Result<Arc<agentdb_core::Runtime>> {
     let kv_path = data_dir.join("runtime");
     // Create the store if it does not exist (a fresh import target); if the
     // server is running against it, RocksDB's single-writer lock makes the open
@@ -422,10 +461,16 @@ fn open_import_runtime(data_dir: &std::path::Path) -> anyhow::Result<Arc<agentdb
             )
         })?,
     );
-    let content_dir = data_dir.join("content");
-    std::fs::create_dir_all(&content_dir)?;
-    let content: Arc<dyn agentdb_storage::ContentBackend> =
-        Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir));
+    let content_config = resolve_import_content_config(config_path, data_dir)?;
+    match content_config.content_backend {
+        ContentBackendKind::ObjectStore => {
+            tracing::info!("importer artifact content backend: object store");
+        }
+        ContentBackendKind::LocalFs => {
+            tracing::info!("importer artifact content backend: local filesystem");
+        }
+    }
+    let (content, _mirror) = build_content_backend(&content_config)?;
 
     let runtime = match build_encryption_keyring(&kv)? {
         Some((keyring, admin)) => {
@@ -613,7 +658,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         };
 
         recovery_kv = Some(kv.clone());
-        let (content, content_mirror) = build_content_backend(&config)?;
+        let (content, content_mirror) = build_content_backend(&config.content_backend_config())?;
         if let Some(logs) = runtime_raft_logs {
             tracing::info!(
                 tablet_count = logs.len(),
@@ -1498,6 +1543,16 @@ struct ResolvedObjectStoreConfig {
 }
 
 impl ResolvedServeConfig {
+    fn content_backend_config(&self) -> ContentBackendConfig {
+        ContentBackendConfig {
+            content_backend: self.content_backend,
+            content_dir: self.content_dir.clone(),
+            deployment_mode: self.deployment_mode,
+            object_store: self.object_store.clone(),
+            content_local_cache_ttl_ms: self.content_local_cache_ttl_ms,
+        }
+    }
+
     fn from_serve_opts(opts: ServeOpts) -> anyhow::Result<Self> {
         let file = load_config(opts.config.as_ref())?;
         let disk_budget_bytes = resolve_disk_budget_bytes(&file);
@@ -2414,7 +2469,19 @@ async fn build_cluster_keyring_and_provisioner(
     Ok(Some((keyring, provisioner, rotator, revoker, retirer)))
 }
 
-fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<ContentBackendBundle> {
+/// The storage settings `build_content_backend` needs — the subset of the
+/// resolved config that decides where artifact bytes live. Factored out so the
+/// offline importer can build the same backend from a config file without a
+/// full `ResolvedServeConfig`.
+struct ContentBackendConfig {
+    content_backend: ContentBackendKind,
+    content_dir: PathBuf,
+    deployment_mode: DeploymentMode,
+    object_store: Option<ResolvedObjectStoreConfig>,
+    content_local_cache_ttl_ms: Option<u64>,
+}
+
+fn build_content_backend(config: &ContentBackendConfig) -> anyhow::Result<ContentBackendBundle> {
     match config.content_backend {
         ContentBackendKind::LocalFs => {
             let content_dir = config.content_dir.clone();
@@ -10497,7 +10564,7 @@ node_id = "node-a"
             allow_http: false,
         });
 
-        let (content, mirror) = build_content_backend(&config).unwrap();
+        let (content, mirror) = build_content_backend(&config.content_backend_config()).unwrap();
         content.put("ten_a", "art_x", b"hello").await.unwrap();
 
         let mirror = mirror.expect("cluster object-store content should be mirrored");

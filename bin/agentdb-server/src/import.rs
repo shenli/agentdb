@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader};
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 
-use agentdb_core::runtime::{AppendRequest, FetchRequest, Runtime};
+use agentdb_core::runtime::{AppendRequest, Runtime};
 use agentdb_core::{Id, IdKind, NewAgent, NewArtifact, NewSession, NewTenant};
 use agentdb_core::event::ArtifactRef;
 use agentdb_import::{
@@ -340,6 +340,7 @@ async fn ensure_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentdb_core::runtime::FetchRequest;
     use agentdb_import::ParsedLine;
 
     async fn seed() -> (Arc<Runtime>, Id, Id, Id) {
