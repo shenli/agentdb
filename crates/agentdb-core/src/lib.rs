@@ -46,7 +46,7 @@ pub use policy::{
 };
 pub use record::{IndexingMode, IndexingPolicy, NewRecord, RecordStatus, SearchableRecord};
 pub use runtime::{
-    is_system_tenant, BackpressureReport, BackpressureSignal, ChangefeedItem, ContextInclude,
+    is_system_tenant, BackpressureReport, BackpressureSignal, ContextInclude,
     ContextRequest, ContextResponse, FleetStorageSummary, ForkEdge, ForkSessionRequest,
     GcSweepReport, LifecycleCounts, LifecycleSweepReport, MetadataFilter, MetadataFilterCondition,
     MetadataFilterOp, NewSnapshotRef, PolicyWorkerReport,
@@ -54,7 +54,7 @@ pub use runtime::{
     ReplayResponse, RetireReport, Runtime, SessionStorageSummary, SnapshotResolution,
     TenantKeyProvisioner,
     TenantKeyRetirer, TenantKeyRevoker, TenantKeyRotator, TenantMetaEntry,
-    TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope, RUNTIME_PRIMARY_TABLET_ID,
+    TenantStorageSummary, TenantWorkerReport, WatchScope, RUNTIME_PRIMARY_TABLET_ID,
     SYSTEM_TENANT_EXTERNAL_KEY, SYSTEM_TENANT_ID,
 };
 pub use segment::{

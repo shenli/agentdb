@@ -283,11 +283,10 @@ consolidated into `changes`, which is now the single public changefeed (the
 former `GET /watch` endpoint has been removed in its favor).
 
 `changes` returns stable export envelopes for observability sinks.
-Persistent runtimes return durable ledger cursors (`ledger:...`) for events and
-metadata object mutations; in-memory/dev runtimes fall back to current event
-changefeed cursors (`frontier:v1:...`). `changes` accepts both frontier cursors
-and older `v2:` item cursors for resume compatibility. Use the optional
-comma-separated `include` query parameter, for example
+Both persistent and in-memory/dev runtimes return durable ledger cursors
+(`ledger:...`): persistent runtimes cover events and metadata object mutations,
+while the in-memory ledger covers events and fork-edge control items. Use the
+optional comma-separated `include` query parameter, for example
 `include=events,records`, to filter object types:
 
 Durable export is currently a single-tablet feature. When metadata-backed

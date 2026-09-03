@@ -587,16 +587,6 @@ pub enum WatchScope {
 }
 
 #[derive(Debug, Clone)]
-pub struct WatchRequest {
-    pub tenant_id: Id,
-    pub scope: WatchScope,
-    pub session_id: Option<Id>,
-    pub agent_id: Option<Id>,
-    pub from_cursor: Option<String>,
-    pub limit: usize,
-}
-
-#[derive(Debug, Clone)]
 pub struct ExportWatchRequest {
     pub tenant_id: Id,
     pub scope: WatchScope,
@@ -618,27 +608,6 @@ pub struct ForkEdge {
     pub child_session_id: Id,
     pub fork_point_seq: u64,
     pub created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangefeedItem {
-    pub cursor: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cell_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub placement_scope_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tablet_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tablet_epoch: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub applied_index: Option<u64>,
-    /// The event for a normal changefeed item. `None` for a fork-edge item.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event: Option<EventEnvelope>,
-    /// Set for a fork-edge control item; mutually exclusive with `event`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fork_edge: Option<ForkEdge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -855,6 +824,14 @@ struct State {
     /// Reset on every restart, which is fine — the in-memory backend
     /// doesn't persist anyway.
     event_by_id: BTreeMap<String, (String, u64)>,
+    /// In-memory export ledger, keyed `tenant_id -> (durable-order seq -> item)`.
+    /// Only populated for in-memory runtimes; persisted runtimes keep the
+    /// authoritative ledger in the KV store. Both backends emit the same
+    /// `ledger:` cursor format so the export/changefeed surface is uniform.
+    export_ledger: BTreeMap<String, BTreeMap<u64, ExportLedgerItem>>,
+    /// Next per-tenant in-memory export ledger sequence. Starts at 1 to match
+    /// the persist sequencer (first committed item gets seq 1).
+    export_ledger_next_seq: BTreeMap<String, u64>,
     /// Alias / external_key uniqueness maps. Each entry is the canonical
     /// "is this alias claimed?" lookup; on `create_*` we check the map under
     /// the state lock and reject collisions with `AliasConflict`.
@@ -927,6 +904,13 @@ fn insert_runtime_event_cache(
     event: EventEnvelope,
 ) {
     let seq = event.seq;
+    if !persist_enabled {
+        // In-memory runtimes carry their own append-ordered export ledger so
+        // the changefeed emits `ledger:` cursors identical in shape to the
+        // persisted backend. The persisted backend writes its ledger through
+        // the durable KV sequencer instead (see `persist.rs`).
+        push_in_memory_export_ledger_item(state, export_ledger_item_from_event(event.clone()));
+    }
     state.events.insert((session_id.to_string(), seq), event);
 
     if !persist_enabled {
@@ -950,6 +934,45 @@ fn insert_runtime_event_cache(
 
     let stale_seq = seq - hot_event_cache_per_session;
     state.events.remove(&(session_id.to_string(), stale_seq));
+}
+
+/// Public `ledger:` cursor for an in-memory ledger entry. Mirrors the persist
+/// ledger key layout (`export_ledger_item_cursor_from_key` in `persist.rs`):
+/// events key on `event/{session}/{event_id}`, every other object type keys on
+/// `object/{object_type}/{object_id}`. The 20-digit zero-padded sequence makes
+/// lexical cursor order equal to durable commit order.
+fn in_memory_export_ledger_cursor(tenant_id: &str, seq: u64, item: &ExportLedgerItem) -> String {
+    if item.object_type == "event" {
+        let session_id = item
+            .session_id
+            .as_ref()
+            .map(|id| id.as_str())
+            .unwrap_or_default();
+        format!(
+            "ledger:{tenant_id}/v2/{seq:020}/event/{session_id}/{}",
+            item.object_id
+        )
+    } else {
+        format!(
+            "ledger:{tenant_id}/v2/{seq:020}/object/{}/{}",
+            item.object_type, item.object_id
+        )
+    }
+}
+
+/// Append `item` to the in-memory export ledger for its tenant, assigning the
+/// next per-tenant sequence. Caller holds the state lock, so sequence
+/// assignment is serialized (the same guarantee the persist sequencer gives).
+fn push_in_memory_export_ledger_item(state: &mut State, item: ExportLedgerItem) {
+    let tenant_id = item.tenant_id.as_str().to_string();
+    let seq = state.export_ledger_next_seq.entry(tenant_id.clone()).or_insert(1);
+    let assigned = *seq;
+    *seq = seq.saturating_add(1);
+    state
+        .export_ledger
+        .entry(tenant_id)
+        .or_default()
+        .insert(assigned, item);
 }
 
 fn scoped_alias_key(tenant_id: &str, alias: &str) -> String {
@@ -3147,17 +3170,14 @@ impl Runtime {
                 .map_err(internal);
         }
 
-        let items = self
-            .watch(WatchRequest {
-                tenant_id: tenant_id.clone(),
-                scope: WatchScope::Tenant,
-                session_id: None,
-                agent_id: None,
-                from_cursor: None,
-                limit: usize::MAX,
-            })
-            .await?;
-        Ok(items.last().map(|item| item.cursor.clone()))
+        let s = self.state.lock().await;
+        validate_tenant_live_in_state(&s, tenant_id)?;
+        Ok(s.export_ledger.get(tenant_id.as_str()).and_then(|ledger| {
+            ledger
+                .iter()
+                .next_back()
+                .map(|(&seq, item)| in_memory_export_ledger_cursor(tenant_id.as_str(), seq, item))
+        }))
     }
 
     pub async fn export_oldest_available_cursor(&self, tenant_id: &Id) -> Result<Option<String>> {
@@ -3171,17 +3191,14 @@ impl Runtime {
                 .map_err(internal);
         }
 
-        let items = self
-            .watch(WatchRequest {
-                tenant_id: tenant_id.clone(),
-                scope: WatchScope::Tenant,
-                session_id: None,
-                agent_id: None,
-                from_cursor: None,
-                limit: 1,
-            })
-            .await?;
-        Ok(items.first().map(|item| item.cursor.clone()))
+        let s = self.state.lock().await;
+        validate_tenant_live_in_state(&s, tenant_id)?;
+        Ok(s.export_ledger.get(tenant_id.as_str()).and_then(|ledger| {
+            ledger
+                .iter()
+                .next()
+                .map(|(&seq, item)| in_memory_export_ledger_cursor(tenant_id.as_str(), seq, item))
+        }))
     }
 
     pub fn with_kv_kms_and_content_crypto(
@@ -6157,6 +6174,27 @@ impl Runtime {
             let mut s = self.state.lock().await;
             s.sessions
                 .insert(child.session_id.as_str().to_string(), child.clone());
+            if self.persist.is_none() {
+                // Persisted runtimes emit the fork-edge ledger item inside
+                // `put_forked_session`; the in-memory ledger records it here so
+                // parent-scoped export consumers discover the child branch.
+                if let Some(fork) = child.forked_from.as_ref() {
+                    let edge = ForkEdge {
+                        parent_session_id: fork.session_id.clone(),
+                        child_session_id: child.session_id.clone(),
+                        fork_point_seq: fork.at_seq,
+                        created_at_ms: child.created_at_ms,
+                    };
+                    push_in_memory_export_ledger_item(
+                        &mut s,
+                        export_ledger_item_from_fork_edge(
+                            &child.tenant_id,
+                            Some(child.agent_id.clone()),
+                            edge,
+                        ),
+                    );
+                }
+            }
         }
         self.invalidate_tenant_aggregates(&req.tenant_id).await;
         Ok(child)
@@ -8901,192 +8939,6 @@ impl Runtime {
         Ok(response)
     }
 
-    pub async fn watch(&self, req: WatchRequest) -> Result<Vec<ChangefeedItem>> {
-        self.ensure_tenant_cached(&req.tenant_id).await?;
-        if let Some(session_id) = req.session_id.as_ref() {
-            self.ensure_session_cached(&req.tenant_id, session_id)
-                .await?;
-        }
-        if let Some(agent_id) = req.agent_id.as_ref() {
-            self.ensure_agent_cached(&req.tenant_id, agent_id).await?;
-        }
-        self.get_tenant(&req.tenant_id).await?;
-        // Enumerate over the authoritative session set (KV base + cache
-        // overlay), not the cache alone: in lazy hydration mode the cache
-        // holds only touched rows, and a watch must not silently narrow to
-        // them.
-        let tenant_sessions: Vec<Session> = self
-            .authoritative_tenant_sessions(&req.tenant_id)
-            .await?
-            .into_iter()
-            .filter(|session| {
-                session.deleted_at_ms.is_none()
-                    && session.tenant_id.as_str() == req.tenant_id.as_str()
-            })
-            .collect();
-        let (session_ids, fork_edges): (Vec<Id>, Vec<ForkEdge>) = {
-            let session_ids: Vec<Id> = match req.scope {
-                WatchScope::Session => {
-                    let session_id = req.session_id.clone().ok_or_else(|| {
-                        Error::new(ErrorCode::SessionNotFound, "watch session_id is required")
-                    })?;
-                    let live = tenant_sessions
-                        .iter()
-                        .any(|session| session.session_id.as_str() == session_id.as_str());
-                    if !live {
-                        return Err(Error::new(
-                            ErrorCode::SessionNotFound,
-                            format!("{}", session_id),
-                        ));
-                    }
-                    vec![session_id]
-                }
-                WatchScope::Tenant => tenant_sessions
-                    .iter()
-                    .map(|session| session.session_id.clone())
-                    .collect(),
-                WatchScope::Agent => {
-                    let agent_id = req.agent_id.clone().ok_or_else(|| {
-                        Error::new(ErrorCode::AgentNotFound, "watch agent_id is required")
-                    })?;
-                    self.get_agent(&req.tenant_id, &agent_id).await?;
-                    tenant_sessions
-                        .iter()
-                        .filter(|session| session.agent_id.as_str() == agent_id.as_str())
-                        .map(|session| session.session_id.clone())
-                        .collect()
-                }
-            };
-            // Fork-edge discovery: a child is announced in the feed whenever its
-            // parent is in scope, so a consumer following the parent learns the
-            // child sub-stream exists. The child knows its own origin, so we do
-            // not announce when only the child (not the parent) is in scope.
-            let scoped: std::collections::HashSet<&str> =
-                session_ids.iter().map(|id| id.as_str()).collect();
-            let fork_edges: Vec<ForkEdge> = tenant_sessions
-                .iter()
-                .filter_map(|session| {
-                    let parent = session.forked_from.as_ref()?;
-                    if !scoped.contains(parent.session_id.as_str()) {
-                        return None;
-                    }
-                    Some(ForkEdge {
-                        parent_session_id: parent.session_id.clone(),
-                        child_session_id: session.session_id.clone(),
-                        fork_point_seq: parent.at_seq,
-                        created_at_ms: session.created_at_ms,
-                    })
-                })
-                .collect();
-            (session_ids, fork_edges)
-        };
-
-        let cursor_context = self.changefeed_cursor_context()?;
-
-        // Frontier-first: the cursor already records each session's
-        // next-sequence position, so a poll fetches only events past it,
-        // bounded by the requested page size — O(new events + sessions in
-        // scope), not O(total retained history). Legacy (pre-frontier)
-        // cursors fall back to the full scan below for compatibility.
-        let frontier_positions = req
-            .from_cursor
-            .as_deref()
-            .and_then(parse_watch_frontier_cursor);
-        let legacy_cursor = req.from_cursor.is_some() && frontier_positions.is_none();
-        let per_session_limit = if legacy_cursor {
-            usize::MAX
-        } else {
-            req.limit.max(1)
-        };
-
-        // Build a unified, totally-ordered feed of per-session event sub-streams
-        // plus fork-edge control items. Each physical event is emitted exactly
-        // once on the session where it was written (no re-emission of ancestor
-        // history across a fork). Entry = (order_key-bearing cursor, item).
-        let mut entries: Vec<(String, ChangefeedItem)> = Vec::new();
-        for session_id in session_ids {
-            let from_seq = if legacy_cursor {
-                0
-            } else {
-                frontier_positions
-                    .as_ref()
-                    .and_then(|positions| positions.get(session_id.as_str()).copied())
-                    .unwrap_or(0)
-            };
-            let events = self
-                .fetch_from_seq(FetchRequest {
-                    tenant_id: req.tenant_id.clone(),
-                    session_id,
-                    from_seq,
-                    limit: per_session_limit,
-                })
-                .await?;
-            for event in events {
-                let cursor = event_cursor(&event, &cursor_context);
-                entries.push((
-                    cursor.clone(),
-                    ChangefeedItem {
-                        cursor,
-                        cell_id: cursor_context.cell_id.clone(),
-                        placement_scope_id: cursor_context.placement_scope_id.clone(),
-                        tablet_id: cursor_context.tablet_id,
-                        tablet_epoch: cursor_context.tablet_epoch,
-                        applied_index: cursor_context.applied_index,
-                        event: Some(event),
-                        fork_edge: None,
-                    },
-                ));
-            }
-        }
-        for edge in fork_edges {
-            let cursor = fork_edge_cursor(&edge, &cursor_context);
-            entries.push((
-                cursor.clone(),
-                ChangefeedItem {
-                    cursor,
-                    cell_id: cursor_context.cell_id.clone(),
-                    placement_scope_id: cursor_context.placement_scope_id.clone(),
-                    tablet_id: cursor_context.tablet_id,
-                    tablet_epoch: cursor_context.tablet_epoch,
-                    applied_index: cursor_context.applied_index,
-                    event: None,
-                    fork_edge: Some(edge),
-                },
-            ));
-        }
-        entries.sort_by(|left, right| {
-            watch_entry_order_key(&left.1).cmp(&watch_entry_order_key(&right.1))
-        });
-
-        if req.limit == 0 {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        let mut frontier = frontier_positions.unwrap_or_default();
-        let legacy_from_cursor_key = if legacy_cursor {
-            req.from_cursor.as_deref().map(event_cursor_order_key)
-        } else {
-            None
-        };
-        for (cursor, mut item) in entries {
-            if legacy_from_cursor_key.is_some_and(|from| event_cursor_order_key(&cursor) <= from) {
-                continue;
-            }
-            if legacy_from_cursor_key.is_none()
-                && watch_item_delivered_by_frontier(&item, &frontier)
-            {
-                continue;
-            }
-            advance_watch_frontier(&mut frontier, &item);
-            item.cursor = watch_frontier_cursor(&frontier, &cursor_context);
-            out.push(item);
-            if out.len() >= req.limit {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
     pub async fn export_watch(&self, req: ExportWatchRequest) -> Result<Vec<ExportFeedItem>> {
         self.export_watch_through(req, None).await
     }
@@ -9194,80 +9046,126 @@ impl Runtime {
             return Ok(out);
         }
 
-        let through_frontier = through_cursor
-            .map(|cursor| {
-                parse_watch_frontier_cursor(cursor).ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::InvalidCursor,
-                        "in-memory export high watermark must use the frontier:v1 format",
-                    )
-                })
-            })
-            .transpose()?;
-        {
-            let s = self.state.lock().await;
-            validate_export_consumer_scope_in_state(
-                &s,
-                &req.tenant_id,
-                req.scope,
-                req.agent_id.as_ref(),
-                req.session_id.as_ref(),
-            )?;
-        }
-        let mut out = Vec::new();
-        let mut from_cursor = req.from_cursor.clone();
-        let page_limit = req.limit.max(64);
-        loop {
-            let items = self
-                .watch(WatchRequest {
-                    tenant_id: req.tenant_id.clone(),
-                    scope: req.scope,
-                    session_id: req.session_id.clone(),
-                    agent_id: req.agent_id.clone(),
-                    from_cursor: from_cursor.clone(),
-                    limit: page_limit,
-                })
-                .await?;
-            let fetched = items.len();
-            if fetched == 0 {
-                break;
+        // In-memory export ledger: read the append-ordered ledger the same way
+        // the persist branch reads its durable ledger — scope + `ledger:` cursor
+        // bounds + include filter — so both backends behave identically. The
+        // `through_cursor` boundary is a `ledger:` high-watermark string.
+        if let Some(through_cursor) = through_cursor {
+            if parse_export_ledger_cursor_for_runtime(through_cursor).is_none() {
+                return Err(Error::new(
+                    ErrorCode::InvalidCursor,
+                    "in-memory export high watermark must use the ledger: format",
+                ));
             }
-            for item in items {
-                if through_frontier
-                    .as_ref()
-                    .is_some_and(|frontier| !watch_item_delivered_by_frontier(&item, frontier))
+        }
+        self.validate_in_memory_export_cursor(&req).await?;
+        let cursor_context = self.changefeed_cursor_context()?;
+        let mut out = Vec::new();
+        let s = self.state.lock().await;
+        validate_export_consumer_scope_in_state(
+            &s,
+            &req.tenant_id,
+            req.scope,
+            req.agent_id.as_ref(),
+            req.session_id.as_ref(),
+        )?;
+        if let Some(ledger) = s.export_ledger.get(req.tenant_id.as_str()) {
+            for (&seq, item) in ledger.iter() {
+                let cursor = in_memory_export_ledger_cursor(req.tenant_id.as_str(), seq, item);
+                if req
+                    .from_cursor
+                    .as_deref()
+                    .is_some_and(|from| cursor.as_str() <= from)
                 {
-                    return Ok(out);
-                }
-                from_cursor = Some(item.cursor.clone());
-                let ledger_item = if let Some(event) = item.event {
-                    export_ledger_item_from_event(event)
-                } else if let Some(edge) = item.fork_edge {
-                    export_ledger_item_from_fork_edge(&req.tenant_id, req.agent_id.clone(), edge)
-                } else {
                     continue;
-                };
-                if !export_item_matches_include(&ledger_item, &req.include) {
+                }
+                if through_cursor.is_some_and(|boundary| cursor.as_str() > boundary) {
+                    break;
+                }
+                if !export_item_matches_scope(
+                    item,
+                    req.scope,
+                    req.agent_id.as_ref(),
+                    req.session_id.as_ref(),
+                ) || !export_item_matches_include(item, &req.include)
+                {
                     continue;
                 }
                 out.push(ExportFeedItem {
-                    cursor: item.cursor,
-                    cell_id: item.cell_id,
-                    placement_scope_id: item.placement_scope_id,
-                    tablet_id: item.tablet_id,
-                    tablet_epoch: item.tablet_epoch,
-                    applied_index: item.applied_index,
-                    item: ledger_item,
+                    cursor,
+                    cell_id: cursor_context.cell_id.clone(),
+                    placement_scope_id: cursor_context.placement_scope_id.clone(),
+                    tablet_id: cursor_context.tablet_id,
+                    tablet_epoch: cursor_context.tablet_epoch,
+                    applied_index: cursor_context.applied_index,
+                    item: item.clone(),
                 });
                 if out.len() >= req.limit {
-                    return Ok(out);
+                    break;
                 }
-            }
-            if fetched < page_limit {
-                break;
             }
         }
         Ok(out)
+    }
+
+    /// Cursor validation for the in-memory export ledger, mirroring
+    /// `validate_persistent_export_cursor`: the resume cursor must use the
+    /// `ledger:` format, belong to this tenant (and session, for session
+    /// scope), and still be within the retained ledger range.
+    async fn validate_in_memory_export_cursor(&self, req: &ExportWatchRequest) -> Result<()> {
+        let Some(cursor) = req.from_cursor.as_deref() else {
+            return Ok(());
+        };
+        let Some(parts) = parse_export_ledger_cursor_for_runtime(cursor) else {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "in-memory export cursor must use the ledger: format",
+            ));
+        };
+        if parts.tenant_id != req.tenant_id.as_str() {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export cursor belongs to a different tenant",
+            ));
+        }
+        if req.scope == WatchScope::Session
+            && req.session_id.as_ref().is_some_and(|session_id| {
+                parts
+                    .session_id
+                    .is_some_and(|cursor_session_id| cursor_session_id != session_id.as_str())
+            })
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export cursor belongs to a different session",
+            ));
+        }
+        let s = self.state.lock().await;
+        let ledger = s.export_ledger.get(req.tenant_id.as_str());
+        if let Some((&oldest_seq, oldest_item)) = ledger.and_then(|ledger| ledger.iter().next()) {
+            let oldest =
+                in_memory_export_ledger_cursor(req.tenant_id.as_str(), oldest_seq, oldest_item);
+            if cursor < oldest.as_str() {
+                return Err(Error::new(
+                    ErrorCode::InvalidCursor,
+                    format!(
+                        "export cursor is older than the retained export ledger; oldest_available_cursor={oldest}"
+                    ),
+                ));
+            }
+        }
+        let exists = ledger.is_some_and(|ledger| {
+            ledger.iter().any(|(&seq, item)| {
+                in_memory_export_ledger_cursor(req.tenant_id.as_str(), seq, item) == cursor
+            })
+        });
+        if !exists {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export cursor was not found in the retained export ledger",
+            ));
+        }
+        Ok(())
     }
 
     async fn validate_persistent_export_cursor(&self, req: &ExportWatchRequest) -> Result<()> {
@@ -11573,152 +11471,6 @@ fn push_budgeted<T: Serialize>(used: &mut usize, max_bytes: usize, value: &T) ->
     }
     *used += bytes;
     true
-}
-
-fn event_cursor(event: &EventEnvelope, context: &ChangefeedCursorContext) -> String {
-    let cell = context.cell_id.as_deref().unwrap_or("none");
-    let placement_scope = context.placement_scope_id.as_deref().unwrap_or("none");
-    let tablet = context
-        .tablet_id
-        .map_or_else(|| "none".to_string(), |tablet_id| tablet_id.to_string());
-    let epoch = context
-        .tablet_epoch
-        .map_or_else(|| "none".to_string(), |epoch| epoch.to_string());
-    let applied = context
-        .applied_index
-        .map_or_else(|| "none".to_string(), |index| index.to_string());
-    format!(
-        "v2:{:020}:{}:{:020}:cell={}:scope={}:tablet={}:epoch={}:applied={}",
-        event.created_at_ms,
-        event.session_id,
-        event.seq,
-        cell,
-        placement_scope,
-        tablet,
-        epoch,
-        applied
-    )
-}
-
-fn event_cursor_order_key(cursor: &str) -> &str {
-    cursor
-        .split_once(":cell=")
-        .map(|(prefix, _)| prefix)
-        .unwrap_or(cursor)
-}
-
-fn watch_entry_order_key(item: &ChangefeedItem) -> (u64, String, u8, u64) {
-    if let Some(edge) = &item.fork_edge {
-        return (
-            edge.created_at_ms,
-            edge.child_session_id.as_str().to_string(),
-            0,
-            0,
-        );
-    }
-    if let Some(event) = &item.event {
-        return (
-            event.created_at_ms,
-            event.session_id.as_str().to_string(),
-            1,
-            event.seq,
-        );
-    }
-    (u64::MAX, String::new(), u8::MAX, u64::MAX)
-}
-
-fn watch_frontier_cursor(
-    frontier: &BTreeMap<String, u64>,
-    context: &ChangefeedCursorContext,
-) -> String {
-    let cell = context.cell_id.as_deref().unwrap_or("none");
-    let placement_scope = context.placement_scope_id.as_deref().unwrap_or("none");
-    let tablet = context
-        .tablet_id
-        .map_or_else(|| "none".to_string(), |tablet_id| tablet_id.to_string());
-    let epoch = context
-        .tablet_epoch
-        .map_or_else(|| "none".to_string(), |epoch| epoch.to_string());
-    let applied = context
-        .applied_index
-        .map_or_else(|| "none".to_string(), |index| index.to_string());
-    let sessions = frontier
-        .iter()
-        .map(|(session_id, next_seq)| format!("{session_id}@{next_seq}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "frontier:v1:sessions={}:cell={}:scope={}:tablet={}:epoch={}:applied={}",
-        sessions, cell, placement_scope, tablet, epoch, applied
-    )
-}
-
-fn parse_watch_frontier_cursor(cursor: &str) -> Option<BTreeMap<String, u64>> {
-    let raw = cursor.strip_prefix("frontier:v1:sessions=")?;
-    let (sessions, _) = raw.split_once(":cell=").unwrap_or((raw, ""));
-    let mut frontier = BTreeMap::new();
-    if sessions.is_empty() {
-        return Some(frontier);
-    }
-    for entry in sessions.split(',') {
-        let (session_id, next_seq) = entry.rsplit_once('@')?;
-        if session_id.is_empty() {
-            return None;
-        }
-        frontier.insert(session_id.to_string(), next_seq.parse().ok()?);
-    }
-    Some(frontier)
-}
-
-fn watch_item_delivered_by_frontier(
-    item: &ChangefeedItem,
-    frontier: &BTreeMap<String, u64>,
-) -> bool {
-    if let Some(event) = &item.event {
-        return frontier
-            .get(event.session_id.as_str())
-            .is_some_and(|next_seq| event.seq < *next_seq);
-    }
-    if let Some(edge) = &item.fork_edge {
-        return frontier.contains_key(edge.child_session_id.as_str());
-    }
-    false
-}
-
-fn advance_watch_frontier(frontier: &mut BTreeMap<String, u64>, item: &ChangefeedItem) {
-    if let Some(event) = &item.event {
-        let next_seq = event.seq.saturating_add(1);
-        let entry = frontier
-            .entry(event.session_id.as_str().to_string())
-            .or_insert(0);
-        *entry = (*entry).max(next_seq);
-    } else if let Some(edge) = &item.fork_edge {
-        frontier
-            .entry(edge.child_session_id.as_str().to_string())
-            .or_insert(0);
-    }
-}
-
-/// Cursor for a fork-edge control item. Keyed by the child's creation time and
-/// id with a `:fork` discriminator so it slots into the same total order as
-/// event cursors yet can never collide with a real event's order key. One
-/// fork-edge per child makes this unique.
-fn fork_edge_cursor(edge: &ForkEdge, context: &ChangefeedCursorContext) -> String {
-    let cell = context.cell_id.as_deref().unwrap_or("none");
-    let placement_scope = context.placement_scope_id.as_deref().unwrap_or("none");
-    let tablet = context
-        .tablet_id
-        .map_or_else(|| "none".to_string(), |tablet_id| tablet_id.to_string());
-    let epoch = context
-        .tablet_epoch
-        .map_or_else(|| "none".to_string(), |epoch| epoch.to_string());
-    let applied = context
-        .applied_index
-        .map_or_else(|| "none".to_string(), |index| index.to_string());
-    format!(
-        "v2:{:020}:{}:{:020}:fork:cell={}:scope={}:tablet={}:epoch={}:applied={}",
-        edge.created_at_ms, edge.child_session_id, 0, cell, placement_scope, tablet, epoch, applied
-    )
 }
 
 fn validate_export_include(include: &[String]) -> Result<()> {
