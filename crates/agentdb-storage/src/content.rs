@@ -149,6 +149,35 @@ pub struct MirrorCacheSweepReport {
     pub evicted: u64,
     pub retained_unmirrored: u64,
     pub skipped_no_mtime: u64,
+    /// Un-mirrored local objects re-queued for upload this pass (a subset of
+    /// `retained_unmirrored`; the rest were left for a later pass because the
+    /// backlog ceiling was reached or a read failed).
+    pub requeued: u64,
+    pub requeued_bytes: u64,
+}
+
+/// Result of a re-drive pass over un-mirrored local objects
+/// ([`AsyncMirrorContentBackend::reconcile_unmirrored`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MirrorReconcileReport {
+    pub scanned: u64,
+    pub already_mirrored: u64,
+    pub requeued: u64,
+    pub requeued_bytes: u64,
+    /// Objects left for a later pass because the backlog ceiling was reached.
+    pub throttled: u64,
+    /// Objects whose mirror-head or primary read failed; retained for retry.
+    pub errors: u64,
+}
+
+/// Outcome of attempting to re-queue one un-mirrored local object.
+enum RequeueOutcome {
+    /// Re-queued for upload; carries the payload byte count.
+    Requeued(u64),
+    /// The backlog ceiling was reached; left for a later pass.
+    Throttled,
+    /// The primary read or enqueue failed; the local copy is retained.
+    Error,
 }
 
 #[derive(Default)]
@@ -360,9 +389,22 @@ impl AsyncMirrorContentBackend {
                     report.evicted += 1;
                 }
                 Ok(false) => {
-                    // Mirror does not have it (upload pending or failed):
-                    // the local copy is the only copy. Never evict it.
+                    // Mirror does not have it (upload lost to a crash, an
+                    // exhausted retry budget, or an outage past the worker's
+                    // retries): the local copy is the only copy. Never evict
+                    // it, and re-drive the upload so the object still reaches
+                    // the mirror instead of accumulating as permanent debt.
                     report.retained_unmirrored += 1;
+                    match self
+                        .requeue_local_object(&object.tenant_id, &object.artifact_id)
+                        .await
+                    {
+                        RequeueOutcome::Requeued(bytes) => {
+                            report.requeued += 1;
+                            report.requeued_bytes += bytes;
+                        }
+                        RequeueOutcome::Throttled | RequeueOutcome::Error => {}
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -376,6 +418,90 @@ impl AsyncMirrorContentBackend {
             }
         }
         Ok(report)
+    }
+
+    /// Re-drive every local object the mirror is missing back onto the upload
+    /// queue. The local primary is the durable record of what must be
+    /// mirrored, so this recovers uploads lost to a process crash, an
+    /// exhausted retry budget, or an object-store outage that outlived the
+    /// worker's retries — without any persisted queue. Safe to run repeatedly:
+    /// an object the mirror already holds is skipped, and a re-uploaded object
+    /// is an idempotent create of identical bytes.
+    ///
+    /// Requires the primary to support `list_objects`; other backends return
+    /// `Unsupported` and this is a no-op.
+    pub async fn reconcile_unmirrored(
+        &self,
+        list_limit: usize,
+    ) -> io::Result<MirrorReconcileReport> {
+        let listing = self.primary.list_objects(list_limit).await?;
+        let mut report = MirrorReconcileReport {
+            scanned: listing.objects.len() as u64,
+            ..MirrorReconcileReport::default()
+        };
+        for object in listing.objects {
+            match self.mirror.head(&object.tenant_id, &object.artifact_id).await {
+                Ok(true) => report.already_mirrored += 1,
+                Ok(false) => match self
+                    .requeue_local_object(&object.tenant_id, &object.artifact_id)
+                    .await
+                {
+                    RequeueOutcome::Requeued(bytes) => {
+                        report.requeued += 1;
+                        report.requeued_bytes += bytes;
+                    }
+                    RequeueOutcome::Throttled => report.throttled += 1,
+                    RequeueOutcome::Error => report.errors += 1,
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        tenant_id = %object.tenant_id,
+                        artifact_id = %object.artifact_id,
+                        "mirror reconcile head failed; retaining local copy for retry"
+                    );
+                    report.errors += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Read an un-mirrored local object and re-enqueue its upload, honoring the
+    /// same backlog ceiling as a fresh `put` so reconciliation cannot push the
+    /// backlog past its bound. Reads the primary backend directly so it does
+    /// not refresh managed-cache age.
+    async fn requeue_local_object(&self, tenant_id: &str, artifact_id: &str) -> RequeueOutcome {
+        let bytes = match self.primary.get(tenant_id, artifact_id).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    tenant_id,
+                    artifact_id,
+                    "mirror reconcile primary read failed; retaining local copy for retry"
+                );
+                return RequeueOutcome::Error;
+            }
+        };
+        if self.over_backlog_limit(bytes.len() as u64) {
+            return RequeueOutcome::Throttled;
+        }
+        let byte_len = bytes.len() as u64;
+        match self
+            .enqueue(MirrorJob::Put {
+                tenant_id: tenant_id.into(),
+                artifact_id: artifact_id.into(),
+                bytes,
+            })
+            .await
+        {
+            Ok(()) => RequeueOutcome::Requeued(byte_len),
+            Err(error) => {
+                tracing::warn!(?error, tenant_id, artifact_id, "mirror reconcile enqueue failed");
+                RequeueOutcome::Error
+            }
+        }
     }
 
     pub fn stats(&self) -> AsyncMirrorStats {
