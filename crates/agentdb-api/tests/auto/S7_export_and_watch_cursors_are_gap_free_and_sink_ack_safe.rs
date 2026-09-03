@@ -19,7 +19,6 @@ use agentdb_storage::{ContentBackend, InMemoryContentBackend, KvStore, RocksKvSt
 use common::{spawn_app_with_state, TestApp};
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::time::{sleep, Duration};
 
 fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
     static STORES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<dyn KvStore + Send + Sync>>>> =
@@ -133,25 +132,6 @@ fn export_request(
         .query(&query)
 }
 
-fn tenant_export_request(
-    app: &TestApp,
-    tid: &str,
-    limit: usize,
-    cursor: Option<&str>,
-) -> reqwest::RequestBuilder {
-    let mut query = vec![
-        ("scope", "tenant".to_string()),
-        ("include", "events".to_string()),
-        ("limit", limit.to_string()),
-    ];
-    if let Some(cursor) = cursor {
-        query.push(("from_cursor", cursor.to_string()));
-    }
-    app.client
-        .get(format!("{}/api/tenants/{tid}/exports/watch", app.base))
-        .query(&query)
-}
-
 async fn export_page(
     app: &TestApp,
     tid: &str,
@@ -170,124 +150,9 @@ async fn export_page(
         .unwrap()
 }
 
-async fn tenant_export_page(
-    app: &TestApp,
-    tid: &str,
-    limit: usize,
-    cursor: Option<&str>,
-) -> serde_json::Value {
-    tenant_export_request(app, tid, limit, cursor)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
-}
-
-async fn create_consumer(app: &TestApp, tid: &str) {
-    let created: serde_json::Value = app
-        .client
-        .post(format!("{}/api/tenants/{tid}/exports/consumers", app.base))
-        .json(&json!({
-            "name": "auto-clickhouse",
-            "scope": "tenant",
-            "include": ["events"]
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(created["last_acked_cursor"].is_null());
-}
-
-async fn claim_consumer(app: &TestApp, tid: &str, owner: &str, lease_ms: u64) {
-    let claimed: serde_json::Value = app
-        .client
-        .post(format!(
-            "{}/api/tenants/{tid}/exports/consumers/auto-clickhouse/claim",
-            app.base
-        ))
-        .json(&json!({"lease_owner": owner, "lease_ms": lease_ms}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(claimed["lease_owner"], owner);
-}
-
-async fn ack_consumer(app: &TestApp, tid: &str, owner: &str, cursor: &str) -> serde_json::Value {
-    app.client
-        .post(format!(
-            "{}/api/tenants/{tid}/exports/consumers/auto-clickhouse/ack",
-            app.base
-        ))
-        .json(&json!({
-            "lease_owner": owner,
-            "cursor": cursor,
-            "snapshot_high_watermark": cursor
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
-}
-
-async fn consumer_status(app: &TestApp, tid: &str) -> serde_json::Value {
-    app.client
-        .get(format!(
-            "{}/api/tenants/{tid}/exports/consumers/auto-clickhouse",
-            app.base
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
-}
-
-#[derive(Default)]
-struct Sink {
-    accepted: BTreeMap<String, serde_json::Value>,
-    partial_attempts: Vec<String>,
-}
-
-impl Sink {
-    fn accept_full(&mut self, item: &serde_json::Value) {
-        let cursor = item["cursor"].as_str().unwrap().to_string();
-        self.accepted.entry(cursor).or_insert_with(|| item.clone());
-    }
-
-    fn accept_partial_without_commit(&mut self, item: &serde_json::Value) {
-        self.partial_attempts
-            .push(item["cursor"].as_str().unwrap().to_string());
-    }
-
-    fn cursors(&self) -> BTreeSet<String> {
-        self.accepted.keys().cloned().collect()
-    }
-}
-
 #[tokio::test]
 async fn export_and_watch_cursors_are_gap_free_and_sink_ack_safe() {
-    let (mut app, _dir) = spawn_persistent_app().await;
+    let (app, _dir) = spawn_persistent_app().await;
     let (tid, aid, sid) = seed(&app, "auto-export").await;
     for n in 0..6_u64 {
         append(&app, &tid, &aid, &sid, n).await;
@@ -340,66 +205,4 @@ async fn export_and_watch_cursors_are_gap_free_and_sink_ack_safe() {
         wrong_scope.status(),
         reqwest::StatusCode::UNPROCESSABLE_ENTITY
     );
-
-    create_consumer(&app, &tid).await;
-    let mut sink = Sink::default();
-
-    claim_consumer(&app, &tid, "worker-before-sink", 1).await;
-    let first_page = tenant_export_page(&app, &tid, 3, None).await;
-    let first_items = first_page["items"].as_array().unwrap();
-    assert_eq!(first_items.len(), 3);
-    let before_sink_status = consumer_status(&app, &tid).await;
-    assert!(before_sink_status["last_acked_cursor"].is_null());
-    assert_eq!(before_sink_status["pending_items"], 6);
-
-    sleep(Duration::from_millis(5)).await;
-    claim_consumer(&app, &tid, "worker-partial-sink", 1).await;
-    sink.accept_partial_without_commit(&first_items[0]);
-    let partial_status = consumer_status(&app, &tid).await;
-    assert!(partial_status["last_acked_cursor"].is_null());
-    assert!(sink.accepted.is_empty());
-
-    sleep(Duration::from_millis(5)).await;
-    claim_consumer(&app, &tid, "worker-full-sink-crash", 1).await;
-    for item in first_items {
-        sink.accept_full(item);
-    }
-    let full_sink_status = consumer_status(&app, &tid).await;
-    assert!(full_sink_status["last_acked_cursor"].is_null());
-    assert_eq!(sink.accepted.len(), 3);
-
-    sleep(Duration::from_millis(5)).await;
-    let runtime = app.runtime.clone();
-    drop(app);
-    app = spawn_app_with_state(AppState::new(runtime)).await;
-    claim_consumer(&app, &tid, "worker-ack-after-replay", 60_000).await;
-    for item in first_items {
-        sink.accept_full(item);
-    }
-    let first_ack_cursor = first_items.last().unwrap()["cursor"].as_str().unwrap();
-    let acked = ack_consumer(&app, &tid, "worker-ack-after-replay", first_ack_cursor).await;
-    assert_eq!(acked["last_acked_cursor"], first_ack_cursor);
-    assert_eq!(sink.accepted.len(), 3);
-
-    let remaining_page = tenant_export_page(&app, &tid, 10, Some(first_ack_cursor)).await;
-    let remaining_items = remaining_page["items"].as_array().unwrap();
-    assert_eq!(remaining_items.len(), 3);
-    for item in remaining_items {
-        sink.accept_full(item);
-    }
-    let final_cursor = remaining_items.last().unwrap()["cursor"].as_str().unwrap();
-    let final_ack = ack_consumer(&app, &tid, "worker-ack-after-replay", final_cursor).await;
-    assert_eq!(final_ack["last_acked_cursor"], final_cursor);
-
-    let no_replay_page = tenant_export_page(&app, &tid, 10, Some(final_cursor)).await;
-    assert!(no_replay_page["items"].as_array().unwrap().is_empty());
-    let final_status = consumer_status(&app, &tid).await;
-    assert_eq!(final_status["last_acked_cursor"], final_cursor);
-    assert_eq!(final_status["pending_items"], 0);
-    let expected_sink_cursors = first_items
-        .iter()
-        .chain(remaining_items.iter())
-        .map(|item| item["cursor"].as_str().unwrap().to_string())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(sink.cursors(), expected_sink_cursors);
 }

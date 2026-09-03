@@ -258,11 +258,6 @@ GET  /api/tenants/{tenant_id}/watch
 GET  /api/tenants/{tenant_id}/exports/watch
 POST /api/tenants/{tenant_id}/exports/backfill
 GET  /api/tenants/{tenant_id}/exports/status
-POST /api/tenants/{tenant_id}/exports/consumers
-GET  /api/tenants/{tenant_id}/exports/consumers/{name}
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/claim
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/ack
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/rewind
 GET  /api/admin/exports
 ```
 
@@ -297,10 +292,10 @@ comma-separated `include` query parameter, for example
 `include=events,records`, to filter object types:
 
 Durable export is currently a single-tablet feature. When metadata-backed
-cluster routing is active (`routing.mode = snapshot`), export status, watch,
-backfill, admin export status, and managed-consumer endpoints fail closed with
-HTTP 422 until a cross-tablet merge frontier exists. Ordinary runtime watch is
-still available in that evaluation mode.
+cluster routing is active (`routing.mode = snapshot`), the changefeed, export
+status, watch, backfill, and admin export status fail closed with HTTP 422 until
+a cross-tablet merge frontier exists. Ordinary runtime watch is still available
+in that evaluation mode.
 
 ```json
 {
@@ -362,8 +357,8 @@ write-smoke behavior.
 
 Use `agentdbctl export jsonl run --output ./events.jsonl` or an object-store URI
 such as `s3://bucket/prefix/events.jsonl` for raw JSONL archives. The JSONL
-command writes the same export envelopes returned by `exports/watch` and
-supports managed consumer claim/ack options.
+command reads the same export envelopes from the `changes` changefeed and keeps
+its resume cursor in a local checkpoint file.
 ClickHouse and JSONL runs also support exporter-side minimization flags:
 `--allow-object-type`, `--deny-object-type`, `--allow-event-kind`,
 `--deny-event-kind`, `--redact-field`, `--payload-mode full|hash|drop`, and
@@ -390,51 +385,20 @@ request; run metadata backfill first, then event backfill/tail. Omit
 `snapshot_high_watermark` on the first metadata request, then echo the returned
 value on every request that supplies the preceding `from_cursor`.
 
-Managed export consumers provide durable checkpoints and leases. Official
-ClickHouse event exporters usually use `include=["events"]`; generic consumers
-can include any supported object types:
+Consumers hold their own resume cursor — the changefeed and export reads are
+stateless. Persist the last `next_cursor` and pass it back as `from_cursor` to
+resume; `agentdbctl`'s exporters keep this cursor in a client-side checkpoint
+(a ClickHouse table or a local file). Run one exporter per tenant/consumer to
+avoid double-writing a sink. To avoid data loss, insert into the sink before
+advancing the checkpoint.
 
-```json
-{
-  "name": "prod-clickhouse",
-  "scope": "tenant",
-  "include": ["events"]
-}
-```
-
-Use `claim` with `lease_owner` and `lease_ms`, `ack` with the durable sink
-cursor after the sink accepts a batch, and `rewind` to replay from an older
-cursor or from the beginning. `GET /exports/consumers/{name}` and
-`GET /api/admin/exports` include derived status fields such as
-`pending_items`, `high_watermark`, `pending_oldest_created_at_ms`, `lag_ms`, and
-`lease_active`. The admin response also includes an aggregate `metrics` object
-with total pending export items, max consumer lag, oldest pending timestamp,
-lease counts, and per-tenant oldest retained cursor/high-watermark entries.
-
-On persistent runtimes, ordinary ledger ack and rewind operations reject
-fabricated, expired, cross-tenant, scope-incompatible, or filter-incompatible
-cursors; the cursor must identify a retained ledger item emitted for that
-consumer. For a metadata snapshot, continue paging until a response reports
-`complete=true`, then pass the last delivered `snapshot:...` cursor and that
-response's `snapshot_high_watermark`. If the completed snapshot is empty,
-`cursor` may be null as long as `snapshot_high_watermark` is present. AgentDB
-verifies the snapshot tenant when a snapshot cursor exists and always verifies
-that the high watermark identifies a retained tenant ledger item, then stores
-the high watermark as the durable ack. Tailing therefore resumes at the ledger
-boundary instead of at a page-local snapshot cursor. Snapshot-style ack is
-accepted only for a tenant-scope, metadata-only consumer; event, agent, and
-session consumers must acknowledge a cursor they actually received.
-
-Consumer status counts pending rows by streaming the ledger. For one consumer,
-additional scan memory is O(1) and request time is O(N), where N is the number
-of retained ledger candidates visited after its checkpoint; rows excluded by
-the consumer's include filter can still contribute to N.
-
-For high availability, run at least two connector processes with the same
-consumer name and different `lease_owner` values. Only the active lease holder
-can ack. If it dies, another process claims the lease after expiry and resumes
-from the last durable acked cursor. To avoid data loss, connectors must insert
-into the sink before acking AgentDB.
+For a current-state bootstrap, `POST /exports/backfill` with `include` set to
+metadata types (`tenants`, `agents`, `sessions`, `artifacts`, `records`) and no
+`events` returns a point-in-time snapshot of current rows using `snapshot:...`
+cursors. Page until a response reports `complete=true`, carrying the returned
+`snapshot_high_watermark` on each subsequent request, then resume tailing from
+that ledger boundary via `GET /changes`. If the completed snapshot is empty,
+`cursor` may be null as long as `snapshot_high_watermark` is present.
 
 Artifacts:
 

@@ -675,77 +675,6 @@ pub struct ExportFeedItem {
     pub item: ExportLedgerItem,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExportConsumer {
-    pub tenant_id: Id,
-    pub consumer_name: String,
-    pub scope: WatchScope,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<Id>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<Id>,
-    pub include: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_acked_cursor: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub snapshot_high_watermark: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lease_owner: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lease_expires_at_ms: Option<u64>,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ExportConsumerStatus {
-    #[serde(flatten)]
-    pub consumer: ExportConsumer,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub high_watermark: Option<String>,
-    pub pending_items: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_oldest_created_at_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lag_ms: Option<u64>,
-    pub lease_active: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct CreateExportConsumerRequest {
-    pub tenant_id: Id,
-    pub consumer_name: String,
-    pub scope: WatchScope,
-    pub agent_id: Option<Id>,
-    pub session_id: Option<Id>,
-    pub include: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ClaimExportConsumerRequest {
-    pub tenant_id: Id,
-    pub consumer_name: String,
-    pub lease_owner: String,
-    pub lease_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct AckExportConsumerRequest {
-    pub tenant_id: Id,
-    pub consumer_name: String,
-    pub cursor: Option<String>,
-    pub snapshot_high_watermark: Option<String>,
-    pub lease_owner: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RewindExportConsumerRequest {
-    pub tenant_id: Id,
-    pub consumer_name: String,
-    pub cursor: Option<String>,
-    pub lease_owner: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 struct ChangefeedCursorContext {
     cell_id: Option<String>,
@@ -936,8 +865,6 @@ struct State {
     tenant_aliases: BTreeMap<String, String>,
     agent_aliases: BTreeMap<String, String>,
     session_aliases: BTreeMap<String, String>,
-    /// Managed export consumers keyed by `(tenant_id, consumer_name)`.
-    export_consumers: BTreeMap<(String, String), ExportConsumer>,
     /// V2.2 searchable records, keyed by `record_id` string. Hydrated at
     /// startup from `Persist::scan_all_records`; updated on every
     /// `write_record` / `delete_record`.
@@ -2192,7 +2119,7 @@ fn movement_scratch_root(
     Ok(root)
 }
 
-fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 13] {
+fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 12] {
     [
         (
             "tenants",
@@ -2243,11 +2170,6 @@ fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 13] 
             "record index commits",
             b"record/searchable_commit/".as_slice(),
             startup_hydration_limit("AGENTDB_STARTUP_MAX_RECORDS", 100_000),
-        ),
-        (
-            "managed export consumers",
-            b"record/export_consumer/".as_slice(),
-            startup_hydration_limit("AGENTDB_STARTUP_MAX_EXPORT_CONSUMERS", 10_000),
         ),
         (
             "tenant metadata",
@@ -2343,18 +2265,6 @@ fn hydrate_runtime_from_persist(
     // hydrates in both modes.
     if mode == HydrationMode::Full {
         hydrate_metadata_maps(persist, &mut state);
-    }
-    for consumer in persist
-        .scan_all_export_consumers()
-        .expect("hydrate export consumers")
-    {
-        state.export_consumers.insert(
-            (
-                consumer.tenant_id.as_str().to_string(),
-                consumer.consumer_name.clone(),
-            ),
-            consumer,
-        );
     }
     for entry in persist.scan_all_tenant_meta().expect("hydrate tenant meta") {
         state
@@ -4388,7 +4298,7 @@ impl Runtime {
     /// cached sets (tenants/agents/sessions/artifacts/aliases/records/rows/
     /// event hot tails) are evicted and reload on demand through the Stage 1
     /// fallbacks (skills and their bindings included); the small config sets
-    /// with no per-row fallback (export consumers, record edges, tenant
+    /// with no per-row fallback (record edges, tenant
     /// meta) are re-scanned;
     /// the search indexes catch up incrementally from the replicated outbox
     /// rows. Cost per apply: O(changed + small sets), not O(everything).
@@ -4396,7 +4306,6 @@ impl Runtime {
         let Some(persist) = self.persist.as_ref() else {
             return Ok(());
         };
-        let consumers = persist.scan_all_export_consumers().map_err(internal)?;
         let meta = persist.scan_all_tenant_meta().map_err(internal)?;
         {
             let mut s = self.state.lock().await;
@@ -4410,16 +4319,6 @@ impl Runtime {
             s.records.clear();
             s.events.clear();
             s.tenant_aggregate_cache.clear();
-            s.export_consumers.clear();
-            for consumer in consumers {
-                s.export_consumers.insert(
-                    (
-                        consumer.tenant_id.as_str().to_string(),
-                        consumer.consumer_name.clone(),
-                    ),
-                    consumer,
-                );
-            }
             s.tenant_meta.clear();
             for entry in meta {
                 s.tenant_meta
@@ -9425,523 +9324,6 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn create_export_consumer(
-        &self,
-        req: CreateExportConsumerRequest,
-    ) -> Result<ExportConsumer> {
-        validate_consumer_name(&req.consumer_name)?;
-        validate_export_include(&req.include)?;
-        self.ensure_tenant_cached(&req.tenant_id).await?;
-        if let Some(session_id) = req.session_id.as_ref() {
-            self.ensure_session_cached(&req.tenant_id, session_id)
-                .await?;
-        }
-        if let Some(agent_id) = req.agent_id.as_ref() {
-            self.ensure_agent_cached(&req.tenant_id, agent_id).await?;
-        }
-        let now_ms = crate::now_ms();
-        let consumer = {
-            let s = self.state.lock().await;
-            validate_export_consumer_scope_in_state(
-                &s,
-                &req.tenant_id,
-                req.scope,
-                req.agent_id.as_ref(),
-                req.session_id.as_ref(),
-            )?;
-            let existing = s.export_consumers.get(&(
-                req.tenant_id.as_str().to_string(),
-                req.consumer_name.clone(),
-            ));
-            ExportConsumer {
-                tenant_id: req.tenant_id.clone(),
-                consumer_name: req.consumer_name.clone(),
-                scope: req.scope,
-                agent_id: req.agent_id.clone(),
-                session_id: req.session_id.clone(),
-                include: if req.include.is_empty() {
-                    vec!["events".into()]
-                } else {
-                    req.include.clone()
-                },
-                last_acked_cursor: existing.and_then(|consumer| consumer.last_acked_cursor.clone()),
-                snapshot_high_watermark: existing
-                    .and_then(|consumer| consumer.snapshot_high_watermark.clone()),
-                lease_owner: existing.and_then(|consumer| consumer.lease_owner.clone()),
-                lease_expires_at_ms: existing.and_then(|consumer| consumer.lease_expires_at_ms),
-                created_at_ms: existing.map_or(now_ms, |consumer| consumer.created_at_ms),
-                updated_at_ms: now_ms,
-            }
-        };
-        if let Some(persist) = &self.persist {
-            persist
-                .put_export_consumer_async(&consumer)
-                .await
-                .map_err(internal)?;
-        }
-        let mut s = self.state.lock().await;
-        s.export_consumers.insert(
-            (
-                consumer.tenant_id.as_str().to_string(),
-                consumer.consumer_name.clone(),
-            ),
-            consumer.clone(),
-        );
-        Ok(consumer)
-    }
-
-    pub async fn get_export_consumer(
-        &self,
-        tenant_id: &Id,
-        consumer_name: &str,
-    ) -> Result<ExportConsumer> {
-        self.ensure_tenant_cached(tenant_id).await?;
-        validate_consumer_name(consumer_name)?;
-        let s = self.state.lock().await;
-        validate_tenant_live_in_state(&s, tenant_id)?;
-        s.export_consumers
-            .get(&(tenant_id.as_str().to_string(), consumer_name.to_string()))
-            .cloned()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorCode::PolicyNotFound,
-                    format!("export consumer {consumer_name} not found"),
-                )
-            })
-    }
-
-    pub async fn get_export_consumer_status(
-        &self,
-        tenant_id: &Id,
-        consumer_name: &str,
-    ) -> Result<ExportConsumerStatus> {
-        let consumer = self.get_export_consumer(tenant_id, consumer_name).await?;
-        self.export_consumer_status(consumer).await
-    }
-
-    pub async fn list_export_consumers(&self) -> Vec<ExportConsumer> {
-        let s = self.state.lock().await;
-        s.export_consumers.values().cloned().collect()
-    }
-
-    pub async fn list_export_consumer_statuses(&self) -> Result<Vec<ExportConsumerStatus>> {
-        let consumers = self.list_export_consumers().await;
-        let mut statuses = Vec::with_capacity(consumers.len());
-        for consumer in consumers {
-            statuses.push(self.export_consumer_status(consumer).await?);
-        }
-        Ok(statuses)
-    }
-
-    async fn export_consumer_status(
-        &self,
-        consumer: ExportConsumer,
-    ) -> Result<ExportConsumerStatus> {
-        let now_ms = crate::now_ms();
-        let request = ExportWatchRequest {
-            tenant_id: consumer.tenant_id.clone(),
-            scope: consumer.scope,
-            session_id: consumer.session_id.clone(),
-            agent_id: consumer.agent_id.clone(),
-            include: consumer.include.clone(),
-            from_cursor: consumer.last_acked_cursor.clone(),
-            limit: usize::MAX,
-        };
-        let (high_watermark, pending_items, pending_oldest_created_at_ms) =
-            if let Some(persist) = &self.persist {
-                self.validate_persistent_export_cursor(&request).await?;
-                let mut high_watermark = None;
-                let mut pending_items = 0_usize;
-                let mut pending_oldest_created_at_ms = None;
-                let agent_id = (consumer.scope == WatchScope::Agent).then(|| {
-                    consumer
-                        .agent_id
-                        .as_ref()
-                        .expect("validated agent scope")
-                        .as_str()
-                });
-                let session_id = (consumer.scope == WatchScope::Session).then(|| {
-                    consumer
-                        .session_id
-                        .as_ref()
-                        .expect("validated session scope")
-                        .as_str()
-                });
-                persist
-                    .visit_export_ledger_items(
-                        consumer.tenant_id.as_str(),
-                        agent_id,
-                        session_id,
-                        consumer.last_acked_cursor.as_deref(),
-                        |cursor, item| {
-                            if !export_item_matches_scope(
-                                &item,
-                                consumer.scope,
-                                consumer.agent_id.as_ref(),
-                                consumer.session_id.as_ref(),
-                            ) || !export_item_matches_include(&item, &consumer.include)
-                            {
-                                return false;
-                            }
-                            pending_items = pending_items.saturating_add(1);
-                            pending_oldest_created_at_ms.get_or_insert(item.created_at_ms);
-                            high_watermark = Some(cursor);
-                            false
-                        },
-                    )
-                    .map_err(internal)?;
-                (high_watermark, pending_items, pending_oldest_created_at_ms)
-            } else {
-                let items = self.export_watch(request).await?;
-                (
-                    items.last().map(|item| item.cursor.clone()),
-                    items.len(),
-                    items.first().map(|item| item.item.created_at_ms),
-                )
-            };
-        let high_watermark = high_watermark.or_else(|| {
-            consumer
-                .last_acked_cursor
-                .clone()
-                .or_else(|| consumer.snapshot_high_watermark.clone())
-        });
-        let lag_ms = pending_oldest_created_at_ms.map(|created| now_ms.saturating_sub(created));
-        let lease_active = consumer
-            .lease_expires_at_ms
-            .is_some_and(|expires_at| expires_at > now_ms);
-        Ok(ExportConsumerStatus {
-            consumer,
-            high_watermark,
-            pending_items,
-            pending_oldest_created_at_ms,
-            lag_ms,
-            lease_active,
-        })
-    }
-
-    pub async fn claim_export_consumer(
-        &self,
-        req: ClaimExportConsumerRequest,
-    ) -> Result<ExportConsumer> {
-        self.ensure_tenant_cached(&req.tenant_id).await?;
-        validate_consumer_name(&req.consumer_name)?;
-        if req.lease_owner.trim().is_empty() {
-            return Err(Error::new(
-                ErrorCode::PolicyDenied,
-                "export consumer lease_owner is required",
-            ));
-        }
-        if req.lease_ms == 0 {
-            return Err(Error::new(
-                ErrorCode::PolicyDenied,
-                "export consumer lease_ms must be greater than zero",
-            ));
-        }
-        let now_ms = crate::now_ms();
-        let mut consumer = {
-            let s = self.state.lock().await;
-            validate_tenant_live_in_state(&s, &req.tenant_id)?;
-            let consumer = s
-                .export_consumers
-                .get(&(
-                    req.tenant_id.as_str().to_string(),
-                    req.consumer_name.clone(),
-                ))
-                .cloned()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::PolicyNotFound,
-                        format!("export consumer {} not found", req.consumer_name),
-                    )
-                })?;
-            if consumer
-                .lease_expires_at_ms
-                .is_some_and(|expires| expires > now_ms)
-                && consumer.lease_owner.as_deref() != Some(req.lease_owner.as_str())
-            {
-                return Err(Error::new(
-                    ErrorCode::PolicyDenied,
-                    format!(
-                        "export consumer {} is leased by {} until {}",
-                        req.consumer_name,
-                        consumer.lease_owner.as_deref().unwrap_or("unknown"),
-                        consumer.lease_expires_at_ms.unwrap_or_default()
-                    ),
-                ));
-            }
-            consumer
-        };
-        consumer.lease_owner = Some(req.lease_owner);
-        consumer.lease_expires_at_ms = Some(now_ms.saturating_add(req.lease_ms));
-        consumer.updated_at_ms = now_ms;
-        self.persist_export_consumer_and_update_state(consumer)
-            .await
-    }
-
-    pub async fn ack_export_consumer(
-        &self,
-        req: AckExportConsumerRequest,
-    ) -> Result<ExportConsumer> {
-        self.ensure_tenant_cached(&req.tenant_id).await?;
-        validate_consumer_name(&req.consumer_name)?;
-        if req
-            .cursor
-            .as_deref()
-            .is_some_and(|cursor| cursor.trim().is_empty())
-        {
-            return Err(Error::new(
-                ErrorCode::InvalidCursor,
-                "export consumer ack cursor must not be empty",
-            ));
-        }
-        let mut consumer = self
-            .load_export_consumer_for_update(
-                &req.tenant_id,
-                &req.consumer_name,
-                req.lease_owner.as_deref(),
-            )
-            .await?;
-        let snapshot_ack = req
-            .cursor
-            .as_deref()
-            .is_none_or(|cursor| cursor.starts_with("snapshot:"));
-        if snapshot_ack
-            && (consumer.scope != WatchScope::Tenant
-                || consumer.include.is_empty()
-                || !consumer.include.iter().all(|include| {
-                    matches!(
-                        include.as_str(),
-                        "tenants"
-                            | "agents"
-                            | "sessions"
-                            | "artifacts"
-                            | "records"
-                    )
-                }))
-        {
-            return Err(Error::new(
-                ErrorCode::InvalidCursor,
-                "snapshot acknowledgements require a tenant-scope metadata-only consumer",
-            ));
-        }
-        let cursor = match req.cursor.as_deref() {
-            Some(snapshot_cursor) if snapshot_cursor.starts_with("snapshot:") => {
-                self.validate_snapshot_cursor_tenant(&consumer.tenant_id, snapshot_cursor)?;
-                if self.persist.is_some() && req.snapshot_high_watermark.is_none() {
-                    return Err(Error::new(
-                        ErrorCode::InvalidCursor,
-                        "persistent snapshot acknowledgements require snapshot_high_watermark",
-                    ));
-                }
-                req.snapshot_high_watermark.clone()
-            }
-            Some(cursor) => {
-                self.validate_export_consumer_cursor(&consumer, cursor, true)
-                    .await?;
-                Some(cursor.to_string())
-            }
-            None => {
-                if req.snapshot_high_watermark.is_none() {
-                    return Err(Error::new(
-                        ErrorCode::InvalidCursor,
-                        "export consumer acknowledgement requires cursor or snapshot_high_watermark",
-                    ));
-                }
-                req.snapshot_high_watermark.clone()
-            }
-        };
-        if let Some(high_watermark) = req.snapshot_high_watermark.as_deref() {
-            self.validate_export_consumer_cursor(&consumer, high_watermark, false)
-                .await?;
-        }
-        if let Some(previous) = &consumer.last_acked_cursor {
-            if cursor.as_ref().is_some_and(|cursor| {
-                event_cursor_order_key(cursor) < event_cursor_order_key(previous)
-            }) {
-                return Err(Error::new(
-                    ErrorCode::InvalidCursor,
-                    "export consumer ack cursor is behind the last acked cursor; use rewind to move backward",
-                ));
-            }
-        }
-        if let Some(cursor) = cursor {
-            consumer.last_acked_cursor = Some(cursor);
-        }
-        if let Some(high_watermark) = req.snapshot_high_watermark {
-            consumer.snapshot_high_watermark = Some(high_watermark);
-        }
-        consumer.updated_at_ms = crate::now_ms();
-        self.persist_export_consumer_and_update_state(consumer)
-            .await
-    }
-
-    pub async fn rewind_export_consumer(
-        &self,
-        req: RewindExportConsumerRequest,
-    ) -> Result<ExportConsumer> {
-        self.ensure_tenant_cached(&req.tenant_id).await?;
-        validate_consumer_name(&req.consumer_name)?;
-        let mut consumer = self
-            .load_export_consumer_for_update(
-                &req.tenant_id,
-                &req.consumer_name,
-                req.lease_owner.as_deref(),
-            )
-            .await?;
-        if let Some(cursor) = req.cursor.as_deref() {
-            self.validate_export_consumer_cursor(&consumer, cursor, true)
-                .await?;
-        }
-        consumer.last_acked_cursor = req.cursor;
-        consumer.updated_at_ms = crate::now_ms();
-        self.persist_export_consumer_and_update_state(consumer)
-            .await
-    }
-
-    fn validate_snapshot_cursor_tenant(&self, tenant_id: &Id, cursor: &str) -> Result<()> {
-        let parts = cursor
-            .strip_prefix("snapshot:")
-            .map(|raw| raw.split('/').collect::<Vec<_>>());
-        let valid = parts.as_ref().is_some_and(|parts| {
-            parts.len() == 4
-                && parts[0] == tenant_id.as_str()
-                && parts[1].len() == 20
-                && parts[1].bytes().all(|byte| byte.is_ascii_digit())
-                && matches!(
-                    parts[2],
-                    "tenant"
-                        | "agent"
-                        | "session"
-                        | "artifact"
-                        | "record"
-                )
-                && !parts[3].is_empty()
-        });
-        if !valid {
-            return Err(Error::new(
-                ErrorCode::InvalidCursor,
-                "snapshot cursor belongs to a different tenant or is malformed",
-            ));
-        }
-        Ok(())
-    }
-
-    async fn validate_export_consumer_cursor(
-        &self,
-        consumer: &ExportConsumer,
-        cursor: &str,
-        require_consumer_match: bool,
-    ) -> Result<()> {
-        let Some(persist) = &self.persist else {
-            return Ok(());
-        };
-        let Some(parts) = parse_export_ledger_cursor_for_runtime(cursor) else {
-            return Err(Error::new(
-                ErrorCode::InvalidCursor,
-                "persistent export consumer cursors must use the ledger: format",
-            ));
-        };
-        if parts.tenant_id != consumer.tenant_id.as_str() {
-            return Err(Error::new(
-                ErrorCode::InvalidCursor,
-                "export consumer cursor belongs to a different tenant",
-            ));
-        }
-        if let Some(oldest) = self
-            .export_oldest_available_cursor(&consumer.tenant_id)
-            .await?
-        {
-            if cursor < oldest.as_str() {
-                return Err(Error::new(
-                    ErrorCode::InvalidCursor,
-                    format!(
-                        "export consumer cursor is older than the retained export ledger; oldest_available_cursor={oldest}"
-                    ),
-                ));
-            }
-        }
-        let Some(item) = persist
-            .get_export_ledger_item(consumer.tenant_id.as_str(), cursor)
-            .map_err(internal)?
-        else {
-            return Err(Error::new(
-                ErrorCode::InvalidCursor,
-                "export consumer cursor does not identify a retained ledger item",
-            ));
-        };
-        if require_consumer_match
-            && (!export_item_matches_scope(
-                &item,
-                consumer.scope,
-                consumer.agent_id.as_ref(),
-                consumer.session_id.as_ref(),
-            ) || !export_item_matches_include(&item, &consumer.include))
-        {
-            return Err(Error::new(
-                ErrorCode::InvalidCursor,
-                "export consumer cursor was not emitted for this consumer scope and include filter",
-            ));
-        }
-        Ok(())
-    }
-
-    async fn load_export_consumer_for_update(
-        &self,
-        tenant_id: &Id,
-        consumer_name: &str,
-        lease_owner: Option<&str>,
-    ) -> Result<ExportConsumer> {
-        let now_ms = crate::now_ms();
-        let s = self.state.lock().await;
-        validate_tenant_live_in_state(&s, tenant_id)?;
-        let consumer = s
-            .export_consumers
-            .get(&(tenant_id.as_str().to_string(), consumer_name.to_string()))
-            .cloned()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorCode::PolicyNotFound,
-                    format!("export consumer {consumer_name} not found"),
-                )
-            })?;
-        if consumer
-            .lease_expires_at_ms
-            .is_some_and(|expires| expires > now_ms)
-            && consumer.lease_owner.as_deref() != lease_owner
-        {
-            return Err(Error::new(
-                ErrorCode::PolicyDenied,
-                format!(
-                    "export consumer {consumer_name} is leased by {} until {}",
-                    consumer.lease_owner.as_deref().unwrap_or("unknown"),
-                    consumer.lease_expires_at_ms.unwrap_or_default()
-                ),
-            ));
-        }
-        Ok(consumer)
-    }
-
-    async fn persist_export_consumer_and_update_state(
-        &self,
-        consumer: ExportConsumer,
-    ) -> Result<ExportConsumer> {
-        if let Some(persist) = &self.persist {
-            persist
-                .put_export_consumer_async(&consumer)
-                .await
-                .map_err(internal)?;
-        }
-        let mut s = self.state.lock().await;
-        s.export_consumers.insert(
-            (
-                consumer.tenant_id.as_str().to_string(),
-                consumer.consumer_name.clone(),
-            ),
-            consumer.clone(),
-        );
-        Ok(consumer)
-    }
-
     /// Resolve an `event_id` to its `(session_id, seq)` location.
     ///
     /// KV-backed runtime resolves through the persisted `event_by_id`
@@ -12337,16 +11719,6 @@ fn fork_edge_cursor(edge: &ForkEdge, context: &ChangefeedCursorContext) -> Strin
         "v2:{:020}:{}:{:020}:fork:cell={}:scope={}:tablet={}:epoch={}:applied={}",
         edge.created_at_ms, edge.child_session_id, 0, cell, placement_scope, tablet, epoch, applied
     )
-}
-
-fn validate_consumer_name(name: &str) -> Result<()> {
-    if name.trim().is_empty() || name.contains('/') {
-        return Err(Error::new(
-            ErrorCode::PolicyDenied,
-            "export consumer name must be non-empty and must not contain '/'",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_export_include(include: &[String]) -> Result<()> {
