@@ -151,14 +151,12 @@ async fn import_file(api: &Api, source: Source, file: &Path, state: &mut State) 
         last_idx = idx;
         match classify_line(&line) {
             LineClass::Skip => {}
-            LineClass::Oversized => skipped_oversized += 1,
-            LineClass::Event {
-                kind,
-                payload,
-                payload_bytes,
-            } => {
-                batch.push(json!({ "kind": kind, "payload": payload }));
-                batch_bytes += payload_bytes;
+            // The HTTP importer skips oversized events; use `agentdb import
+            // --large-events artifact` (offline, in-process) to externalize them.
+            LineClass::Oversized(_) => skipped_oversized += 1,
+            LineClass::Event(parsed) => {
+                batch.push(json!({ "kind": parsed.kind, "payload": parsed.payload }));
+                batch_bytes += parsed.payload_bytes;
                 if batch.len() >= MAX_BATCH || batch_bytes >= MAX_BATCH_BYTES {
                     appended += flush(api, &path, &agent_id, &mut batch, file, last_idx).await?;
                     batch_bytes = 0;

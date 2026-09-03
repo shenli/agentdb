@@ -133,6 +133,27 @@ struct ImportRunOpts {
     /// location.
     #[arg(long)]
     dir: Option<PathBuf>,
+    /// What to do with events whose payload exceeds the inline limit: `skip`
+    /// them (default), or `artifact` — store the payload as a content-addressed
+    /// artifact (identical payloads dedup to one blob) and reference it from a
+    /// small stub event.
+    #[arg(long, value_enum, default_value_t = LargeEventsArg::Skip)]
+    large_events: LargeEventsArg,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum LargeEventsArg {
+    Skip,
+    Artifact,
+}
+
+impl From<LargeEventsArg> for import::LargeEvents {
+    fn from(arg: LargeEventsArg) -> Self {
+        match arg {
+            LargeEventsArg::Skip => import::LargeEvents::Skip,
+            LargeEventsArg::Artifact => import::LargeEvents::Artifact,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -379,8 +400,9 @@ async fn import_cmd(opts: ImportOpts) -> anyhow::Result<()> {
         ImportSourceCmd::Codex(run) => (agentdb_import::Source::Codex, run),
     };
     let data_dir = run.data_dir.unwrap_or_else(default_data_dir);
+    let large = run.large_events.into();
     let runtime = open_import_runtime(&data_dir)?;
-    import::run(runtime, source, run.dir).await
+    import::run(runtime, source, run.dir, large).await
 }
 
 /// Open the persistent single-node store in-process for the offline importer.

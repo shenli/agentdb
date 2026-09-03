@@ -114,19 +114,24 @@ fn decode_claude_project_dir(name: &str) -> String {
     }
 }
 
+/// A parsed JSONL line: the event kind (the line's `type`), the whole line as
+/// the payload, and its serialized byte size.
+pub struct ParsedLine {
+    pub kind: String,
+    pub payload: Value,
+    pub payload_bytes: usize,
+}
+
 /// What one JSONL line becomes. Session logs can be tens of GB (embedded tool
 /// output), so callers stream line by line and classify each — never load a
 /// whole file — keeping memory bounded to one line plus one batch.
 pub enum LineClass {
     /// An importable inline event.
-    Event {
-        kind: String,
-        payload: Value,
-        payload_bytes: usize,
-    },
-    /// Payload exceeds [`MAX_PAYLOAD_BYTES`]; belongs in an artifact, not an
-    /// inline event, so it is skipped.
-    Oversized,
+    Event(ParsedLine),
+    /// Payload exceeds [`MAX_PAYLOAD_BYTES`]; too large for an inline event. The
+    /// parsed line is carried so a sink can externalize it into an artifact
+    /// instead of dropping it.
+    Oversized(ParsedLine),
     /// Blank or malformed line; skipped.
     Skip,
 }
@@ -144,18 +149,20 @@ pub fn classify_line(line: &str) -> LineClass {
         Err(_) => return LineClass::Skip, // skip a malformed line rather than abort the file
     };
     let payload_bytes = serde_json::to_vec(&value).map(|v| v.len()).unwrap_or(usize::MAX);
-    if payload_bytes > MAX_PAYLOAD_BYTES {
-        return LineClass::Oversized;
-    }
     let kind = value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("log")
         .to_string();
-    LineClass::Event {
+    let parsed = ParsedLine {
         kind,
         payload: value,
         payload_bytes,
+    };
+    if payload_bytes > MAX_PAYLOAD_BYTES {
+        LineClass::Oversized(parsed)
+    } else {
+        LineClass::Event(parsed)
     }
 }
 
@@ -268,19 +275,26 @@ mod tests {
     #[test]
     fn classify_handles_event_blank_malformed_and_oversized() {
         match classify_line(r#"{"type":"a","v":1}"#) {
-            LineClass::Event { kind, payload_bytes, .. } => {
-                assert_eq!(kind, "a");
-                assert!(payload_bytes > 0);
+            LineClass::Event(p) => {
+                assert_eq!(p.kind, "a");
+                assert!(p.payload_bytes > 0);
             }
             _ => panic!("expected event"),
         }
         assert!(matches!(classify_line("   "), LineClass::Skip));
         assert!(matches!(classify_line("not json"), LineClass::Skip));
+        // Oversized carries the parsed payload so a sink can externalize it.
         let big = format!(r#"{{"type":"big","x":"{}"}}"#, "a".repeat(MAX_PAYLOAD_BYTES));
-        assert!(matches!(classify_line(&big), LineClass::Oversized));
+        match classify_line(&big) {
+            LineClass::Oversized(p) => {
+                assert_eq!(p.kind, "big");
+                assert!(p.payload_bytes > MAX_PAYLOAD_BYTES);
+            }
+            _ => panic!("expected oversized"),
+        }
         // A line with no `type` still imports, kind defaults to "log".
         match classify_line(r#"{"v":1}"#) {
-            LineClass::Event { kind, .. } => assert_eq!(kind, "log"),
+            LineClass::Event(p) => assert_eq!(p.kind, "log"),
             _ => panic!("expected event"),
         }
     }
