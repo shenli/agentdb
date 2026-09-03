@@ -57,6 +57,21 @@ pub struct CreateSessionBody {
     pub alias: Option<String>,
 }
 
+/// Body for `POST /api/sessions/open`: idempotently resolve-or-create a
+/// (workspace, agent, session) triple in one call. `workspace` is the tenant
+/// external key; `agent` and `session` are aliases. `policy`/`config` are used
+/// only when the tenant/agent must be created.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct OpenSessionBody {
+    pub workspace: String,
+    pub agent: String,
+    pub session: String,
+    #[serde(default = "default_policy")]
+    pub policy: serde_json::Value,
+    #[serde(default = "default_policy")]
+    pub config: serde_json::Value,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TransitionSessionLifecycleBody {
     pub target: String,

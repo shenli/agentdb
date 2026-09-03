@@ -205,7 +205,22 @@ a metadata snapshot. Runtime summary data is observability metadata, not a full
 copy of runtime KV/content data. The restore endpoint validates manifests only;
 destructive restore apply remains an offline operator procedure.
 
-Tenants, agents, and sessions:
+One-call session opening:
+
+```text
+POST   /api/sessions/open
+```
+
+`POST /api/sessions/open` takes a JSON body `{"workspace", "agent", "session"}`
+(optional `policy`/`config`) and idempotently resolves-or-creates the whole
+triple in one request, returning the session. Repeats and concurrent callers
+converge on the same rows; a session alias already owned by another agent in the
+workspace returns 409 `ALIAS_CONFLICT`. This is the preferred way to start a
+session — it replaces the list/create/catch-409/re-list loop below. A
+tenant-scoped token may open only within the workspace it is bound to; minting a
+new workspace requires a root/admin credential (single-node loopback qualifies).
+
+Tenants, agents, and sessions (lower-level; `open` is preferred):
 
 ```text
 POST   /api/tenants
@@ -552,6 +567,7 @@ Primary sync classes:
 AgentDB
   health_ready()
   workspace(external_key=None, *, tenant_id=None, policy=None)
+  open_session(workspace, agent, session, *, policy=None, config=None)
   session(tenant_id, session_id=None, *, agent_id=None)
   session_by_id(tenant_id, session_id, *, agent_id=None)
 
@@ -661,6 +677,7 @@ Primary classes:
 AgentDB
   healthReady()
   workspace(externalKey?, opts?)
+  openSession(workspace, agent, session, opts?)
   session(sessionId, opts?)
   sessionById(sessionId, { tenantId, agentId? })
 

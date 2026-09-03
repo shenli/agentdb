@@ -208,6 +208,27 @@ class AgentDB:
             data=tenant,
         )
 
+    def open_session(
+        self,
+        workspace: str,
+        agent: str,
+        session: str,
+        *,
+        policy: Optional[dict] = None,
+        config: Optional[dict] = None,
+    ) -> "SessionHandle":
+        """Open a session in one call: idempotently create-if-missing the
+        workspace, agent, and session, and return a ready-to-use handle.
+
+        Replaces the workspace/agent/session open dance with a single request.
+        """
+
+        sess = self.client.open_session(
+            workspace, agent, session, policy=policy, config=config
+        )
+        ws = Workspace(self.client, sess.tenant_id, name=workspace)
+        return SessionHandle(ws, sess)
+
     def session(
         self,
         session_id: SessionId,
@@ -691,6 +712,27 @@ class Client:
             json={"alias": alias},
         )
         return Session(self, tenant_id, data["session_id"], data["agent_id"])
+
+    def open_session(
+        self,
+        workspace: str,
+        agent: str,
+        session: str,
+        *,
+        policy: Optional[dict] = None,
+        config: Optional[dict] = None,
+    ) -> "Session":
+        """Idempotently resolve-or-create (workspace, agent, session) in one
+        request. `workspace` is the tenant external key; `agent`/`session` are
+        aliases. Repeats and concurrent callers converge on the same rows."""
+
+        body: dict = {"workspace": workspace, "agent": agent, "session": session}
+        if policy is not None:
+            body["policy"] = policy
+        if config is not None:
+            body["config"] = config
+        data = self._request("POST", "/api/sessions/open", json=body)
+        return Session(self, data["tenant_id"], data["session_id"], data["agent_id"])
 
     def list_sessions(self, tenant_id: TenantId) -> list:
         data = self._request("GET", f"/api/tenants/{_quote(tenant_id)}/sessions")

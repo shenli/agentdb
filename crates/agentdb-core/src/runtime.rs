@@ -4772,6 +4772,94 @@ impl Runtime {
         Ok(())
     }
 
+    // ----- Alias resolvers (O(1) resolve-or-create support) ----------------
+    //
+    // These back `POST /api/sessions/open`: look up an existing row by its
+    // alias/external key through the alias map (a single point read on a
+    // miss), never an unbounded list scan. `None` means "no live row for this
+    // alias" — the caller then creates one.
+
+    /// Resolve a live tenant by its external key (workspace name), or `None`.
+    pub async fn resolve_tenant_by_external_key(&self, external_key: &str) -> Result<Option<Tenant>> {
+        if external_key.is_empty() {
+            return Ok(None);
+        }
+        self.ensure_tenant_alias_cached(external_key).await?;
+        let tenant_id = {
+            let s = self.state.lock().await;
+            s.tenant_aliases.get(external_key).cloned()
+        };
+        let Some(tenant_id) = tenant_id else {
+            return Ok(None);
+        };
+        let Ok(id) = Id::parse_kind(&tenant_id, crate::id::IdKind::Tenant) else {
+            return Ok(None);
+        };
+        match self.get_tenant(&id).await {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.code == ErrorCode::TenantNotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolve a live agent by `(tenant, alias)`, or `None`.
+    pub async fn resolve_agent_by_alias(
+        &self,
+        tenant_id: &Id,
+        alias: &str,
+    ) -> Result<Option<Agent>> {
+        if alias.is_empty() {
+            return Ok(None);
+        }
+        self.ensure_agent_alias_cached(tenant_id, alias).await?;
+        let key = scoped_alias_key(tenant_id.as_str(), alias);
+        let agent_id = {
+            let s = self.state.lock().await;
+            s.agent_aliases.get(&key).cloned()
+        };
+        let Some(agent_id) = agent_id else {
+            return Ok(None);
+        };
+        let Ok(id) = Id::parse_kind(&agent_id, crate::id::IdKind::Agent) else {
+            return Ok(None);
+        };
+        match self.get_agent(tenant_id, &id).await {
+            Ok(a) => Ok(Some(a)),
+            Err(e) if e.code == ErrorCode::AgentNotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolve a live session by `(tenant, alias)`, or `None`. Session aliases
+    /// are unique per tenant (not per agent), so this does not take an agent —
+    /// the caller checks `session.agent_id` against the intended agent.
+    pub async fn resolve_session_by_alias(
+        &self,
+        tenant_id: &Id,
+        alias: &str,
+    ) -> Result<Option<Session>> {
+        if alias.is_empty() {
+            return Ok(None);
+        }
+        self.ensure_session_alias_cached(tenant_id, alias).await?;
+        let key = scoped_alias_key(tenant_id.as_str(), alias);
+        let session_id = {
+            let s = self.state.lock().await;
+            s.session_aliases.get(&key).cloned()
+        };
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let Ok(id) = Id::parse_kind(&session_id, crate::id::IdKind::Session) else {
+            return Ok(None);
+        };
+        match self.get_session(tenant_id, &id).await {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.code == ErrorCode::SessionNotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     // ----- Authoritative enumerations (Stage 2 of KV-authoritative state) --
     //
     // Enumerations must not depend on the cache being complete: in lazy

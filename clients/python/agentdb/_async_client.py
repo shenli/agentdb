@@ -121,6 +121,26 @@ class AsyncClient:
         )
         return AsyncSession(self, tenant_id, data["session_id"], data["agent_id"])
 
+    async def open_session(
+        self,
+        workspace: str,
+        agent: str,
+        session: str,
+        *,
+        policy: Optional[dict] = None,
+        config: Optional[dict] = None,
+    ) -> "AsyncSession":
+        """Idempotently resolve-or-create (workspace, agent, session) in one
+        request. See `Client.open_session`."""
+
+        body: dict = {"workspace": workspace, "agent": agent, "session": session}
+        if policy is not None:
+            body["policy"] = policy
+        if config is not None:
+            body["config"] = config
+        data = await self._request("POST", "/api/sessions/open", json=body)
+        return AsyncSession(self, data["tenant_id"], data["session_id"], data["agent_id"])
+
     async def list_sessions(self, tenant_id: TenantId) -> list:
         data = await self._request("GET", f"/api/tenants/{_quote(tenant_id)}/sessions")
         return data.get("sessions", [])
