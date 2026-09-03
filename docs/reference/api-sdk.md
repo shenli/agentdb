@@ -255,7 +255,6 @@ POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 GET  /api/tenants/{tenant_id}/changes
 GET  /api/tenants/{tenant_id}/watch
-GET  /api/tenants/{tenant_id}/exports/watch
 POST /api/tenants/{tenant_id}/exports/backfill
 GET  /api/tenants/{tenant_id}/exports/status
 GET  /api/admin/exports
@@ -283,7 +282,7 @@ optional `backfill=true` mode (a pinned `snapshot_high_watermark` plus a
 Records appear only when labs is enabled. `watch` and the `exports/*` routes are
 being superseded by `changes` and will be consolidated into it.
 
-`exports/watch` returns stable export envelopes for observability sinks.
+`changes` returns stable export envelopes for observability sinks.
 Persistent runtimes return durable ledger cursors (`ledger:...`) for events and
 metadata object mutations; in-memory/dev runtimes fall back to current event
 watch cursors (`frontier:v1:...`). Runtime `watch` accepts both frontier cursors

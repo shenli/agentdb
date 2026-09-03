@@ -187,17 +187,6 @@ pub struct ExportBackfillBody {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ExportWatchResponse {
-    pub items: Vec<ExportEnvelope>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub oldest_available_cursor: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub high_watermark: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 pub struct ExportBackfillResponse {
     pub items: Vec<ExportEnvelope>,
     #[serde(skip_serializing_if = "Option::is_none")]

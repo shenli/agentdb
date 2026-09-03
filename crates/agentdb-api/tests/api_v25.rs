@@ -316,7 +316,7 @@ async fn export_watch_returns_event_envelopes_and_resume_cursor() {
     let first: serde_json::Value = app
         .client
         .get(format!(
-            "{}/api/tenants/{tid}/exports/watch?scope=tenant&limit=1",
+            "{}/api/tenants/{tid}/changes?scope=tenant&limit=1",
             app.base
         ))
         .header(HDR_TABLET_ID, "7")
@@ -365,7 +365,7 @@ async fn export_watch_returns_event_envelopes_and_resume_cursor() {
     let after: serde_json::Value = app
         .client
         .get(format!(
-            "{}/api/tenants/{tid}/exports/watch?scope=session&session_id={sid}&from_cursor={cursor}",
+            "{}/api/tenants/{tid}/changes?scope=session&session_id={sid}&from_cursor={cursor}",
             app.base
         ))
         .send()
@@ -427,7 +427,7 @@ async fn export_watch_scope_never_leaks_other_tenants_or_agents() {
     let tenant_items: serde_json::Value = app
         .client
         .get(format!(
-            "{}/api/tenants/{tenant_a}/exports/watch?scope=tenant",
+            "{}/api/tenants/{tenant_a}/changes?scope=tenant",
             app.base
         ))
         .send()
@@ -448,7 +448,7 @@ async fn export_watch_scope_never_leaks_other_tenants_or_agents() {
     let agent_items: serde_json::Value = app
         .client
         .get(format!(
-            "{}/api/tenants/{tenant_a}/exports/watch?scope=agent&agent_id={agent_a}",
+            "{}/api/tenants/{tenant_a}/changes?scope=agent&agent_id={agent_a}",
             app.base
         ))
         .send()
@@ -464,7 +464,7 @@ async fn export_watch_scope_never_leaks_other_tenants_or_agents() {
     let wrong_agent = app
         .client
         .get(format!(
-            "{}/api/tenants/{tenant_a}/exports/watch?scope=agent&agent_id={agent_b}",
+            "{}/api/tenants/{tenant_a}/changes?scope=agent&agent_id={agent_b}",
             app.base
         ))
         .send()
@@ -475,7 +475,7 @@ async fn export_watch_scope_never_leaks_other_tenants_or_agents() {
     let wrong_session = app
         .client
         .get(format!(
-            "{}/api/tenants/{tenant_a}/exports/watch?scope=session&session_id={session_b}",
+            "{}/api/tenants/{tenant_a}/changes?scope=session&session_id={session_b}",
             app.base
         ))
         .send()
@@ -655,7 +655,7 @@ async fn export_backfill_pages_event_snapshots_and_rejects_unknown_includes() {
     assert_eq!(metadata_second_page["complete"], true);
     let tail_after_boundary: serde_json::Value = app
         .client
-        .get(format!("{}/api/tenants/{tid}/exports/watch", app.base))
+        .get(format!("{}/api/tenants/{tid}/changes", app.base))
         .query(&[
             ("scope", "tenant"),
             ("include", "records"),

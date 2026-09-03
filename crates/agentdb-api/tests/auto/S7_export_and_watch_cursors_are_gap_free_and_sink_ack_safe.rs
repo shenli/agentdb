@@ -128,7 +128,7 @@ fn export_request(
         query.push(("from_cursor", cursor.to_string()));
     }
     app.client
-        .get(format!("{}/api/tenants/{tid}/exports/watch", app.base))
+        .get(format!("{}/api/tenants/{tid}/changes", app.base))
         .query(&query)
 }
 

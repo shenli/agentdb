@@ -277,7 +277,7 @@ ClickStack source views compile in ClickHouse. Create HyperDX sources using the
 field names above.
 
 The current implementation exports event and runtime metadata envelopes from
-`/api/tenants/{tenant_id}/exports/watch`. Persistent AgentDB runtimes return
+`/api/tenants/{tenant_id}/changes`. Persistent AgentDB runtimes return
 durable `ledger:...` cursors; in-memory/dev runtimes return `v2:...` event
 watch cursors. It is suitable for local validation of schema, ClickHouse
 reachability, cursor resume, metadata snapshot backfill, tombstone handling,
