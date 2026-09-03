@@ -10,6 +10,7 @@ name = "agentdbctl"
 path = "src/main.rs"
 
 [dependencies]
+agentdb-import = { path = "../../crates/agentdb-import" }
 agentdb-storage = { path = "../../crates/agentdb-storage" }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }

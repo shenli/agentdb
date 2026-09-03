@@ -7895,6 +7895,77 @@ impl Runtime {
         Ok((committed.appended, backpressure))
     }
 
+    /// Append several events to ONE session in a single committed write batch.
+    /// This is the bulk-ingest path (session-log importers, replay loaders): it
+    /// preserves event order, assigns contiguous seqs, and commits every event
+    /// through one persist write batch — far fewer round-trips and write
+    /// batches than N single appends.
+    ///
+    /// Every request must target the same `(tenant, session)` and use the
+    /// simple append shape (no artifact/source/credential refs and no per-event
+    /// idempotency key); callers needing those append one event at a time.
+    pub async fn append_batch(&self, reqs: Vec<AppendRequest>) -> Result<Vec<AppendResponse>> {
+        if reqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tenant_id = reqs[0].tenant_id.clone();
+        let session_id = reqs[0].session_id.clone();
+        let agent_id = reqs[0].agent_id.clone();
+        for req in &reqs {
+            if req.tenant_id.as_str() != tenant_id.as_str()
+                || req.session_id.as_str() != session_id.as_str()
+            {
+                return Err(Error::new(
+                    ErrorCode::PolicyDenied,
+                    "append_batch requires every event to target the same tenant and session",
+                ));
+            }
+            if !req.artifact_refs.is_empty()
+                || !req.source_refs.is_empty()
+                || !req.credential_refs.is_empty()
+                || req.idempotency_key.is_some()
+            {
+                return Err(Error::new(
+                    ErrorCode::PolicyDenied,
+                    "append_batch does not support artifact/source/credential refs or per-event \
+                     idempotency keys; use append for those",
+                ));
+            }
+        }
+        self.ensure_tenant_cached(&tenant_id).await?;
+        self.ensure_agent_cached(&tenant_id, &agent_id).await?;
+        self.ensure_session_cached(&tenant_id, &session_id).await?;
+
+        // Drive the same coalesced-commit machinery the concurrent append queue
+        // uses, but with the whole ordered batch in one shot: one session lock,
+        // one prepare pass, one write batch.
+        let mut jobs = Vec::with_capacity(reqs.len());
+        let mut receivers = Vec::with_capacity(reqs.len());
+        for req in reqs {
+            let (done, rx) = oneshot::channel();
+            jobs.push(SimpleAppendJob {
+                req,
+                fetch_recent: None,
+                context_max_bytes: None,
+                done,
+            });
+            receivers.push(rx);
+        }
+        self.process_simple_append_batch(jobs).await;
+
+        let mut out = Vec::with_capacity(receivers.len());
+        for rx in receivers {
+            let committed = rx.await.map_err(|_| {
+                Error::new(
+                    ErrorCode::Internal,
+                    "session append batch dropped a response",
+                )
+            })??;
+            out.push(committed.appended);
+        }
+        Ok(out)
+    }
+
     async fn append_with_policy(
         &self,
         req: AppendRequest,

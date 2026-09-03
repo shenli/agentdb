@@ -13,6 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use axum::routing::get;
 use clap::Parser;
 use object_store::aws::AmazonS3Builder;
@@ -75,6 +76,8 @@ type ContentBackendBundle = (
     Option<Arc<agentdb_storage::AsyncMirrorContentBackend>>,
 );
 
+mod import;
+
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
 struct Cli {
@@ -99,6 +102,63 @@ enum Cmd {
     /// manifest in the configured object store.
     #[command(name = "restore-from-bucket")]
     RestoreFromBucket(RestoreFromBucketOpts),
+    /// Bulk-import coding-agent session logs directly into the local store
+    /// (offline, in-process — no HTTP). The server must be stopped: the store
+    /// is single-writer. Use `agentdbctl import` for a running/remote server.
+    Import(ImportOpts),
+}
+
+#[derive(Parser, Debug)]
+struct ImportOpts {
+    #[command(subcommand)]
+    source: ImportSourceCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ImportSourceCmd {
+    /// Import Claude Code sessions from `~/.claude/projects`.
+    ClaudeCode(ImportRunOpts),
+    /// Import Codex sessions from `~/.codex/sessions`.
+    Codex(ImportRunOpts),
+}
+
+#[derive(Parser, Debug)]
+struct ImportRunOpts {
+    /// Runtime data directory that holds the RocksDB store. Defaults to the
+    /// machine-scoped home (`$AGENTDB_HOME`, `$XDG_DATA_HOME/agentdb`, or
+    /// `~/.agentdb`).
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Session-log source directory. Defaults to the source's standard
+    /// location.
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Config file (same as `serve`) — its `[storage]` section decides where
+    /// externalized artifact blobs go (local disk, or an object store).
+    /// Defaults to `<agentdb_home>/agentdb.toml` when present.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// What to do with events whose payload exceeds the inline limit: `skip`
+    /// them (default), or `artifact` — store the payload as a content-addressed
+    /// artifact (identical payloads dedup to one blob) and reference it from a
+    /// small stub event.
+    #[arg(long, value_enum, default_value_t = LargeEventsArg::Skip)]
+    large_events: LargeEventsArg,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum LargeEventsArg {
+    Skip,
+    Artifact,
+}
+
+impl From<LargeEventsArg> for import::LargeEvents {
+    fn from(arg: LargeEventsArg) -> Self {
+        match arg {
+            LargeEventsArg::Skip => import::LargeEvents::Skip,
+            LargeEventsArg::Artifact => import::LargeEvents::Artifact,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -335,7 +395,94 @@ async fn main() -> anyhow::Result<()> {
         Cmd::InitConfig(opts) => init_config(opts),
         Cmd::Service(opts) => service(opts),
         Cmd::RestoreFromBucket(opts) => restore_from_bucket(opts).await,
+        Cmd::Import(opts) => import_cmd(opts).await,
     }
+}
+
+async fn import_cmd(opts: ImportOpts) -> anyhow::Result<()> {
+    let (source, run) = match opts.source {
+        ImportSourceCmd::ClaudeCode(run) => (agentdb_import::Source::ClaudeCode, run),
+        ImportSourceCmd::Codex(run) => (agentdb_import::Source::Codex, run),
+    };
+    let data_dir = run.data_dir.unwrap_or_else(default_data_dir);
+    let large = run.large_events.into();
+    let runtime = open_import_runtime(&data_dir, run.config.as_ref())?;
+    import::run(runtime, source, run.dir, large).await
+}
+
+/// Resolve the artifact content backend for the importer from the same config
+/// file `serve` reads, so externalized blobs land wherever the deployment keeps
+/// them — local disk, or (single-node object-store content) straight in the
+/// object store, keeping the local store small.
+fn resolve_import_content_config(
+    config_path: Option<&PathBuf>,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<ContentBackendConfig> {
+    let file = load_config(config_path)?;
+    let content_dir = file
+        .storage
+        .content_dir
+        .clone()
+        .unwrap_or_else(|| data_dir.join("content"));
+    let deployment_mode = resolve_deployment_mode(&file.deployment)?;
+    let content_backend = resolve_content_backend(&file.storage.content)?;
+    let object_store = resolve_object_store_config(
+        file.storage.object_store.as_ref(),
+        data_dir.join("object-store"),
+    )?;
+    let content_local_cache_ttl_ms =
+        resolve_content_cache_ttl(&file.storage.content, content_backend, deployment_mode);
+    Ok(ContentBackendConfig {
+        content_backend,
+        content_dir,
+        deployment_mode,
+        object_store,
+        content_local_cache_ttl_ms,
+    })
+}
+
+/// Open the persistent single-node store in-process for the offline importer.
+/// RocksDB is single-writer, so this fails fast if the server holds the lock.
+fn open_import_runtime(
+    data_dir: &std::path::Path,
+    config_path: Option<&PathBuf>,
+) -> anyhow::Result<Arc<agentdb_core::Runtime>> {
+    let kv_path = data_dir.join("runtime");
+    // Create the store if it does not exist (a fresh import target); if the
+    // server is running against it, RocksDB's single-writer lock makes the open
+    // below fail with the message below rather than corrupt anything.
+    std::fs::create_dir_all(&kv_path)?;
+    let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> = Arc::new(
+        agentdb_storage::RocksKvStore::open(&kv_path).with_context(|| {
+            format!(
+                "open runtime store at {} (is the server running? the store is single-writer — \
+                 stop it first, or use `agentdbctl import` against the running server)",
+                kv_path.display()
+            )
+        })?,
+    );
+    let content_config = resolve_import_content_config(config_path, data_dir)?;
+    match content_config.content_backend {
+        ContentBackendKind::ObjectStore => {
+            tracing::info!("importer artifact content backend: object store");
+        }
+        ContentBackendKind::LocalFs => {
+            tracing::info!("importer artifact content backend: local filesystem");
+        }
+    }
+    let (content, _mirror) = build_content_backend(&content_config)?;
+
+    let runtime = match build_encryption_keyring(&kv)? {
+        Some((keyring, admin)) => {
+            let rt = agentdb_core::Runtime::with_kv_content_and_keyring(kv, content, keyring);
+            rt.set_key_rotator(admin.clone());
+            rt.set_key_revoker(admin.clone());
+            rt.set_key_retirer(admin);
+            rt
+        }
+        None => agentdb_core::Runtime::with_kv(kv, content),
+    };
+    Ok(runtime)
 }
 
 async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
@@ -511,7 +658,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         };
 
         recovery_kv = Some(kv.clone());
-        let (content, content_mirror) = build_content_backend(&config)?;
+        let (content, content_mirror) = build_content_backend(&config.content_backend_config())?;
         if let Some(logs) = runtime_raft_logs {
             tracing::info!(
                 tablet_count = logs.len(),
@@ -1396,6 +1543,16 @@ struct ResolvedObjectStoreConfig {
 }
 
 impl ResolvedServeConfig {
+    fn content_backend_config(&self) -> ContentBackendConfig {
+        ContentBackendConfig {
+            content_backend: self.content_backend,
+            content_dir: self.content_dir.clone(),
+            deployment_mode: self.deployment_mode,
+            object_store: self.object_store.clone(),
+            content_local_cache_ttl_ms: self.content_local_cache_ttl_ms,
+        }
+    }
+
     fn from_serve_opts(opts: ServeOpts) -> anyhow::Result<Self> {
         let file = load_config(opts.config.as_ref())?;
         let disk_budget_bytes = resolve_disk_budget_bytes(&file);
@@ -2312,7 +2469,19 @@ async fn build_cluster_keyring_and_provisioner(
     Ok(Some((keyring, provisioner, rotator, revoker, retirer)))
 }
 
-fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<ContentBackendBundle> {
+/// The storage settings `build_content_backend` needs — the subset of the
+/// resolved config that decides where artifact bytes live. Factored out so the
+/// offline importer can build the same backend from a config file without a
+/// full `ResolvedServeConfig`.
+struct ContentBackendConfig {
+    content_backend: ContentBackendKind,
+    content_dir: PathBuf,
+    deployment_mode: DeploymentMode,
+    object_store: Option<ResolvedObjectStoreConfig>,
+    content_local_cache_ttl_ms: Option<u64>,
+}
+
+fn build_content_backend(config: &ContentBackendConfig) -> anyhow::Result<ContentBackendBundle> {
     match config.content_backend {
         ContentBackendKind::LocalFs => {
             let content_dir = config.content_dir.clone();
@@ -10395,7 +10564,7 @@ node_id = "node-a"
             allow_http: false,
         });
 
-        let (content, mirror) = build_content_backend(&config).unwrap();
+        let (content, mirror) = build_content_backend(&config.content_backend_config()).unwrap();
         content.put("ten_a", "art_x", b"hello").await.unwrap();
 
         let mirror = mirror.expect("cluster object-store content should be mirrored");
