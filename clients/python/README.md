@@ -62,7 +62,7 @@ asyncio.run(main())
 ## Core Surface
 
 - `AgentDB.workspace`, `AgentDB.session_by_id`
-- `Workspace.agent`, `Workspace.agent_by_id`, `Workspace.session_by_id`, `Workspace.watch`
+- `Workspace.agent`, `Workspace.agent_by_id`, `Workspace.session_by_id`, `Workspace.changes`
 - `Workspace.artifacts`, `Workspace.records`
 - `AgentHandle.session`, `AgentHandle.session_by_id`
 - `SessionHandle.append`, `append_user`, `model_message`, `tool_call`, `tool_result`, `context_pack_built`
@@ -114,7 +114,7 @@ Concept mapping:
 | append and fetch | `session.append_and_fetch(...)` |
 | fork session | `session.fork(...)` |
 | build context | `session.context(...)` |
-| workspace/session watch | `workspace.watch(...)` |
+| workspace/session changefeed | `workspace.changes(...)` |
 
 Use `from_seq=last_seen_seq + 1` when reconnecting a subscription to avoid
 replaying events the harness has already processed. Persisting the last handled

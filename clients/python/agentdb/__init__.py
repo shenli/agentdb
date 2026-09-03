@@ -50,7 +50,6 @@ from .client import (
     Workspace,
     AppendResult,
     Event,
-    WatchItem,
     artifact_ref,
     event_ref,
 )
@@ -94,7 +93,6 @@ __all__ = [
     "Session",
     "AppendResult",
     "Event",
-    "WatchItem",
     "artifact_ref",
     "event_ref",
     "SessionEventKind",

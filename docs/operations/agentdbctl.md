@@ -268,10 +268,10 @@ agentdbctl nodes delete node-a
 
 The first supported observability sink is ClickHouse over HTTP. The initial
 implementation exports event and runtime metadata envelopes, supports event
-backfill, supports tenant-scope metadata snapshot backfill, and provides
-managed consumer checkpoints. Persistent AgentDB runtimes use durable ledger
-cursors for export; in-memory/dev runtimes fall back to current event watch
-cursors. Runtime soft deletes are exported as tombstone envelopes. Export is
+backfill, supports tenant-scope metadata snapshot backfill, and keeps its resume
+cursor in a client-side checkpoint. Persistent AgentDB runtimes use durable
+ledger cursors for export; in-memory/dev runtimes use `frontier:v1` cursors.
+Runtime soft deletes are exported as tombstone envelopes. Export is
 currently supported only on single-tablet runtimes; metadata-backed clustered
 routing returns HTTP 422 rather than exposing an incomplete tablet-local feed.
 
@@ -456,14 +456,13 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse status --tenant-id ten_... --consumer prod-clickhouse
 ```
 
-The underlying HTTP API also exposes
-`POST /api/tenants/{tenant_id}/exports/backfill` for event and tenant-scope
-metadata snapshot paging before a tailing export loop. Managed export consumers
-are available through `/api/tenants/{tenant_id}/exports/consumers`; they store
-durable checkpoints, include filters, lease ownership, and rewind state for
-official connectors. Use `agentdbctl raw get /api/admin/exports` to inspect all
-export consumers on a node, including pending item count, high watermark, lag,
-and lease-active state.
+The exporter reads the tenant changefeed `GET /api/tenants/{tenant_id}/changes`
+for the event tail and `POST /api/tenants/{tenant_id}/exports/backfill` for the
+tenant-scope metadata snapshot bootstrap before tailing. It holds its own resume
+cursor: `--consumer <name>` names a client-side checkpoint — for ClickHouse the
+`agentdb_export_checkpoints` table keyed by `(consumer, tenant_id)`, for JSONL a
+local `<output>.checkpoint` file. Use `agentdbctl raw get /api/admin/exports` for
+per-tenant `high_watermark` and `oldest_available_cursor`.
 
 The exporter keeps the first page's snapshot boundary fixed across a backfill.
 When manually resuming an interrupted metadata snapshot, provide both
@@ -471,15 +470,12 @@ When manually resuming an interrupted metadata snapshot, provide both
 `--snapshot-high-watermark ledger:...`; a snapshot cursor alone is rejected so
 concurrent metadata mutations cannot be skipped during the tail handoff.
 
-For HA connector deployment, run two or more `run --tail` processes with the
-same `--consumer` and distinct `--lease-owner` values. The process holding the
-lease writes to ClickHouse and acks only after ClickHouse accepts the batch. A
-standby process can claim the lease after `--lease-ms` expires and resumes from
-the last acked cursor. Use `status --consumer` or `/api/admin/exports` to watch
-lag, pending item count, high watermark, active lease state, and lease owner.
-ClickHouse inserts retry with stable per-table deduplication tokens derived
-from the exported cursor range; tune `--max-retries` and
-`--retry-initial-backoff-ms` for the deployment.
+Run one exporter per `(consumer, tenant)` — two sharing a consumer name and
+tenant would race the same checkpoint. For availability, run a single supervised
+instance (systemd, or a Kubernetes Deployment with `replicas: 1`); on restart it
+resumes from the checkpoint. ClickHouse inserts retry with stable per-table
+deduplication tokens derived from the exported cursor range; tune `--max-retries`
+and `--retry-initial-backoff-ms` for the deployment.
 
 For systemd deployments, use
 `ops/observability/agentdb-export-clickhouse.service` with
@@ -487,7 +483,7 @@ For systemd deployments, use
 file. The unit runs `migrate --apply` before starting the tailing exporter.
 
 For the end-to-end CDC/export operator workflow, including cursor recovery,
-managed consumer failover, privacy controls, and routine checks, see
+checkpoint resume and availability, privacy controls, and routine checks, see
 [cdc-export.md](cdc-export.md).
 
 ## Raw Escape Hatch

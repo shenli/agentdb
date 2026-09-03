@@ -32,9 +32,9 @@ use agentdb_core::{
     record::{NewRecord, SearchableRecord},
     runtime::{
         AppendRequest, ContextInclude, ContextRequest, ExportFeedItem, ExportWatchRequest,
-        FetchRequest, ForkSessionRequest, RecordUpdate, SearchRequest, WatchRequest, WatchScope,
+        FetchRequest, ForkSessionRequest, RecordUpdate, SearchRequest, WatchScope,
     },
-    Agent, Artifact, ChangefeedItem, ErrorCode, Id, IdKind,
+    Agent, Artifact, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewTenant, Session, SourceRef, Tenant,
 };
 use agentdb_meta::{
@@ -132,7 +132,6 @@ pub fn route_catalog() -> &'static [(Stability, &'static str)] {
         (Internal, "/api/tenants"),
         (Internal, "/api/tenants/:tenant_id/agents"),
         (Internal, "/api/tenants/:tenant_id/meta/:key"),
-        (Internal, "/api/tenants/:tenant_id/watch"),
         (Internal, "/api/admin/tokens"),
         (Internal, "/api/admin/backups"),
         (Internal, "/api/admin/recovery"),
@@ -228,7 +227,6 @@ pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
             get(replay_session),
         )
         .route("/api/tenants/:tenant_id/changes", get(changes))
-        .route("/api/tenants/:tenant_id/watch", get(watch))
         .route(
             "/api/tenants/:tenant_id/exports/backfill",
             post(export_backfill),
@@ -6901,21 +6899,6 @@ async fn build_context(
     Ok(with_headers(Json(context).into_response(), route_headers))
 }
 
-async fn watch(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-    Path(tenant_id): Path<String>,
-    Query(q): Query<WatchQuery>,
-) -> Result<Json<Vec<ChangefeedItem>>, ApiError> {
-    let req = watch_request_from_query(&tenant_id, q)?;
-    let runtime = s.runtime.clone();
-    let items = with_route_tablet_context(runtime.clone(), &headers, async move {
-        runtime.watch(req).await
-    })
-    .await?;
-    Ok(Json(items))
-}
-
 /// `GET /api/tenants/{t}/changes` — the one public changefeed over the export
 /// ledger. Commit-ordered items with `next_cursor` / `high_watermark` /
 /// `oldest_available_cursor`, optional session scope and `include` filter, an
@@ -7394,28 +7377,6 @@ fn require_single_tablet_export(s: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn watch_request_from_query(tenant_id: &str, q: WatchQuery) -> Result<WatchRequest, ApiError> {
-    let tid = parse_id_or(tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let scope = parse_watch_scope(&q.scope);
-    let session_id = q
-        .session_id
-        .as_deref()
-        .map(|raw| parse_id_or(raw, IdKind::Session, ErrorCode::SessionNotFound))
-        .transpose()?;
-    let agent_id = q
-        .agent_id
-        .as_deref()
-        .map(|raw| parse_id_or(raw, IdKind::Agent, ErrorCode::AgentNotFound))
-        .transpose()?;
-    Ok(WatchRequest {
-        tenant_id: tid,
-        scope,
-        session_id,
-        agent_id,
-        from_cursor: q.from_cursor,
-        limit: q.limit.clamp(1, 1000),
-    })
-}
 
 fn parse_export_include_query(raw: &str) -> Vec<String> {
     raw.split(',')

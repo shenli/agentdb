@@ -60,8 +60,8 @@ def capture(client):
             return response(body={"events": []})
         if url.endswith("/context"):
             return response(body={"events": [], "records": []})
-        if url.endswith("/watch"):
-            return response(body=[])
+        if url.endswith("/changes"):
+            return response(body={"items": [], "next_cursor": None, "high_watermark": None})
         if url.endswith("/artifacts"):
             return response(body={"artifact_id": "art_1"})
         if "/records/search" in url:
@@ -86,7 +86,7 @@ def test_v2_urls_cover_core_flow():
         session.replay()
         session.materialize_replay_prefix()
         session.context(include=["recent_events", "records"])
-        c.watch(tenant["tenant_id"], scope="tenant")
+        c.changes(tenant["tenant_id"], scope="tenant")
         c.put_artifact(tenant["tenant_id"], b"blob")
         c.verify_artifact_lifecycle(tenant["tenant_id"])
         c.write_record(tenant["tenant_id"], namespace=["mem"], text="x")
@@ -101,7 +101,7 @@ def test_v2_urls_cover_core_flow():
     assert any("/replay" in url for url in urls)
     assert any("/replay-prefix" in url for url in urls)
     assert any("/context" in url for url in urls)
-    assert any("/watch" in url for url in urls)
+    assert any(url.endswith("/changes") for url in urls)
 
 
 def test_changes_reads_the_changefeed():
@@ -159,7 +159,7 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
         )
         workspace.records.write(namespace=["mem"], text="x")
         workspace.records.search(namespace=["mem"], text="x")
-        workspace.watch(scope="agent", agent_id=agent.id)
+        workspace.changes()
         recovered = agent.session_by_id(session.id)
         recovered.replay()
         db.session_by_id(session.id, tenant_id=workspace.id, agent_id=agent.id).fetch()
@@ -179,7 +179,7 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
     assert any("/api/tenants/ten_1/artifacts" in url for url in urls)
     assert any("/api/tenants/ten_1/artifacts/verify-lifecycle" in url for url in urls)
     assert any("/api/tenants/ten_1/records" in url for url in urls)
-    assert any("/api/tenants/ten_1/watch" in url for url in urls)
+    assert any("/api/tenants/ten_1/changes" in url for url in urls)
     assert any("/api/tenants/ten_1/sessions/ses_1/replay" in url for url in urls)
 
 

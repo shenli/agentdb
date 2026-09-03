@@ -14,12 +14,14 @@ dashboards.
 ClickHouse is the first-class sink. It is not the only sink. S3/Parquet,
 OpenTelemetry Collector, Kafka, lakehouse, warehouse, and customer-specific
 pipelines should all use the same export envelope, cursor, backfill, and
-consumer contracts. The design goal is that `AgentDB -> ClickHouse` feels like
-the best-supported path, while the underlying export layer stays sink-neutral.
+checkpoint contracts. The design goal is that `AgentDB -> ClickHouse` feels
+like the best-supported path, while the underlying export layer stays
+sink-neutral.
 
 ```text
 AgentDB runtime log
-  -> durable export ledger, backfill, watch, and managed consumer cursors
+  -> durable export ledger, backfill snapshots, and a commit-ordered changefeed
+      -> client-side resume checkpoints held by the exporter
       -> ClickHouse native AgentDB schema
       -> optional OpenTelemetry / ClickStack projection
       -> S3/Parquet archive or lakehouse table
@@ -50,7 +52,7 @@ The highest-risk gaps were:
   rows.
 - No clear ClickHouse schema, engine choice, migration story, or retry/dedup
   contract.
-- No managed consumer cursor model. Requiring every connector to invent
+- No documented resume-checkpoint model. Requiring every connector to invent
   checkpointing creates avoidable data-loss and duplicate risks.
 - No OpenTelemetry / ClickStack compatibility plan. Native AgentDB schema is
   necessary, but many observability tools expect OTel-shaped logs/traces.
@@ -64,34 +66,28 @@ contract below it.
 
 ## Current State
 
-AgentDB has both the runtime watch surface and the durable export surface:
+AgentDB exposes one public changefeed over the durable export ledger:
 
-- `GET /api/tenants/{tenant_id}/watch` returns `ChangefeedItem` values.
-- Watch supports tenant, agent, and session scope.
-- Watch uses a resume cursor and a result limit.
+- `GET /api/tenants/{tenant_id}/changes` returns commit-ordered export items
+  with `next_cursor`, `high_watermark`, and `oldest_available_cursor`.
+- `/changes` supports optional `scope` (tenant, agent, session), an `include`
+  filter, `from_cursor` resume, `backfill=true` (pinned
+  `snapshot_high_watermark` plus `complete`), and long-poll `wait_ms`.
+- `fork_edge` lineage arrives as an item with `object_type = "fork_edge"`.
+- Records appear only when the server runs with `labs` enabled.
 - `replay` covers session-local event recovery.
 - Records already have a durable outbox-like path for async global indexing.
-- Architecture docs already treat watch/changefeed cursors as a dashboard and
-  supervisor primitive.
 - Persistent export mutations are written to a dedicated durable ledger with
-  tenant, agent, and session indexes, retained-cursor validation, and managed
-  consumer checkpoints.
+  tenant, agent, and session indexes and retained-cursor validation.
 
-The general watch implementation remains intentionally different from the
-replication contract:
-
-- It primarily emits session events, not every runtime mutation.
-- It reconstructs results from live session events instead of reading a
-  dedicated durable changefeed ledger.
-- Its frontier/item cursors are for runtime observation, not external sink
-  checkpoints.
-
-The durable export API closes those replication gaps for single-tablet
-runtimes. Its v2 cursor contains a monotonic sequence allocated at the
-serialized persistent commit boundary, not a wall-clock timestamp; it defines
-retention and expired-cursor errors, backfill, leases/checkpoints, tombstones,
-and projection-friendly envelopes. Metadata-backed cross-tablet routing fails
-the export surface closed until it has a distributed merge frontier.
+The durable changefeed closes the replication gaps for single-tablet runtimes.
+Its v2 cursor contains a monotonic sequence allocated at the serialized
+persistent commit boundary, not a wall-clock timestamp; it defines retention and
+expired-cursor errors, backfill snapshots, tombstones, and projection-friendly
+envelopes. Resume durability is client-side: the exporter persists its own
+checkpoint and seeds `from_cursor` from it on restart. Metadata-backed
+cross-tablet routing fails the export surface closed until it has a distributed
+merge frontier.
 
 ## Goals
 
@@ -145,8 +141,8 @@ agentdb-export-clickhouse run \
 The first successful run should produce:
 
 - visible rows in `agentdb_events`
-- a saved consumer cursor
-- a health report with rows exported, lag, and last cursor
+- a saved client-side resume checkpoint keyed by `(consumer, tenant_id)`
+- a health report with rows exported, export freshness, and last cursor
 - copyable sample queries
 - optional ClickStack/HyperDX and Grafana setup snippets
 
@@ -185,7 +181,7 @@ should be easy for humans and reliable for coding agents.
   form is `--format json`, since `--output` names the export sink path).
 - `doctor -o json` returns stable machine-readable check IDs:
   `agentdb_reachable`, `clickhouse_reachable`, `schema_current`,
-  `can_insert`, `can_query`, `consumer_cursor_valid`, `lag_within_slo`.
+  `can_insert`, `can_query`, `checkpoint_valid`, `freshness_within_slo`.
 - Errors carry stable codes and remediation text.
 - The connector emits structured logs and optional Prometheus metrics.
 - The docs include a minimal "AI coding agent playbook" with exact commands,
@@ -208,8 +204,8 @@ capabilities so future connectors are compatible by construction.
 
 | Level | Capability | Examples |
 |---|---|---|
-| L0 | Stateless polling from `exports/watch`; sink owns checkpointing. | Scripts, prototypes, local JSONL. |
-| L1 | Managed consumer with claim/ack/rewind and lag reporting. | Official ClickHouse and S3 connectors. |
+| L0 | Stateless polling from `/changes`; caller keeps its own cursor in memory. | Scripts, prototypes, local JSONL. |
+| L1 | Durable client-side checkpoint keyed by `(consumer, tenant)` with supervised-restart resume. | Official ClickHouse and S3 connectors. |
 | L2 | Backfill plus tail with snapshot high-watermark handoff. | ClickHouse, S3/Parquet, Kafka bootstrap. |
 | L3 | Sink-specific schema/init/doctor/status UX. | ClickHouse DDL/migrations, ClickStack projection. |
 | L4 | Bidirectional operational integration. | Future alerts, replay links, or UI deep links back into AgentDB. |
@@ -230,8 +226,8 @@ The design should leave room for:
 - embedded/local export for development and tests.
 
 AgentDB should not add a bespoke runtime API for each target. If a sink cannot
-be implemented through the export envelope, backfill, watch, and managed
-consumer APIs, the export contract is incomplete.
+be implemented through the export envelope, backfill snapshots, and the
+`/changes` changefeed, the export contract is incomplete.
 
 ## Required Additions
 
@@ -257,44 +253,30 @@ cursor without needing to scan all session event keys.
 Export ledger writes happen after the runtime mutation is committed and locally
 visible. External sink failure must not block ordinary AgentDB appends.
 
-### 2. Managed Export Consumers
+### 2. Client-Side Resume Checkpoints
 
-Add optional named export consumers. This is not strictly required for generic
-changefeeds, but it is the right default for a polished ClickHouse integration.
+The server keeps no per-consumer state, leases, or acks. Resume durability lives
+in the exporter, which persists the last `next_cursor` it processed and seeds
+`from_cursor` from it on start. `--consumer <name>` is the client-side
+checkpoint key, not a server-side consumer registration.
 
-Consumer state should include:
+The official connectors persist a checkpoint keyed by `(consumer, tenant_id)`:
 
-```text
-tenant_id
-consumer_name
-scope
-include object types
-last_acked_cursor
-snapshot_high_watermark
-lease_owner
-lease_expires_at_ms
-created_at_ms
-updated_at_ms
-```
+- ClickHouse: an `agentdb_export_checkpoints` row, upserted with `next_cursor`
+  after each committed batch and read back on start.
+- JSONL: a local `<output>.checkpoint` file, or an explicit `--checkpoint
+  <path>`.
 
-APIs:
-
-```text
-POST /api/tenants/{tenant_id}/exports/consumers
-GET  /api/tenants/{tenant_id}/exports/consumers/{name}
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/claim
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/ack
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/rewind
-```
-
-Sinks can still store their own checkpoints. The managed consumer path gives
-the official connector a safe default and gives operators one place to inspect
-export lag.
+Run exactly one exporter per `(consumer, tenant)`. Two exporters sharing the
+same checkpoint key would race the checkpoint and produce duplicate or skipped
+writes. Availability comes from a supervised restart (systemd, or a Kubernetes
+Deployment with `replicas: 1`) that resumes from the persisted checkpoint; there
+is no server-side lease or HA handoff.
 
 ### 3. Stable Export Cursor
 
-Persistent export uses an opaque `ledger:` cursor distinct from the general
-runtime-watch cursor. Its current v2 form encodes:
+The `/changes` changefeed uses an opaque `ledger:` cursor. Its current v2 form
+encodes:
 
 ```text
 version
@@ -310,15 +292,15 @@ legacy timestamp-based ledger cursors remain readable during migration, but new
 writes receive v2 cursors.
 
 Clients must still treat the whole cursor as opaque. SDKs and sinks should
-persist and replay it, not parse or synthesize one. Managed consumer ack and
-rewind reject a well-formed but fabricated cursor: the row must still exist and
-match the consumer tenant, scope, and include filter.
+persist and replay it, not parse or synthesize one. `/changes` resumes only from
+a well-formed cursor that names a real retained ledger position for the
+requested tenant, scope, and include filter; a fabricated cursor is rejected.
 
 Persistent page boundaries have separate meanings:
 
 - `next_cursor` is the last row returned in that page and is the cursor for the
   next page request.
-- `high_watermark` is the ledger head captured when an export-watch request
+- `high_watermark` is the ledger head captured when a `/changes` request
   starts.
 - `snapshot_high_watermark` is captured on the first backfill page and remains
   fixed across continued pages. Clients must echo it with `from_cursor`. When
@@ -335,7 +317,7 @@ hardening.
 
 A future tablet-local cursor format may add placement/epoch fields behind the
 same opaque contract. Tablet movement and restore currently preserve the
-tenant ledger, high-watermark, and managed-consumer rows.
+tenant ledger and its high-watermark pointers.
 
 Expired cursors return a structured error with:
 
@@ -375,7 +357,12 @@ The response should include:
 ```
 
 The `snapshot_high_watermark` lets a sink backfill up to a point and then switch
-to tailing watch from that same boundary without gaps.
+to tailing `/changes` from that same boundary without gaps. `exports/backfill`
+remains the only way to obtain a current-state metadata snapshot
+(`--include tenants,agents,sessions,artifacts,records`, no `events`), emitting
+`snapshot:` cursors with a fixed `snapshot_high_watermark` and a final
+`complete`. `GET /changes?backfill=true` offers the same pinned-snapshot handoff
+inline for changefeed consumers.
 
 ### 5. Export Envelope
 
@@ -418,9 +405,12 @@ session
 event
 artifact
 record
+fork_edge
 policy
-consumer
 ```
+
+`record` items appear only when the server runs with `labs` enabled.
+`fork_edge` items carry session fork lineage.
 
 For `object_type = "event"`, `data` should include the canonical
 `EventEnvelope`.
@@ -546,7 +536,7 @@ Retry and dedup:
   `(object_type, object_id)` for mutable metadata.
 - Metadata/latest tables use `ReplacingMergeTree(updated_at_ms)` so repeated
   updates converge.
-- The connector should ack the AgentDB consumer cursor only after ClickHouse
+- The connector should advance its client-side checkpoint only after ClickHouse
   confirms the batch.
 
 Do not rely on ClickHouse alone to provide exactly-once semantics. The product
@@ -611,7 +601,7 @@ connector framework and capability model.
 
 1. `agentdb-export-clickhouse`
    - backfills a tenant
-   - tails watch
+   - tails `/changes`
    - writes idempotently into ClickHouse
    - initializes and migrates schema
    - supports native and OTel projection modes
@@ -670,7 +660,7 @@ Default insert behavior:
 - use `async_insert=1` with `wait_for_async_insert=1` when configured
 - set a stable deduplication token per AgentDB export batch
 - retry failed batches with the same batch id and ClickHouse settings
-- ack AgentDB only after ClickHouse returns success
+- advance the client-side checkpoint only after ClickHouse returns success
 
 This gives low operational friction while preserving a clear durability
 boundary.
@@ -736,12 +726,12 @@ The export contract should be:
   loss.
 - **Tombstones for deletes.** Sinks receive delete/purge intent so dashboards can
   honor retention and privacy policy.
-- **Ack after sink durability.** Official connectors ack managed consumers only
-  after the sink has durably accepted the batch.
+- **Checkpoint after sink durability.** Official connectors advance their
+  client-side checkpoint only after the sink has durably accepted the batch.
 
 Exactly-once effects are a sink responsibility implemented with idempotent
 insert keys, deduplication tokens, replacing/merging tables, and replay-safe
-consumer cursors.
+client-side checkpoints.
 
 ## Runtime Isolation
 
@@ -750,12 +740,13 @@ locally visible. External sink failure must not block normal appends.
 
 Backpressure rules:
 
-- If the export ledger grows too large, report lag and apply policy-based
-  retention or backpressure.
+- If the export ledger grows too large, apply policy-based retention. Exporters
+  gauge their own freshness client-side, so backpressure is measured at the
+  sink, not tracked as server-side per-consumer lag.
 - Do not synchronously wait for ClickHouse, S3, or any external sink in the
   append path.
-- Admin status should expose oldest retained cursor, export lag, dropped cursor
-  count, and ledger bytes by tenant/tablet.
+- Admin status (`GET /api/admin/exports`) exposes per-tenant `high_watermark`
+  and `oldest_available_cursor`.
 
 ## Security And Privacy
 
@@ -781,33 +772,30 @@ redaction remains future work once tenant policy mutation APIs are promoted.
 
 ## API Sketch
 
-Existing:
+The export surface is a small, fixed set of routes:
 
 ```text
-GET /api/tenants/{tenant_id}/watch
-```
-
-Keep it for simple consumers. Add export-specific APIs:
-
-```text
-GET  /api/tenants/{tenant_id}/exports/watch
+GET  /api/tenants/{tenant_id}/changes
 POST /api/tenants/{tenant_id}/exports/backfill
 GET  /api/tenants/{tenant_id}/exports/status
-POST /api/tenants/{tenant_id}/exports/consumers
-GET  /api/tenants/{tenant_id}/exports/consumers/{name}
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/claim
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/ack
-POST /api/tenants/{tenant_id}/exports/consumers/{name}/rewind
 GET  /api/admin/exports
 ```
 
-`exports/watch` differs from current `watch` by returning export envelopes for
-all requested object types, not only session events.
+`/changes` is the one public changefeed. It returns export envelopes for all
+requested object types, not only session events, in durable commit order. It
+accepts `scope` (tenant, agent, session), an `include` filter, `from_cursor`
+resume, `backfill=true` for a pinned metadata snapshot, and `wait_ms` for
+long-poll. Records appear only when the server runs with `labs` enabled.
+
+`exports/backfill` returns a paged current-state metadata snapshot.
+`exports/status` reports export health, high watermark, and oldest available
+cursor. `GET /api/admin/exports` returns per-tenant
+`{ tenant_id, high_watermark, oldest_available_cursor }`.
 
 Example:
 
 ```text
-GET /api/tenants/ten_x/exports/watch?scope=tenant&from_cursor=...&limit=1000
+GET /api/tenants/ten_x/changes?scope=tenant&from_cursor=...&limit=1000&wait_ms=5000
 ```
 
 Response:
@@ -826,16 +814,16 @@ Response:
 ### Phase 1: ClickHouse Golden Path And Durable Export Ledger
 
 - Implemented: `ExportEnvelope` DTOs for events and runtime metadata objects.
-- Implemented: `GET /api/tenants/{tenant_id}/exports/watch` returning export
-  envelopes. Persistent runtimes serve this from a durable export ledger;
-  in-memory/dev runtimes fall back to current event watch logic.
+- Implemented: `GET /api/tenants/{tenant_id}/changes`, the one public
+  changefeed returning commit-ordered export envelopes over the durable export
+  ledger.
 - Implemented: `GET /api/tenants/{tenant_id}/exports/status` exposing the
   durable ledger capability and supported object types.
 - Implemented: `POST /api/tenants/{tenant_id}/exports/backfill` with event
   snapshots plus tenant-scope metadata snapshots for tenants, agents, sessions,
   artifacts, and records.
 - Implemented: explicit persisted cursor validation and
-  `oldest_available_cursor` reporting for export watch, backfill, and status.
+  `oldest_available_cursor` reporting for `/changes`, backfill, and status.
 - Implemented: commit-ordered v2 durable cursors backed by a persisted
   per-tenant sequence in single-tablet runtimes. Late commits cannot sort
   behind an already-issued high-watermark merely because their wall-clock
@@ -844,39 +832,35 @@ Response:
 - Implemented: page-local `next_cursor`, request-start bounded
   `high_watermark`, and fixed first-page `snapshot_high_watermark` semantics,
   with tests covering limited pages and changes committed between pages.
-- Implemented: managed export consumers with durable checkpoints, include
-  filters, leases, ack, and rewind.
-- Implemented: managed ack/rewind validation against an actual retained ledger
-  item for the consumer tenant, scope, and include filter. Metadata snapshot
-  acknowledgements normalize to the captured ledger high watermark.
+- Implemented: client-side resume checkpoints in the exporters (ClickHouse
+  `agentdb_export_checkpoints` table, JSONL `<output>.checkpoint` file), keyed
+  by `(consumer, tenant_id)` and seeded via `from_cursor` on restart.
+- Implemented: `/changes` cursor validation against an actual retained ledger
+  item for the requested tenant, scope, and include filter. Metadata snapshot
+  handoff normalizes to the captured ledger high watermark.
 - Implemented: per-tenant durable export high-watermark pointers for
   persistent runtimes, so `exports/status` does not scan the full ledger.
 - Implemented: durable session and agent export ledger indexes for scoped
-  event and metadata consumers. The public cursor remains the canonical tenant
-  `ledger:...` cursor.
+  event and metadata changefeed reads. The public cursor remains the canonical
+  tenant `ledger:...` cursor.
 - Implemented: tenant, agent, session, artifact, and record mutation ledger
   rows.
 - Implemented: soft-delete tombstone export for metadata objects that use the
   runtime soft-delete contract.
 - Implemented: retention-GC and tenant-purge tombstone export for physical GC
   removal of events and runtime metadata objects.
-- Implemented: persisted export watch can drain retained ledger rows after a
+- Implemented: persisted `/changes` reads can drain retained ledger rows after a
   tenant has been physically purged, so final tenant-purge tombstones remain
   observable.
-- Implemented: retention-aware cursor validation. A consumer resuming from a
+- Implemented: retention-aware cursor validation. A reader resuming from a
   pruned durable-ledger cursor receives `InvalidCursor` with the current
   `oldest_available_cursor`.
 - Implemented: tablet movement snapshot classification for export ledger,
-  scoped ledger indexes, high-watermark rows, and managed consumer rows.
+  scoped ledger indexes, and high-watermark rows.
 - Implemented: restore/conformance coverage proving tablet snapshot restore
-  preserves export ledger high watermarks and managed consumer checkpoints.
-- Implemented: `GET /api/admin/exports` visibility for managed consumers and
-  current export capability, including pending item count, high watermark,
-  oldest pending item timestamp, lag, and lease-active state.
-- Implemented: streaming pending-status calculation with O(1) additional
-  memory and O(number of retained pending rows) scan time.
-- Implemented: aggregate admin export metrics for total pending items, max
-  lag, oldest pending timestamp, lease counts, and oldest retained cursors.
+  preserves export ledger high watermarks.
+- Implemented: `GET /api/admin/exports` visibility returning per-tenant
+  `{ tenant_id, high_watermark, oldest_available_cursor }`.
 - Implemented: normalized event observability fields for common convention
   payload keys.
 - Implemented: `agentdbctl export clickhouse doctor/init/migrate/run/status`,
@@ -900,8 +884,8 @@ Response:
   exporter metrics.
 - Implemented: systemd service/env packaging for the long-running
   `agentdbctl` exporter. A separate `agentdb-export-clickhouse` daemon binary
-  remains optional because the packaged service uses the same consumer lease
-  protocol.
+  remains optional because the packaged service resumes from the same
+  client-side checkpoint on restart.
 
 This phase is a durable export API, metadata snapshot, schema, HA, and UX
 commitment. It includes tenant-prefixed durable ledger rows for persisted
@@ -914,12 +898,15 @@ exports use secondary index rows that point back to the canonical tenant ledger
 entry, avoiding full tenant scans while preserving one sink checkpoint cursor
 format.
 
-Single-tablet HA behavior: run multiple connector workers with the same consumer name and
-distinct lease owners. Only the active lease holder can ack. The connector
-writes a batch to ClickHouse before acking AgentDB, so failover can replay the
-last unacked batch without data loss. RPO is zero for committed AgentDB events
-that remain in the export ledger. RTO is bounded by the configured export
-consumer lease expiry plus the worker poll interval and ClickHouse insert time.
+Single-tablet availability behavior: run exactly one exporter per
+`(consumer, tenant)` under a supervisor (systemd, or a Kubernetes Deployment
+with `replicas: 1`). The exporter writes a batch to ClickHouse before advancing
+its client-side checkpoint, so a supervised restart replays the last
+uncheckpointed batch without data loss. RPO is zero for committed AgentDB events
+that remain in the export ledger. RTO is bounded by the supervisor restart time
+plus the worker poll interval and ClickHouse insert time. There is no
+server-side lease; running two exporters on the same checkpoint key would race
+the checkpoint.
 
 Local exporter baseline: on a developer workstation with in-memory AgentDB,
 local Docker ClickHouse, one tenant/session, 10 batches, and 1000 envelopes per
@@ -967,9 +954,9 @@ Cluster export throughput scales through tenant and consumer parallelism:
 cluster throughput ~= sum(active tenant consumers) * per-consumer throughput
 ```
 
-A single tenant/consumer remains ordered and acked serially. Many tenants can
-be exported by multiple workers across nodes or cells until ClickHouse ingest,
-network, or exporter CPU becomes the shared bottleneck.
+A single tenant/consumer remains ordered and checkpointed serially. Many tenants
+can be exported by multiple workers across nodes or cells until ClickHouse
+ingest, network, or exporter CPU becomes the shared bottleneck.
 
 Initial SLO guidance:
 
@@ -977,12 +964,13 @@ Initial SLO guidance:
 |---|---:|
 | Same-AZ export freshness | p95 under 2s |
 | Remote sink export freshness | p95 under 5s |
-| Failover RTO | `lease_ms + poll_interval_ms + insert_time` |
+| Restart RTO | `supervisor_restart_time + poll_interval_ms + insert_time` |
 | RPO | zero for committed events retained in the export ledger |
 
-With default `lease_ms=30000` and `poll_interval_ms=1000`, failover RTO is
-roughly 31s plus the active insert time. Shorter leases can reduce RTO, but
-they must remain above ClickHouse insert p99 to avoid unnecessary lease churn.
+RTO is dominated by how quickly the supervisor restarts the single exporter and
+how far its persisted checkpoint trails the ledger head. With
+`poll_interval_ms=1000` and a fast supervised restart, recovery is typically a
+few seconds plus the active insert time.
 
 Future real-world tests should cover persistent AgentDB, AWS ClickHouse or
 ClickHouse Cloud, 1/10/100 tenants, many sessions per tenant, payload sizes of
@@ -1048,14 +1036,15 @@ formalized.
   without gaps; tolerate snapshot/tail duplicates during concurrent metadata
   mutation.
 - Delete and retention GC produce tombstones.
-- Export lag metrics increase when a sink stops and recover when it resumes.
+- Exporter freshness reported client-side increases when a sink stops and
+  recovers when it resumes.
 - Cursor expiry returns a structured error.
 - Tenant/agent/session scopes never leak cross-tenant data.
 - Restore and tablet movement preserve or rebuild export cursor state.
 - `agentdbctl export clickhouse doctor -o json` remains stable.
 - ClickHouse schema migrations are idempotent.
-- ClickHouse connector crash after insert but before ack does not create
-  duplicate query-facing rows after restart.
+- ClickHouse connector crash after insert but before advancing its checkpoint
+  does not create duplicate query-facing rows after restart.
 
 ## Open Questions
 
@@ -1072,8 +1061,9 @@ formalized.
 
 ## Recommendation
 
-The durable ledger, managed consumers, ClickHouse/ClickStack path, and
-JSONL/Parquet path have landed. Continue in this order:
+The durable ledger, the `/changes` changefeed with client-side checkpoints, the
+ClickHouse/ClickStack path, and the JSONL/Parquet path have landed. Continue in
+this order:
 
 1. Make metadata backfill a transactionally stable multi-page snapshot.
 2. Promote tenant policy mutation/redaction into the server-side export path;

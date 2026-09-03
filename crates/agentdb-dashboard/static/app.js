@@ -403,8 +403,11 @@ async function watchScope() {
     const cfg = readConfig();
     const params = new URLSearchParams({ scope: "session", session_id: cfg.sessionId, limit: String(cfg.limit) });
     if (cfg.agentId) params.set("agent_id", cfg.agentId);
-    const data = await request(`/api/tenants/${enc(cfg.tenantId)}/watch?${params}`);
-    state.events = data.map((item) => item.event || item);
+    const data = await request(`/api/tenants/${enc(cfg.tenantId)}/changes?${params}`);
+    const items = Array.isArray(data.items) ? data.items : [];
+    state.events = items
+      .filter((item) => item.object_type === "event")
+      .map((item) => item.data);
     if (!state.events.find((event) => event.event_id === state.selectedEventId)) {
       state.selectedEventId = state.events[0]?.event_id || null;
     }
