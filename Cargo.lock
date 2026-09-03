@@ -121,6 +121,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentdb-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+]
+
+[[package]]
 name = "agentdb-index"
 version = "0.1.0"
 dependencies = [
@@ -165,6 +173,7 @@ dependencies = [
  "agentdb-api",
  "agentdb-core",
  "agentdb-dashboard",
+ "agentdb-import",
  "agentdb-meta",
  "agentdb-storage",
  "anyhow",
@@ -216,6 +225,7 @@ dependencies = [
 name = "agentdbctl"
 version = "0.1.0"
 dependencies = [
+ "agentdb-import",
  "agentdb-storage",
  "anyhow",
  "clap",

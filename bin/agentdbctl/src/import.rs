@@ -1,48 +1,34 @@
-//! Import coding-agent session logs (Claude Code, Codex) into AgentDB.
+//! Import coding-agent session logs (Claude Code, Codex) into a **running**
+//! AgentDB server over HTTP.
 //!
 //! One JSONL file is one session; the repository path (the log's `cwd`) is the
 //! workspace; the session UUID is the session alias; each line becomes an event
-//! whose kind is the line's `type`. Appends carry an `Idempotency-Key` of
-//! `<file>:<line>`, so re-running — and `--watch` — never duplicates an event.
-//! A small local state file remembers each file's created ids and how many lines
-//! have been imported, so re-runs only send new lines.
+//! whose kind is the line's `type`. Events are sent in bulk to the `/events/batch`
+//! endpoint. A local state file remembers each file's resolved ids and import
+//! offset, so re-runs — and `--watch` — send only new lines.
+//!
+//! Shared parsing lives in [`agentdb_import`]. For a one-shot bulk load into the
+//! local store with the server stopped, `agentdb import` is faster (in-process,
+//! no HTTP).
 
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
+use agentdb_import::{
+    classify_line, collect_jsonl, derive_identity, read_prefix_lines, resolve_dir, LineClass, State,
+};
+pub(crate) use agentdb_import::Source;
+
 use crate::{Api, ImportArgs};
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Source {
-    ClaudeCode,
-    Codex,
-}
-
-impl Source {
-    fn agent_alias(self) -> &'static str {
-        match self {
-            Source::ClaudeCode => "claude-code",
-            Source::Codex => "codex",
-        }
-    }
-
-    fn default_dir(self) -> Option<PathBuf> {
-        let home = home()?;
-        Some(match self {
-            Source::ClaudeCode => home.join(".claude/projects"),
-            Source::Codex => home.join(".codex/sessions"),
-        })
-    }
-}
-
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-}
+const STATE_FILE: &str = "agentdbctl-import-state.json";
+const MAX_BATCH: usize = 512;
+/// Keep a request comfortably under the server's HTTP body limit.
+const MAX_BATCH_BYTES: usize = 1_000_000;
 
 #[derive(Default)]
 struct Summary {
@@ -52,17 +38,21 @@ struct Summary {
     errors: usize,
 }
 
-pub(crate) async fn run(api: &Api, source: Source, args: ImportArgs) -> Result<Value> {
-    let dir = args
-        .dir
-        .clone()
-        .or_else(|| source.default_dir())
-        .ok_or_else(|| anyhow!("could not resolve a source directory; pass --dir"))?;
-    if !dir.exists() {
-        anyhow::bail!("source directory {} does not exist", dir.display());
+impl Summary {
+    fn to_value(&self, dir: &Path) -> Value {
+        json!({
+            "directory": dir.display().to_string(),
+            "files_seen": self.files_seen,
+            "sessions_touched": self.sessions_touched,
+            "events_appended": self.events_appended,
+            "errors": self.errors,
+        })
     }
+}
 
-    let mut state = State::load()?;
+pub(crate) async fn run(api: &Api, source: Source, args: ImportArgs) -> Result<Value> {
+    let dir = resolve_dir(source, args.dir.clone())?;
+    let mut state = State::load(STATE_FILE)?;
     let summary = import_once(api, source, &dir, &mut state).await?;
 
     if !args.watch {
@@ -103,12 +93,15 @@ async fn import_once(
     for file in files {
         summary.files_seen += 1;
         match import_file(api, source, &file, state).await {
-            Ok(appended) => {
-                if appended > 0 {
-                    summary.sessions_touched += 1;
-                    summary.events_appended += appended;
-                }
+            Ok(appended) if appended > 0 => {
+                summary.sessions_touched += 1;
+                summary.events_appended += appended;
+                // Persist the offset after each file so a crash re-imports at
+                // most one in-flight file (the batch path carries no per-event
+                // idempotency key).
+                state.save()?;
             }
+            Ok(_) => {}
             Err(error) => {
                 summary.errors += 1;
                 eprintln!("skip {}: {error:#}", file.display());
@@ -119,141 +112,97 @@ async fn import_once(
     Ok(summary)
 }
 
-async fn import_file(
-    api: &Api,
-    source: Source,
-    file: &Path,
-    state: &mut State,
-) -> Result<usize> {
+async fn import_file(api: &Api, source: Source, file: &Path, state: &mut State) -> Result<usize> {
     let key = file.to_string_lossy().into_owned();
-    let text = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let lines: Vec<&str> = text.lines().collect();
-
     let start = state.next_line(&key);
-    if start >= lines.len() {
-        return Ok(0); // nothing new
-    }
 
-    let (session_alias, workspace) = derive_identity(source, file, &lines)?;
-
-    // Resolve (and cache) the workspace/agent/session ids for this file.
-    let entry = if let Some(existing) = state.entry(&key) {
-        existing
+    // Resolve (and cache) the tenant/agent/session ids. Identity comes from a
+    // bounded prefix so we never load a whole (possibly multi-GB) file.
+    let (tenant_id, agent_id, session_id) = if let Some(entry) = state.entry(&key) {
+        (entry.tenant_id, entry.agent_id, entry.session_id)
     } else {
+        let prefix = read_prefix_lines(file, 64)?;
+        let prefix_refs: Vec<&str> = prefix.iter().map(String::as_str).collect();
+        let (session_alias, workspace) = derive_identity(source, file, &prefix_refs)?;
         let tenant_id = ensure_workspace(api, &workspace).await?;
         let agent_id = ensure_agent(api, &tenant_id, source.agent_alias()).await?;
         let session_id = ensure_session(api, &tenant_id, &agent_id, &session_alias).await?;
-        state.set_entry(&key, &tenant_id, &agent_id, &session_id)
+        let entry = state.set_entry(&key, &tenant_id, &agent_id, &session_id);
+        (entry.tenant_id, entry.agent_id, entry.session_id)
     };
 
-    let mut appended = 0;
-    for (idx, line) in lines.iter().enumerate().skip(start) {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    let path = format!("/api/tenants/{tenant_id}/sessions/{session_id}/events/batch");
+
+    // Stream the file line by line so memory stays bounded to one line plus one
+    // batch, and batch events to one HTTP request instead of one per event.
+    let reader = BufReader::new(
+        std::fs::File::open(file).with_context(|| format!("open {}", file.display()))?,
+    );
+    let mut batch: Vec<Value> = Vec::new();
+    let mut batch_bytes = 0usize;
+    let mut appended = 0usize;
+    let mut skipped_oversized = 0usize;
+    let mut last_idx = start;
+    for (idx, line) in reader.lines().enumerate() {
+        if idx < start {
+            continue; // already imported on a previous run
         }
-        let value: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue, // skip a malformed line rather than abort the file
-        };
-        let kind = value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("log")
-            .to_string();
-        let body = json!({
-            "agent_id": entry.agent_id,
-            "kind": kind,
-            "payload": value,
-        });
-        let path = format!(
-            "/api/tenants/{}/sessions/{}/events",
-            entry.tenant_id, entry.session_id
+        let line = line.with_context(|| format!("read line {idx} of {}", file.display()))?;
+        last_idx = idx;
+        match classify_line(&line) {
+            LineClass::Skip => {}
+            LineClass::Oversized => skipped_oversized += 1,
+            LineClass::Event {
+                kind,
+                payload,
+                payload_bytes,
+            } => {
+                batch.push(json!({ "kind": kind, "payload": payload }));
+                batch_bytes += payload_bytes;
+                if batch.len() >= MAX_BATCH || batch_bytes >= MAX_BATCH_BYTES {
+                    appended += flush(api, &path, &agent_id, &mut batch, file, last_idx).await?;
+                    batch_bytes = 0;
+                    state.set_next_line(&key, idx + 1);
+                }
+            }
+        }
+    }
+    if !batch.is_empty() {
+        appended += flush(api, &path, &agent_id, &mut batch, file, last_idx).await?;
+    }
+    // Advance past any trailing blank/skipped lines so they aren't re-read.
+    state.set_next_line(&key, last_idx + 1);
+    if skipped_oversized > 0 {
+        eprintln!(
+            "note: skipped {skipped_oversized} oversized event(s) in {}",
+            file.display()
         );
-        let idempotency_key = format!("{key}:{idx}");
-        api.post_idempotent(&path, body, &idempotency_key)
-            .await
-            .with_context(|| format!("append line {idx} of {}", file.display()))?;
-        appended += 1;
-        state.set_next_line(&key, idx + 1);
     }
     Ok(appended)
 }
 
-/// (session_alias, workspace) for a source's file.
-fn derive_identity(source: Source, file: &Path, lines: &[&str]) -> Result<(String, String)> {
-    let file_stem = file
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let parent_name = file
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
-    match source {
-        Source::ClaudeCode => {
-            // Session id is the file name; workspace is the first line's cwd.
-            let cwd = first_field(lines, |v| v.get("cwd").and_then(Value::as_str));
-            let workspace = cwd.unwrap_or_else(|| decode_claude_project_dir(&parent_name));
-            Ok((file_stem, workspace))
-        }
-        Source::Codex => {
-            // The session_meta line carries the session id and cwd.
-            let meta = lines.iter().find_map(|l| {
-                let v: Value = serde_json::from_str(l).ok()?;
-                (v.get("type").and_then(Value::as_str) == Some("session_meta"))
-                    .then(|| v.get("payload").cloned().unwrap_or(Value::Null))
-            });
-            let session = meta
-                .as_ref()
-                .and_then(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_else(|| file_stem.clone());
-            let workspace = meta
-                .as_ref()
-                .and_then(|m| m.get("cwd").and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_else(|| "unknown".to_string());
-            Ok((session, workspace))
-        }
-    }
-}
-
-fn first_field(lines: &[&str], pick: impl Fn(&Value) -> Option<&str>) -> Option<String> {
-    lines.iter().find_map(|l| {
-        let v: Value = serde_json::from_str(l).ok()?;
-        pick(&v).map(str::to_string)
-    })
-}
-
-/// Best-effort decode of a Claude Code project directory name
-/// (`-Users-me-work-repo`) back to a path when no `cwd` was found in the log.
-fn decode_claude_project_dir(name: &str) -> String {
-    if name.starts_with('-') {
-        name.replacen('-', "/", 1).replace('-', "/")
-    } else {
-        name.to_string()
-    }
-}
-
-fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_jsonl(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            out.push(path);
-        }
-    }
-    Ok(())
+async fn flush(
+    api: &Api,
+    path: &str,
+    agent_id: &str,
+    batch: &mut Vec<Value>,
+    file: &Path,
+    last_idx: usize,
+) -> Result<usize> {
+    let n = batch.len();
+    let body = json!({ "agent_id": agent_id, "events": std::mem::take(batch) });
+    api.post(path, body)
+        .await
+        .with_context(|| format!("append batch ending at line {last_idx} of {}", file.display()))?;
+    Ok(n)
 }
 
 async fn ensure_workspace(api: &Api, external_key: &str) -> Result<String> {
     let list = api.get("/api/tenants").await?;
-    if let Some(found) = list["tenants"].as_array().and_then(|a| {
-        a.iter()
-            .find(|t| t["external_key"] == json!(external_key))
-    }) {
+    if let Some(found) = list["tenants"]
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["external_key"] == json!(external_key)))
+    {
         return id_field(found, "tenant_id");
     }
     let created = api
@@ -301,121 +250,4 @@ fn id_field(value: &Value, field: &str) -> Result<String> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| anyhow!("response missing {field}: {value}"))
-}
-
-// ----- local import state (offsets + resolved ids per file) -----
-
-struct State {
-    path: PathBuf,
-    root: Value,
-}
-
-struct Entry {
-    tenant_id: String,
-    agent_id: String,
-    session_id: String,
-}
-
-impl State {
-    fn state_path() -> PathBuf {
-        home()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".agentdb/agentdbctl-import-state.json")
-    }
-
-    fn load() -> Result<Self> {
-        let path = Self::state_path();
-        let root = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| json!({ "files": {} })),
-            Err(_) => json!({ "files": {} }),
-        };
-        Ok(Self { path, root })
-    }
-
-    fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.path, serde_json::to_vec_pretty(&self.root)?)?;
-        Ok(())
-    }
-
-    fn next_line(&self, key: &str) -> usize {
-        self.root["files"][key]["next_line"]
-            .as_u64()
-            .unwrap_or(0) as usize
-    }
-
-    fn set_next_line(&mut self, key: &str, line: usize) {
-        self.root["files"][key]["next_line"] = json!(line);
-    }
-
-    fn entry(&self, key: &str) -> Option<Entry> {
-        let f = &self.root["files"][key];
-        Some(Entry {
-            tenant_id: f["tenant_id"].as_str()?.to_string(),
-            agent_id: f["agent_id"].as_str()?.to_string(),
-            session_id: f["session_id"].as_str()?.to_string(),
-        })
-    }
-
-    fn set_entry(&mut self, key: &str, tenant_id: &str, agent_id: &str, session_id: &str) -> Entry {
-        let existing_next = self.next_line(key);
-        self.root["files"][key] = json!({
-            "tenant_id": tenant_id,
-            "agent_id": agent_id,
-            "session_id": session_id,
-            "next_line": existing_next,
-        });
-        Entry {
-            tenant_id: tenant_id.to_string(),
-            agent_id: agent_id.to_string(),
-            session_id: session_id.to_string(),
-        }
-    }
-}
-
-impl Summary {
-    fn to_value(&self, dir: &Path) -> Value {
-        json!({
-            "directory": dir.display().to_string(),
-            "files_seen": self.files_seen,
-            "sessions_touched": self.sessions_touched,
-            "events_appended": self.events_appended,
-            "errors": self.errors,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decode_claude_project_dir_recovers_a_path() {
-        assert_eq!(
-            decode_claude_project_dir("-Users-lishen-work-agentdb"),
-            "/Users/lishen/work/agentdb"
-        );
-        assert_eq!(decode_claude_project_dir("plain"), "plain");
-    }
-
-    #[test]
-    fn derive_identity_claude_uses_stem_and_cwd() {
-        let lines = [r#"{"type":"user","cwd":"/repo/x","sessionId":"abc"}"#];
-        let (session, workspace) =
-            derive_identity(Source::ClaudeCode, Path::new("/a/b/abc.jsonl"), &lines).unwrap();
-        assert_eq!(session, "abc");
-        assert_eq!(workspace, "/repo/x");
-    }
-
-    #[test]
-    fn derive_identity_codex_uses_session_meta() {
-        let lines =
-            [r#"{"type":"session_meta","payload":{"id":"sid-1","cwd":"/repo/y"}}"#, r#"{"type":"event_msg","payload":{}}"#];
-        let (session, workspace) =
-            derive_identity(Source::Codex, Path::new("/a/rollout-x.jsonl"), &lines).unwrap();
-        assert_eq!(session, "sid-1");
-        assert_eq!(workspace, "/repo/y");
-    }
 }

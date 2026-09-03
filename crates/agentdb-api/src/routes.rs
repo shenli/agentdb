@@ -44,7 +44,8 @@ use agentdb_meta::{
 };
 
 use crate::dto::{
-    AppendAndFetchBody, AppendBody, ChangesQuery, ChangesResponse,
+    AppendAndFetchBody, AppendBatchBody, AppendBatchResponse, AppendBody, ChangesQuery,
+    ChangesResponse,
     ContextBody, CreateAgentBody, CreateRecordBody,
     CreateSessionBody, CreateTenantBody, EventSearchQuery, EventSearchResponse, ExportBackfillBody,
     ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
@@ -130,6 +131,7 @@ pub fn route_catalog() -> &'static [(Stability, &'static str)] {
         (Labs, "/api/tenants/:tenant_id/policy/lifecycle-sweep"),
         (Labs, "/api/tenants/:tenant_id/policy/gc-sweep"),
         // --- Internal / operator machinery (no SDK or quickstart obligation) ---
+        (Internal, "/api/tenants/:tenant_id/sessions/:session_id/events/batch"),
         (Internal, "/metrics"),
         (Internal, "/api/tenants"),
         (Internal, "/api/tenants/:tenant_id/agents"),
@@ -215,6 +217,10 @@ pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id/events",
             post(append_event).get(fetch_events),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/events/batch",
+            post(append_events_batch),
         )
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id/append-and-fetch",
@@ -6613,6 +6619,91 @@ async fn append_event(
     };
     Ok(with_headers(
         json_with_backpressure(&s, StatusCode::OK, Json(resp), backpressure),
+        route_headers,
+    ))
+}
+
+/// `POST /api/tenants/:tenant_id/sessions/:session_id/events/batch`
+///
+/// Bulk append: many ordered events to one session committed in a single write
+/// batch. The ingest path for session-log importers — one round-trip and one
+/// write batch instead of one per event. Simple shape only (no refs, no
+/// per-event idempotency key); order is preserved and seqs are contiguous.
+async fn append_events_batch(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    Json(body): Json<AppendBatchBody>,
+) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let aid = parse_id_or(&body.agent_id, IdKind::Agent, ErrorCode::AgentNotFound)?;
+
+    const MAX_BATCH: usize = 1024;
+    if body.events.len() > MAX_BATCH {
+        return Err(ApiError(agentdb_core::Error::new(
+            ErrorCode::PolicyDenied,
+            format!(
+                "append batch of {} events exceeds the {MAX_BATCH}-event limit; split it",
+                body.events.len()
+            ),
+        )));
+    }
+
+    let route_headers = match guard_session_request_lazy_body(
+        &s,
+        &tid,
+        &sid,
+        &original_uri,
+        &headers,
+        Method::POST,
+        Some(|| serde_json::to_vec(&body).expect("append batch body must serialize")),
+    )
+    .await
+    {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
+
+    let reqs: Vec<AppendRequest> = body
+        .events
+        .into_iter()
+        .map(|event| AppendRequest {
+            tenant_id: tid.clone(),
+            agent_id: aid.clone(),
+            session_id: sid.clone(),
+            kind: event.kind,
+            payload: event.payload,
+            artifact_refs: Vec::new(),
+            source_refs: Vec::new(),
+            credential_refs: Vec::new(),
+            idempotency_key: None,
+        })
+        .collect();
+
+    let runtime = s.runtime.clone();
+    let rt = runtime.clone();
+    let result =
+        with_route_tablet_context(runtime, &route_headers, async move { rt.append_batch(reqs).await })
+            .await;
+    let appended = match result {
+        Ok(value) => value,
+        Err(error) if error.code == ErrorCode::RaftNotLeader => {
+            return Ok(raft_not_leader_response(&s, &route_headers, error).await);
+        }
+        Err(error) => return Err(ApiError(error)),
+    };
+    let response = AppendBatchResponse {
+        count: appended.len(),
+        appended,
+    };
+    Ok(with_headers(
+        (StatusCode::OK, Json(response)).into_response(),
         route_headers,
     ))
 }

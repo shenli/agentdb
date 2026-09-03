@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use agentdb_core::record::{IndexingPolicy, RecordStatus};
-use agentdb_core::runtime::{EventSearchMatch, MetadataFilter, RecordSearchMatch};
+use agentdb_core::runtime::{AppendResponse, EventSearchMatch, MetadataFilter, RecordSearchMatch};
 use agentdb_core::{ArtifactRef, CredentialRef, SourceRef};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -104,6 +104,27 @@ pub struct AppendBody {
     /// when `fetch_recent` is set.
     #[serde(default)]
     pub fetch_max_bytes: Option<usize>,
+}
+
+/// Bulk append: many ordered events to one session in a single write batch.
+/// The importer/bulk-ingest path — one round-trip instead of one per event.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AppendBatchBody {
+    pub agent_id: String,
+    pub events: Vec<AppendBatchEvent>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AppendBatchEvent {
+    pub kind: String,
+    #[serde(default = "default_policy")]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AppendBatchResponse {
+    pub count: usize,
+    pub appended: Vec<AppendResponse>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

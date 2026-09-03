@@ -13,6 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use axum::routing::get;
 use clap::Parser;
 use object_store::aws::AmazonS3Builder;
@@ -75,6 +76,8 @@ type ContentBackendBundle = (
     Option<Arc<agentdb_storage::AsyncMirrorContentBackend>>,
 );
 
+mod import;
+
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
 struct Cli {
@@ -99,6 +102,37 @@ enum Cmd {
     /// manifest in the configured object store.
     #[command(name = "restore-from-bucket")]
     RestoreFromBucket(RestoreFromBucketOpts),
+    /// Bulk-import coding-agent session logs directly into the local store
+    /// (offline, in-process — no HTTP). The server must be stopped: the store
+    /// is single-writer. Use `agentdbctl import` for a running/remote server.
+    Import(ImportOpts),
+}
+
+#[derive(Parser, Debug)]
+struct ImportOpts {
+    #[command(subcommand)]
+    source: ImportSourceCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ImportSourceCmd {
+    /// Import Claude Code sessions from `~/.claude/projects`.
+    ClaudeCode(ImportRunOpts),
+    /// Import Codex sessions from `~/.codex/sessions`.
+    Codex(ImportRunOpts),
+}
+
+#[derive(Parser, Debug)]
+struct ImportRunOpts {
+    /// Runtime data directory that holds the RocksDB store. Defaults to the
+    /// machine-scoped home (`$AGENTDB_HOME`, `$XDG_DATA_HOME/agentdb`, or
+    /// `~/.agentdb`).
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Session-log source directory. Defaults to the source's standard
+    /// location.
+    #[arg(long)]
+    dir: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -335,7 +369,53 @@ async fn main() -> anyhow::Result<()> {
         Cmd::InitConfig(opts) => init_config(opts),
         Cmd::Service(opts) => service(opts),
         Cmd::RestoreFromBucket(opts) => restore_from_bucket(opts).await,
+        Cmd::Import(opts) => import_cmd(opts).await,
     }
+}
+
+async fn import_cmd(opts: ImportOpts) -> anyhow::Result<()> {
+    let (source, run) = match opts.source {
+        ImportSourceCmd::ClaudeCode(run) => (agentdb_import::Source::ClaudeCode, run),
+        ImportSourceCmd::Codex(run) => (agentdb_import::Source::Codex, run),
+    };
+    let data_dir = run.data_dir.unwrap_or_else(default_data_dir);
+    let runtime = open_import_runtime(&data_dir)?;
+    import::run(runtime, source, run.dir).await
+}
+
+/// Open the persistent single-node store in-process for the offline importer.
+/// RocksDB is single-writer, so this fails fast if the server holds the lock.
+fn open_import_runtime(data_dir: &std::path::Path) -> anyhow::Result<Arc<agentdb_core::Runtime>> {
+    let kv_path = data_dir.join("runtime");
+    // Create the store if it does not exist (a fresh import target); if the
+    // server is running against it, RocksDB's single-writer lock makes the open
+    // below fail with the message below rather than corrupt anything.
+    std::fs::create_dir_all(&kv_path)?;
+    let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> = Arc::new(
+        agentdb_storage::RocksKvStore::open(&kv_path).with_context(|| {
+            format!(
+                "open runtime store at {} (is the server running? the store is single-writer — \
+                 stop it first, or use `agentdbctl import` against the running server)",
+                kv_path.display()
+            )
+        })?,
+    );
+    let content_dir = data_dir.join("content");
+    std::fs::create_dir_all(&content_dir)?;
+    let content: Arc<dyn agentdb_storage::ContentBackend> =
+        Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir));
+
+    let runtime = match build_encryption_keyring(&kv)? {
+        Some((keyring, admin)) => {
+            let rt = agentdb_core::Runtime::with_kv_content_and_keyring(kv, content, keyring);
+            rt.set_key_rotator(admin.clone());
+            rt.set_key_revoker(admin.clone());
+            rt.set_key_retirer(admin);
+            rt
+        }
+        None => agentdb_core::Runtime::with_kv(kv, content),
+    };
+    Ok(runtime)
 }
 
 async fn serve(opts: ServeOpts) -> anyhow::Result<()> {

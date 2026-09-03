@@ -1111,23 +1111,6 @@ impl Api {
         self.request(Method::DELETE, path, None, &[]).await
     }
 
-    /// POST with an `Idempotency-Key` header, so a re-sent request is deduplicated
-    /// server-side.
-    pub(crate) async fn post_idempotent(
-        &self,
-        path: &str,
-        body: Value,
-        idempotency_key: &str,
-    ) -> Result<Value> {
-        self.request(
-            Method::POST,
-            path,
-            Some(body),
-            &[("Idempotency-Key", idempotency_key)],
-        )
-        .await
-    }
-
     async fn request(
         &self,
         method: Method,
