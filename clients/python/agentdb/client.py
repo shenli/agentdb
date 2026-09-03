@@ -938,26 +938,20 @@ class Session:
         credential_refs: Optional[list] = None,
         idempotency_key: Optional[str] = None,
     ) -> AppendResult:
+        body = self._append_body(
+            kind, payload, agent_id, artifact_refs, source_refs, credential_refs
+        )
         if fetch_last_n > 0:
-            return self.append_and_fetch(
-                payload,
-                kind=kind,
-                agent_id=agent_id,
-                last=fetch_last_n,
-                artifact_refs=artifact_refs,
-                source_refs=source_refs,
-                credential_refs=credential_refs,
-                idempotency_key=idempotency_key,
-            )
+            # `fetch_recent` returns the tail in the same call; the dedicated
+            # append-and-fetch route is deprecated.
+            body["fetch_recent"] = fetch_last_n
         data = self._client._request(
             "POST",
             self._events_path(),
-            json=self._append_body(
-                kind, payload, agent_id, artifact_refs, source_refs, credential_refs
-            ),
+            json=body,
             headers=_idem_header(idempotency_key),
         )
-        return AppendResult(event_id=data["event_id"], seq=data["seq"], recent=[])
+        return AppendResult.from_dict(data)
 
     def append_and_fetch(
         self,
@@ -972,6 +966,11 @@ class Session:
         credential_refs: Optional[list] = None,
         idempotency_key: Optional[str] = None,
     ) -> AppendResult:
+        """Deprecated: prefer ``append(..., fetch_last_n=N)``, which returns the
+        tail from the regular events endpoint. This still calls the dedicated
+        append-and-fetch route (kept for one release) so callers that need an
+        explicit ``max_bytes`` cap keep working."""
+
         body = self._append_body(
             kind, payload, agent_id, artifact_refs, source_refs, credential_refs
         )

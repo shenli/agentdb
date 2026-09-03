@@ -150,7 +150,13 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
     assert any(url.endswith("/api/tenants") for url in urls)
     assert any("/api/tenants/ten_1/agents" in url for url in urls)
     assert any("/api/tenants/ten_1/agents/agt_1/sessions" in url for url in urls)
-    assert any("/api/tenants/ten_1/sessions/ses_1/append-and-fetch" in url for url in urls)
+    # A tail request now rides the events endpoint via `fetch_recent`, not the
+    # deprecated append-and-fetch route.
+    assert any(
+        url.endswith("/sessions/ses_1/events")
+        and kwargs.get("json", {}).get("fetch_recent") == 5
+        for _, url, kwargs in calls
+    )
     assert any("/api/tenants/ten_1/artifacts" in url for url in urls)
     assert any("/api/tenants/ten_1/artifacts/verify-lifecycle" in url for url in urls)
     assert any("/api/tenants/ten_1/records" in url for url in urls)

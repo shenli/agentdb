@@ -239,7 +239,7 @@ Events, replay, fork, and context:
 ```text
 POST /api/tenants/{tenant_id}/sessions/{session_id}/events
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/events
-POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
+POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch  # deprecated
 POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
 POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix
@@ -588,7 +588,7 @@ AgentHandle
 
 SessionHandle / Session
   append(payload, kind="message", idempotency_key=None, fetch_last_n=0, ...)
-  append_and_fetch(payload, fetch_last_n=10, ...)
+  append_and_fetch(payload, fetch_last_n=10, ...)   # deprecated; use append(fetch_last_n=)
   append_user(text, ...)
   model_message(text, ...)
   tool_call(...)
@@ -602,6 +602,13 @@ SessionHandle / Session
   fork(child_session_id=None, at_seq=0, alias=None)
   context(max_events=None, max_bytes=None, include=None, record_query=None)
 ```
+
+The append endpoint (`POST .../events`) takes an optional `fetch_recent = N`
+body field: it appends the event and returns the last N events in the same
+response, folding in `append-and-fetch`. The separate `POST .../append-and-fetch`
+route is **deprecated** (kept for one release) — prefer `append` with
+`fetch_recent`; the SDK's `append(..., fetch_last_n=N)` already uses it. Use
+`append-and-fetch` only when you need an explicit `max_bytes` cap on the tail.
 
 `append` and `append_and_fetch` accept `artifact_refs`, `source_refs`, and
 `credential_refs`. Credential refs carry opaque `cred_ref` values resolved by a
@@ -697,7 +704,7 @@ AgentHandle
 
 SessionHandle / Session
   append(payload, opts?)
-  appendAndFetch(payload, opts?)
+  appendAndFetch(payload, opts?)   // deprecated; use append({ fetchLastN })
   appendUser(text, opts?)
   modelMessage(text, opts?)
   toolCall(...)
