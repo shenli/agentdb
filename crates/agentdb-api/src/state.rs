@@ -295,6 +295,11 @@ pub struct AppState {
     /// distributed control-plane routes (`build_router`) so single-node
     /// deployments never expose them. Defaults to false (single node).
     pub cluster_mode: bool,
+    /// True when the `labs` switch is enabled. Gates mounting of the Labs
+    /// routes (records and search, context assembly, caller-driven session
+    /// lifecycle / replay-prefix, artifact verify-lifecycle, and policy sweeps)
+    /// so the default surface stays narrow. Defaults to false.
+    pub labs: bool,
     pub routing: RouteRuntime,
     pub raft_ingress: Option<Arc<dyn RaftRsIngress>>,
     pub raft_registry: Option<Arc<RaftRsGroupRegistry>>,
@@ -335,6 +340,7 @@ impl AppState {
             meta: None,
             auth_meta: None,
             cluster_mode: false,
+            labs: false,
             routing: RouteRuntime::disabled(),
             raft_ingress: None,
             raft_registry: None,
@@ -364,6 +370,14 @@ impl AppState {
     /// false so those routes are never registered.
     pub fn with_cluster_mode(mut self, cluster_mode: bool) -> Self {
         self.cluster_mode = cluster_mode;
+        self
+    }
+
+    /// Enable the Labs route surface (records/search, context, caller-driven
+    /// lifecycle/replay-prefix, verify-lifecycle, policy sweeps). Off by
+    /// default so the supported surface stays narrow.
+    pub fn with_labs(mut self, labs: bool) -> Self {
+        self.labs = labs;
         self
     }
 

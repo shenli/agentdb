@@ -438,17 +438,25 @@ Artifact policy defaults to 16 MiB per object and may be raised to an absolute
 headroom for the runtime to return the structured `ARTIFACT_TOO_LARGE` error at
 that boundary; policies above 128 MiB are clamped.
 
-Records:
+### Labs routes
+
+Records and search, server-side context assembly, caller-driven session
+lifecycle (`/lifecycle`, `/storage`, `/restore`, `/replay-prefix`), artifact
+`verify-lifecycle`, and the tenant policy sweeps are **Labs** routes: they mount
+only when the server runs with the `labs` switch (`serve --labs`, or `labs = true`
+under `[server]`). Off by default they return 404, so the supported surface stays
+narrow — the underlying runtime objects still exist, only the HTTP surface is
+gated. The routes below (records) are Labs; `meta` is core.
 
 ```text
-POST   /api/tenants/{tenant_id}/records
-POST   /api/tenants/{tenant_id}/records/upsert
-GET    /api/tenants/{tenant_id}/records/{record_id}
-PATCH  /api/tenants/{tenant_id}/records/{record_id}
-POST   /api/tenants/{tenant_id}/records/{record_id}/touch
-DELETE /api/tenants/{tenant_id}/records/{record_id}
-GET    /api/tenants/{tenant_id}/records/search
-POST   /api/tenants/{tenant_id}/records/search
+POST   /api/tenants/{tenant_id}/records            # labs
+POST   /api/tenants/{tenant_id}/records/upsert     # labs
+GET    /api/tenants/{tenant_id}/records/{record_id}     # labs
+PATCH  /api/tenants/{tenant_id}/records/{record_id}     # labs
+POST   /api/tenants/{tenant_id}/records/{record_id}/touch  # labs
+DELETE /api/tenants/{tenant_id}/records/{record_id}     # labs
+GET    /api/tenants/{tenant_id}/records/search     # labs
+POST   /api/tenants/{tenant_id}/records/search     # labs
 GET    /api/tenants/{tenant_id}/meta/{key}
 PUT    /api/tenants/{tenant_id}/meta/{key}
 ```

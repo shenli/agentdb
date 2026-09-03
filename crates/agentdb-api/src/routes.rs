@@ -80,7 +80,7 @@ const DEFAULT_ADMIN_TABLET_LEASE_MS: i64 = 30_000;
 const ARTIFACT_BODY_LIMIT_BYTES: usize =
     agentdb_core::policy::ABSOLUTE_MAX_ARTIFACT_BYTES as usize + 1024 * 1024;
 
-pub fn routes(cluster_mode: bool) -> Router<AppState> {
+pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
     let mut router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -145,18 +145,6 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
             get(get_session).delete(delete_session),
         )
         .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/lifecycle",
-            post(transition_session_lifecycle),
-        )
-        .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/storage",
-            get(get_session_storage),
-        )
-        .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/restore",
-            post(restore_session_storage),
-        )
-        .route(
             "/api/tenants/:tenant_id/storage-summary",
             get(get_tenant_storage_summary),
         )
@@ -176,14 +164,6 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id/replay",
             get(replay_session),
-        )
-        .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/replay-prefix",
-            post(materialize_replay_prefix),
-        )
-        .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/context",
-            post(build_context),
         )
         .route("/api/tenants/:tenant_id/watch", get(watch))
         .route("/api/tenants/:tenant_id/exports/watch", get(export_watch))
@@ -221,10 +201,6 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT_BYTES)),
         )
         .route(
-            "/api/tenants/:tenant_id/artifacts/verify-lifecycle",
-            get(verify_artifact_lifecycle),
-        )
-        .route(
             "/api/tenants/:tenant_id/artifacts/:artifact_id",
             get(get_artifact),
         )
@@ -232,12 +208,57 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
             "/api/tenants/:tenant_id/artifacts/:artifact_id/blob",
             get(get_artifact_blob),
         )
-        // V2.2 records: register `/records/search` BEFORE
-        // `/records/:record_id` so the literal `search` segment beats the
-        // dynamic `:record_id` matcher. axum 0.7's matchit-based router
-        // does prefer static over dynamic segments at the same depth, but
-        // we encode the order here so a future router refactor can't
-        // silently swap precedence.
+        .route(
+            "/api/tenants/:tenant_id/meta/:key",
+            get(get_tenant_meta).put(set_tenant_meta),
+        )
+        .route("/api/policy/worker/run", post(run_policy_worker));
+
+    if cluster_mode {
+        router = router.merge(cluster_routes());
+    }
+    if labs {
+        router = router.merge(labs_routes());
+    }
+    router
+}
+
+/// Labs routes (records and search, server-side context assembly, caller-driven
+/// session lifecycle / storage / restore / replay-prefix, artifact
+/// verify-lifecycle, and tenant policy sweeps).
+///
+/// Mounted only when the `labs` switch is enabled. The default supported
+/// surface stays narrow; these return 404 when Labs is off. The underlying
+/// runtime objects (records, lifecycle machinery) still exist — only the HTTP
+/// surface is gated.
+fn labs_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/lifecycle",
+            post(transition_session_lifecycle),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/storage",
+            get(get_session_storage),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/restore",
+            post(restore_session_storage),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/replay-prefix",
+            post(materialize_replay_prefix),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/context",
+            post(build_context),
+        )
+        .route(
+            "/api/tenants/:tenant_id/artifacts/verify-lifecycle",
+            get(verify_artifact_lifecycle),
+        )
+        // Register `/records/search` BEFORE `/records/:record_id` so the
+        // literal `search` segment beats the dynamic `:record_id` matcher.
         .route(
             "/api/tenants/:tenant_id/records/search",
             get(search_records).post(search_records_json),
@@ -256,10 +277,6 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
             post(touch_record),
         )
         .route(
-            "/api/tenants/:tenant_id/meta/:key",
-            get(get_tenant_meta).put(set_tenant_meta),
-        )
-        .route(
             "/api/tenants/:tenant_id/policy/lifecycle-sweep",
             post(run_lifecycle_sweep),
         )
@@ -267,12 +284,6 @@ pub fn routes(cluster_mode: bool) -> Router<AppState> {
             "/api/tenants/:tenant_id/policy/gc-sweep",
             post(run_gc_sweep),
         )
-        .route("/api/policy/worker/run", post(run_policy_worker));
-
-    if cluster_mode {
-        router = router.merge(cluster_routes());
-    }
-    router
 }
 
 /// Cluster / distributed control-plane routes (node, cell, store, tablet,

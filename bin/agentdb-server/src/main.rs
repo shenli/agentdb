@@ -160,6 +160,12 @@ struct ServeOpts {
     #[arg(long)]
     dev: bool,
 
+    /// Mount the Labs HTTP routes (records and search, context assembly,
+    /// caller-driven lifecycle/replay-prefix, verify-lifecycle, policy sweeps).
+    /// Off by default so the supported surface stays narrow.
+    #[arg(long)]
+    labs: bool,
+
     /// Enable metadata-backed routing for this node id. When unset, the server
     /// keeps the single-node routing-disabled behavior.
     #[arg(long)]
@@ -289,6 +295,10 @@ struct DoctorOpts {
     /// Alias for `--in-memory`.
     #[arg(long)]
     dev: bool,
+
+    /// Mount the Labs HTTP routes. Off by default.
+    #[arg(long)]
+    labs: bool,
 
     /// Also check local developer tools used by SDKs, examples, local CI, and cluster smoke.
     #[arg(long)]
@@ -679,6 +689,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
 
     let mut state = agentdb_api::AppState::new(runtime.clone())
         .with_cluster_mode(matches!(config.deployment_mode, DeploymentMode::Cluster))
+        .with_labs(config.labs)
         .with_auth_meta(auth_meta)
         .with_proxy_policy(agentdb_api::state::ProxyPolicy {
             timeout_ms: config.route_proxy_timeout_ms,
@@ -1063,6 +1074,9 @@ fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
         content_dir: None,
         in_memory: !opts.persistent,
         dev: !opts.persistent,
+        // Labs stays off by default; use `serve --labs` to mount the Labs
+        // surface.
+        labs: false,
         route_node_id: None,
         route_shard_count: None,
         route_region: None,
@@ -1107,6 +1121,8 @@ struct ResolvedServeConfig {
     content_backend: ContentBackendKind,
     object_store: Option<ResolvedObjectStoreConfig>,
     in_memory: bool,
+    /// When true, the Labs HTTP routes are mounted. Off by default.
+    labs: bool,
     route_node_id: Option<String>,
     /// Cluster identity for the store-identity fail-closed check. `None`
     /// mints one into the identity file on first boot; when set (via
@@ -1373,6 +1389,7 @@ impl ResolvedServeConfig {
             data_dir.join("object-store"),
         )?;
         let in_memory = opts.in_memory || opts.dev || file.server.dev.unwrap_or(false);
+        let labs = opts.labs || file.server.labs.unwrap_or(false);
         let route_node_id = opts.route_node_id.or(file.routing.node_id);
         validate_storage_backend_config(
             deployment_mode,
@@ -1431,6 +1448,7 @@ impl ResolvedServeConfig {
             content_backend,
             object_store,
             in_memory,
+            labs,
             route_node_id,
             cluster_id: std::env::var("AGENTDB_CLUSTER_ID").ok(),
             route_shard_count: opts
@@ -1532,6 +1550,7 @@ impl ResolvedServeConfig {
             data_dir.join("object-store"),
         )?;
         let in_memory = opts.in_memory || opts.dev || file.server.dev.unwrap_or(false);
+        let labs = opts.labs || file.server.labs.unwrap_or(false);
         let route_node_id = file.routing.node_id;
         validate_storage_backend_config(
             deployment_mode,
@@ -1590,6 +1609,7 @@ impl ResolvedServeConfig {
             content_backend,
             object_store,
             in_memory,
+            labs,
             route_node_id,
             cluster_id: std::env::var("AGENTDB_CLUSTER_ID").ok(),
             route_shard_count: file
@@ -1654,6 +1674,7 @@ struct DeploymentFileConfig {
 struct ServerFileConfig {
     bind: Option<SocketAddr>,
     dev: Option<bool>,
+    labs: Option<bool>,
     internal_auth_token: Option<String>,
     internal_auth_previous_token: Option<String>,
     api_auth_token: Option<String>,
@@ -2530,6 +2551,9 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
     }
     println!("  health:    http://{}/health/ready", config.bind);
     println!("  dashboard: http://{}/dashboard/", config.bind);
+    if config.labs {
+        println!("  labs: enabled (records, search, context, lifecycle routes mounted)");
+    }
     if !config.in_memory {
         println!(
             "  disk budget: {:.0} GiB (advisory; see http://{}/api/storage/disk)",
@@ -6857,6 +6881,7 @@ mod tests {
             content_dir: None,
             in_memory: false,
             dev: false,
+            labs: false,
             route_node_id: None,
             route_shard_count: None,
             route_region: None,

@@ -21,17 +21,19 @@ pub struct TestApp {
 #[allow(dead_code)]
 pub async fn spawn_app() -> TestApp {
     let runtime = Runtime::in_memory();
-    // Plain single-node harness: cluster/distributed routes are not mounted.
-    spawn_raw(AppState::new(runtime)).await
+    // Plain single-node harness: cluster/distributed routes are not mounted, but
+    // Labs routes are enabled so the many existing record/lifecycle/context
+    // tests keep working. Deployment-mode/Labs gating is tested via `spawn_raw`.
+    spawn_raw(AppState::new(runtime).with_labs(true)).await
 }
 
 /// Advanced harness for tests that inject custom state. These exercise the
 /// cluster / distributed / admin surfaces, so the app runs in cluster mode and
-/// mounts the full route set. Use `spawn_raw` directly to test single-node
-/// route gating with a custom state.
+/// mounts the full route set (Labs included). Use `spawn_raw` directly to test
+/// single-node / Labs-off gating with a custom state.
 #[allow(dead_code)]
 pub async fn spawn_app_with_state(state: AppState) -> TestApp {
-    spawn_raw(state.with_cluster_mode(true)).await
+    spawn_raw(state.with_cluster_mode(true).with_labs(true)).await
 }
 
 #[allow(dead_code)]
