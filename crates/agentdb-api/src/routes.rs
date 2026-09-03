@@ -6454,22 +6454,46 @@ async fn append_event(
     let idem_key = idempotency_key(&headers);
 
     let runtime = s.runtime.clone();
-    let append_tid = tid.clone();
-    let append_sid = sid.clone();
-    let append_result = with_route_tablet_context(runtime.clone(), &route_headers, async move {
-        runtime
-            .append_with_backpressure(AppendRequest {
-                tenant_id: append_tid,
-                agent_id: aid,
-                session_id: append_sid,
-                kind: body.kind,
-                payload: body.payload,
-                artifact_refs: body.artifact_refs,
-                source_refs: body.source_refs,
-                credential_refs: body.credential_refs,
-                idempotency_key: idem_key,
-            })
-            .await
+    let req = AppendRequest {
+        tenant_id: tid.clone(),
+        agent_id: aid,
+        session_id: sid.clone(),
+        kind: body.kind,
+        payload: body.payload,
+        artifact_refs: body.artifact_refs,
+        source_refs: body.source_refs,
+        credential_refs: body.credential_refs,
+        idempotency_key: idem_key,
+    };
+
+    // `fetch_recent = N` returns the recent event tail in the same response,
+    // folding in what `append-and-fetch` does. Absent → a plain append.
+    if let Some(last) = body.fetch_recent {
+        let max_bytes = body
+            .fetch_max_bytes
+            .unwrap_or_else(crate::dto::default_max_bytes);
+        let rt = runtime.clone();
+        let append_result = with_route_tablet_context(runtime, &route_headers, async move {
+            rt.append_and_fetch_with_backpressure(req, last, max_bytes)
+                .await
+        })
+        .await;
+        let (resp, backpressure) = match append_result {
+            Ok(value) => value,
+            Err(error) if error.code == ErrorCode::RaftNotLeader => {
+                return Ok(raft_not_leader_response(&s, &route_headers, error).await);
+            }
+            Err(error) => return Err(ApiError(error)),
+        };
+        return Ok(with_headers(
+            json_with_backpressure(&s, StatusCode::OK, Json(resp), backpressure),
+            route_headers,
+        ));
+    }
+
+    let rt = runtime.clone();
+    let append_result = with_route_tablet_context(runtime, &route_headers, async move {
+        rt.append_with_backpressure(req).await
     })
     .await;
     let (resp, backpressure) = match append_result {
@@ -6485,6 +6509,9 @@ async fn append_event(
     ))
 }
 
+/// **Deprecated** in favor of `POST .../events` with a `fetch_recent` field,
+/// which returns the recent tail in the same call. Kept for one release for
+/// existing clients; new code should use `append` with `fetch_recent`.
 async fn append_and_fetch(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,

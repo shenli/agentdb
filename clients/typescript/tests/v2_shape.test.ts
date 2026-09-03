@@ -76,7 +76,11 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
     if (raw.endsWith("/sessions")) return json({ session_id: "ses_1", agent_id: "agt_1" });
     if (raw.endsWith("/append-and-fetch")) return json({ event_id: "evt_fetch", seq: 1, recent: [] });
     if (raw.endsWith("/events") && init?.method === "GET") return json([]);
-    if (raw.endsWith("/events")) return json({ event_id: "evt_1", seq: 0 });
+    if (raw.endsWith("/events")) {
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+      if (body.fetch_recent) return json({ event_id: "evt_fetch", seq: 1, recent: [] });
+      return json({ event_id: "evt_1", seq: 0 });
+    }
     if (raw.includes("/replay")) {
       return json({
         events: [

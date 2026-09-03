@@ -95,6 +95,15 @@ pub struct AppendBody {
     pub source_refs: Vec<SourceRef>,
     #[serde(default)]
     pub credential_refs: Vec<CredentialRef>,
+    /// When set, the append returns the recent event tail (the last N events)
+    /// in the same response, folding in `append-and-fetch`. Absent → a plain
+    /// append with no tail.
+    #[serde(default)]
+    pub fetch_recent: Option<usize>,
+    /// Optional byte cap on the returned tail; defaults to `default_max_bytes`
+    /// when `fetch_recent` is set.
+    #[serde(default)]
+    pub fetch_max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -353,7 +362,7 @@ fn default_last() -> usize {
     20
 }
 
-fn default_max_bytes() -> usize {
+pub(crate) fn default_max_bytes() -> usize {
     1_000_000
 }
 

@@ -727,13 +727,21 @@ export class Session {
   }
 
   async append(payload: unknown, opts: AppendOptions = {}): Promise<AppendResult> {
+    const body: Record<string, unknown> = { ...this.appendBody(payload, opts) };
     if (opts.fetchLastN && opts.fetchLastN > 0) {
-      return await this.appendAndFetch(payload, { ...opts, last: opts.fetchLastN });
+      // fetch_recent returns the tail in the same call; the dedicated
+      // append-and-fetch route is deprecated.
+      body.fetch_recent = opts.fetchLastN;
     }
-    const d = await this._client._request("POST", this.eventsPath(), this.appendBody(payload, opts), idem(opts.idempotencyKey));
-    return appendResultFromDict({ ...d, recent: [] });
+    const d = await this._client._request("POST", this.eventsPath(), body, idem(opts.idempotencyKey));
+    return appendResultFromDict({ recent: [], ...d });
   }
 
+  /**
+   * @deprecated Prefer `append(payload, { fetchLastN })`, which returns the
+   * tail from the regular events endpoint. Kept for one release for callers
+   * that need an explicit `maxBytes` cap.
+   */
   async appendAndFetch(payload: unknown, opts: AppendAndFetchOptions = {}): Promise<AppendResult> {
     const body = { ...this.appendBody(payload, opts), last: opts.last ?? 20, max_bytes: opts.maxBytes ?? 1_000_000 };
     const d = await this._client._request(
