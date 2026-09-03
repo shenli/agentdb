@@ -353,8 +353,22 @@ async function loadSessionStorage() {
     renderOverview();
     renderStorageDetail();
   } catch (err) {
+    // Tiered storage / lifecycle is a Labs feature: when Labs is disabled the
+    // route 404s. Degrade quietly (leave the storage panel blank) instead of
+    // erroring the whole session view — the event timeline still loads.
+    if (isNotFound(err)) {
+      state.sessionStorage = null;
+      renderStorageDetail();
+      return;
+    }
     fail(err);
   }
+}
+
+// True when a request failed with HTTP 404 — e.g. a Labs-only route that is not
+// mounted. `request()` throws `Error("404 …")`, so the status leads the message.
+function isNotFound(err) {
+  return /^404\b/.test(String(err && err.message ? err.message : err));
 }
 
 async function transitionLifecycle(target) {
