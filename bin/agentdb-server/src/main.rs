@@ -2550,6 +2550,7 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
         println!("  note: {note}");
     }
     println!("  health:    http://{}/health/ready", config.bind);
+    println!("  metrics:   http://{}/metrics", config.bind);
     println!("  dashboard: http://{}/dashboard/", config.bind);
     if config.labs {
         println!("  labs: enabled (records, search, context, lifecycle routes mounted)");
