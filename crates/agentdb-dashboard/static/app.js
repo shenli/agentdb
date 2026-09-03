@@ -300,6 +300,10 @@ async function loadSessionView() {
     if (view.mode !== "session") return;
     await loadOverview();
     selectTenant(view.tenantId);
+    // selectTenant() clears the session field (it selects a tenant only), so
+    // restore the session from the URL before the session-scoped loaders run —
+    // otherwise readConfig() throws "session_id is required".
+    $("sessionId").value = view.sessionId;
     const session = (state.sessionsByTenant[view.tenantId] || []).find((item) => item.session_id === view.sessionId);
     if (session) {
       $("agentId").value = session.agent_id || "";
