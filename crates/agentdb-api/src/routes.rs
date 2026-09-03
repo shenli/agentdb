@@ -80,6 +80,68 @@ const DEFAULT_ADMIN_TABLET_LEASE_MS: i64 = 30_000;
 const ARTIFACT_BODY_LIMIT_BYTES: usize =
     agentdb_core::policy::ABSOLUTE_MAX_ARTIFACT_BYTES as usize + 1024 * 1024;
 
+/// Stability classification for a route. See the product-simplification
+/// proposal (`docs/design/product-simplification-proposal.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stability {
+    /// Documented in the main path, covered by the maintained SDKs, and part of
+    /// the compatibility promise.
+    Core,
+    /// Mounted only behind the `labs` switch; unstable and absent from the
+    /// beginner path (the quickstart).
+    Labs,
+    /// Operator / cluster machinery with no application-level compatibility
+    /// promise.
+    Internal,
+}
+
+/// The route stability catalog: the machine-readable label table the product
+/// proposal calls for until an OpenAPI document is generated. The gating in
+/// `routes()` / `labs_routes()` / `cluster_routes()` enforces mounting; this
+/// table records the classification and drives the `api_route_stability` test
+/// (every Core route is covered by both SDKs; every Labs route stays out of the
+/// quickstart). Paths use the axum `:param` form.
+pub fn route_catalog() -> &'static [(Stability, &'static str)] {
+    use Stability::*;
+    &[
+        // --- Core application surface (must be covered by both SDKs) ---
+        (Core, "/api/sessions/open"),
+        (Core, "/api/tenants/:tenant_id/sessions/:session_id/events"),
+        (Core, "/api/tenants/:tenant_id/sessions/:session_id/replay"),
+        (Core, "/api/tenants/:tenant_id/sessions/:session_id/fork"),
+        (Core, "/api/tenants/:tenant_id/sessions/:session_id"),
+        (Core, "/api/tenants/:tenant_id/sessions"),
+        (Core, "/api/tenants/:tenant_id/artifacts"),
+        (Core, "/api/tenants/:tenant_id/artifacts/:artifact_id"),
+        (Core, "/api/tenants/:tenant_id/artifacts/:artifact_id/blob"),
+        // --- Labs surface (behind `labs`; absent from the quickstart) ---
+        (Labs, "/api/tenants/:tenant_id/records"),
+        (Labs, "/api/tenants/:tenant_id/records/search"),
+        (Labs, "/api/tenants/:tenant_id/records/:record_id"),
+        (Labs, "/api/tenants/:tenant_id/records/upsert"),
+        (Labs, "/api/tenants/:tenant_id/records/:record_id/touch"),
+        (Labs, "/api/tenants/:tenant_id/sessions/:session_id/context"),
+        (Labs, "/api/tenants/:tenant_id/sessions/:session_id/replay-prefix"),
+        (Labs, "/api/tenants/:tenant_id/sessions/:session_id/lifecycle"),
+        (Labs, "/api/tenants/:tenant_id/sessions/:session_id/storage"),
+        (Labs, "/api/tenants/:tenant_id/sessions/:session_id/restore"),
+        (Labs, "/api/tenants/:tenant_id/artifacts/verify-lifecycle"),
+        (Labs, "/api/tenants/:tenant_id/policy/lifecycle-sweep"),
+        (Labs, "/api/tenants/:tenant_id/policy/gc-sweep"),
+        // --- Internal / operator machinery (no SDK or quickstart obligation) ---
+        (Internal, "/api/tenants"),
+        (Internal, "/api/tenants/:tenant_id/agents"),
+        (Internal, "/api/tenants/:tenant_id/meta/:key"),
+        (Internal, "/api/tenants/:tenant_id/watch"),
+        (Internal, "/api/tenants/:tenant_id/exports/watch"),
+        (Internal, "/api/admin/tokens"),
+        (Internal, "/api/admin/backups"),
+        (Internal, "/api/admin/recovery"),
+        (Internal, "/api/admin/cluster/health"),
+        (Internal, "/api/policy/worker/run"),
+    ]
+}
+
 pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
     let mut router = Router::new()
         .route("/health/live", get(health_live))

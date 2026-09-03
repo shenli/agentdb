@@ -448,6 +448,12 @@ under `[server]`). Off by default they return 404, so the supported surface stay
 narrow — the underlying runtime objects still exist, only the HTTP surface is
 gated. The routes below (records) are Labs; `meta` is core.
 
+Every route carries a **Core / Labs / Internal** stability label, recorded in
+`route_catalog()` in `crates/agentdb-api/src/routes.rs` (the machine-readable
+label table until an OpenAPI document is generated). The `api_route_stability`
+test enforces the contract: every Core route is covered by both SDKs, and every
+Labs route stays out of the quickstart (the beginner path).
+
 ```text
 POST   /api/tenants/{tenant_id}/records            # labs
 POST   /api/tenants/{tenant_id}/records/upsert     # labs
