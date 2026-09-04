@@ -9076,6 +9076,13 @@ impl Runtime {
         req: ExportWatchRequest,
         through_cursor: Option<&str>,
     ) -> Result<Vec<ExportFeedItem>> {
+        if !crate::persist::changefeed_enabled() {
+            return Err(Error::new(
+                ErrorCode::PolicyDenied,
+                "changefeed is disabled on this server; start with `serve --changefeed` \
+                 (or AGENTDB_CHANGEFEED=1) to enable the export ledger",
+            ));
+        }
         validate_export_include(&req.include)?;
         if req.limit == 0 {
             return Ok(Vec::new());

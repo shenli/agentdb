@@ -27,6 +27,7 @@ pub mod id;
 pub mod idempotency;
 pub(crate) mod persist;
 pub use persist::ReencryptReport;
+pub use persist::{changefeed_enabled, set_changefeed_enabled};
 pub mod policy;
 pub mod record;
 pub mod runtime;

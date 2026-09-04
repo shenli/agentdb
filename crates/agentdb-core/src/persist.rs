@@ -97,6 +97,24 @@ fn append_log_tenant_prefix(tenant_id: &str) -> String {
 
 static EXPORT_LEDGER_PENDING_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Whether the changefeed / export ledger is maintained. When off, appends and
+/// other mutations skip all export-ledger writes (the changefeed's per-event
+/// index) — a large append-throughput win for deployments that don't consume
+/// the changefeed. Defaults to ON so library/test usage is unchanged; the
+/// server sets it (default OFF) via `set_changefeed_enabled`.
+static CHANGEFEED_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Set the changefeed on/off for this process. Call once, before opening the
+/// runtime; later calls are ignored (the first wins).
+pub fn set_changefeed_enabled(enabled: bool) {
+    let _ = CHANGEFEED_ENABLED.set(enabled);
+}
+
+/// Whether the changefeed is enabled (default ON when never set).
+pub fn changefeed_enabled() -> bool {
+    *CHANGEFEED_ENABLED.get_or_init(|| true)
+}
+
 fn next_export_ledger_pending_token(object_id: &str) -> String {
     format!(
         "{:020}-{object_id}",
@@ -1866,6 +1884,9 @@ impl Persist {
     }
 
     fn export_ledger_event_ops(&self, event: &EventEnvelope) -> KvResult<Vec<WriteOp>> {
+        if !changefeed_enabled() {
+            return Ok(Vec::new());
+        }
         let token = next_export_ledger_pending_token(event.event_id.as_str());
         Ok(vec![
             self.export_ledger_event_put_op(event, &token)?,
@@ -1913,6 +1934,9 @@ impl Persist {
     }
 
     fn export_ledger_item_put_ops(&self, item: ExportLedgerItem) -> KvResult<Vec<WriteOp>> {
+        if !changefeed_enabled() {
+            return Ok(Vec::new());
+        }
         let token = next_export_ledger_pending_token(&item.object_id);
         let key = export_ledger_object_key(&item, &token);
         let cursor = format!("ledger:{}", key.trim_start_matches("export_ledger/"));
