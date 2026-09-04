@@ -146,6 +146,7 @@ func main() {
 		payloadB    int
 		forkSeed    int
 		forkN       int
+		batchN      int
 	)
 	flag.StringVar(&base, "base", "http://127.0.0.1:7878", "REST base URL")
 	flag.StringVar(&mode, "mode", "append", "benchmark mode: append | fork")
@@ -154,6 +155,7 @@ func main() {
 	flag.IntVar(&durationS, "duration", 30, "run duration in seconds")
 	flag.IntVar(&fetchN, "fetch", 0, "fetch_last_n per request")
 	flag.IntVar(&payloadB, "payload", 256, "approximate payload bytes per event")
+	flag.IntVar(&batchN, "batch", 1, "events per request via /events/batch (>1 = bulk append)")
 	flag.IntVar(&forkSeed, "fork-seed", 20, "events seeded on the parent before forking (fork mode)")
 	flag.IntVar(&forkN, "fork-n", 100, "number of sequential forks to time (fork mode)")
 	flag.Parse()
@@ -193,6 +195,7 @@ func main() {
 
 	var (
 		ok         atomic.Uint64
+		events     atomic.Uint64
 		errs       atomic.Uint64
 		sampleOnce sync.Once
 		sampleErr  string
@@ -207,18 +210,31 @@ func main() {
 		go func(worker int) {
 			defer wg.Done()
 			s := sessions[worker]
-			url := fmt.Sprintf("%s/api/tenants/%s/sessions/%s/append-and-fetch", base, s.TenantID, s.SessionID)
+			afURL := fmt.Sprintf("%s/api/tenants/%s/sessions/%s/append-and-fetch", base, s.TenantID, s.SessionID)
+			batchURL := fmt.Sprintf("%s/api/tenants/%s/sessions/%s/events/batch", base, s.TenantID, s.SessionID)
 			seq := 0
 			for {
 				if ctx.Err() != nil {
 					return
 				}
-				body, _ := json.Marshal(map[string]any{
-					"agent_id": s.AgentID,
-					"kind":     "message",
-					"payload":  map[string]any{"text": text, "seq": seq},
-					"last":     fetchN,
-				})
+				var url string
+				var body []byte
+				if mode == "batch" {
+					evs := make([]map[string]any, batchN)
+					for i := range evs {
+						evs[i] = map[string]any{"kind": "message", "payload": map[string]any{"text": text, "seq": seq + i}}
+					}
+					body, _ = json.Marshal(map[string]any{"agent_id": s.AgentID, "events": evs})
+					url = batchURL
+				} else {
+					body, _ = json.Marshal(map[string]any{
+						"agent_id": s.AgentID,
+						"kind":     "message",
+						"payload":  map[string]any{"text": text, "seq": seq},
+						"last":     fetchN,
+					})
+					url = afURL
+				}
 				t0 := time.Now()
 				resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 				elapsed := time.Since(t0)
@@ -235,6 +251,7 @@ func main() {
 					})
 				} else {
 					ok.Add(1)
+					events.Add(uint64(batchN))
 				}
 				// Must drain body before close for keep-alive reuse.
 				io.Copy(io.Discard, resp.Body)
@@ -242,7 +259,7 @@ func main() {
 				latsMu.Lock()
 				lats = append(lats, elapsed)
 				latsMu.Unlock()
-				seq++
+				seq += batchN
 			}
 		}(w)
 	}
@@ -267,16 +284,19 @@ func main() {
 	successes := ok.Load()
 
 	out := map[string]any{
-		"base":         base,
-		"concurrency":  concurrency,
-		"tenants":      tenants,
-		"duration_s":   total,
-		"payload_b":    payloadB,
-		"fetch_n":      fetchN,
-		"ok":           successes,
-		"errors":       errs.Load(),
-		"rps":          float64(successes) / total,
-		"sample_error": sampleErr,
+		"base":           base,
+		"concurrency":    concurrency,
+		"tenants":        tenants,
+		"duration_s":     total,
+		"payload_b":      payloadB,
+		"fetch_n":        fetchN,
+		"ok":             successes,
+		"errors":         errs.Load(),
+		"rps":            float64(successes) / total,
+		"batch_n":        batchN,
+		"events":         events.Load(),
+		"events_per_sec": float64(events.Load()) / total,
+		"sample_error":   sampleErr,
 		"latency_ms": map[string]float64{
 			"mean": float64(mean.Microseconds()) / 1000,
 			"p50":  float64(pct(0.50).Microseconds()) / 1000,

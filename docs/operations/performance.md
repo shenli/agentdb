@@ -48,6 +48,27 @@ with concurrency to ~33–38k and the median stays sub-millisecond. With
 it on, each append also writes four commit-ordered index entries, which
 caps throughput near ~8k.
 
+### Bulk append (`POST .../events/batch`)
+
+When an agent writes several events at once — a turn's user message +
+tool call + result, or a bulk import — the batch endpoint appends N
+events in one request, paying the fixed HTTP/JSON/routing cost once per N
+events instead of once per event. Same box, c=32, changefeed off
+(`perf-probe -mode batch -batch N`):
+
+| events / request | events/s | req/s | p50 / request |
+|-----------------:|---------:|------:|--------------:|
+| 1   |  44,369 | 44,369 |  0.60 ms |
+| 10  | 163,394 | 16,339 |  1.56 ms |
+| 50  | **284,961** |  5,699 |  5.14 ms |
+| 100 | 272,124 |  2,721 | 10.19 ms |
+
+Batching lifts single-node ingest from ~44k to **~285k events/s (~6×)**;
+it plateaus around batch 50–100 as the RocksDB write path becomes the
+limit, and each request's latency grows with the batch. (With the
+changefeed *on*, batches do **not** amortize — every event still writes
+four index entries — so keep it off for bulk ingest.)
+
 ### Versus Postgres / MongoDB
 
 Same workload (append + fetch-recent, persistent, non-durable) run
