@@ -1,98 +1,106 @@
 # AgentDB Performance Notes
 
-These numbers come from a single laptop. They are meant to ground the
-README and give a rough sense of what the prototype can do — not to
-make competitive claims against real databases.
+Single-machine numbers to ground the README — not competitive claims
+against tuned databases. Measured on a Linux workstation (li-dev);
+append/fork/vector refreshed 2026-09-04.
 
 ## Setup
 
 | | |
 |---|---|
-| Hardware | Apple M5 laptop, 16 GB RAM |
-| OS | Darwin 25.4.0 (arm64) |
+| Hardware | Intel Core i7-14700KF (20 cores / 28 threads), 32 GB RAM |
+| OS | Ubuntu 22.04.5 LTS (Linux 6.8, x86-64) |
 | Build | `cargo build --release -p agentdb-server` |
-| Storage | RocksDB on local SSD, object store = local FS |
-| Server | 4 boxes, 1 process, default Tokio multi-threaded runtime |
-| Client | Go 1.26 probe, HTTP keep-alive, single process |
-| Workload | `append_and_fetch` with 256-byte payload, `fetch_last_n=5` |
+| Storage | RocksDB on local NVMe SSD (ext4), object store = local FS |
+| Server | single `agentdb serve` process, default Tokio multi-threaded runtime |
+| Client | `perf-probe` (Go), HTTP keep-alive, single process, loopback |
+| Workload | `append-and-fetch`, 256-byte payload, `last=5` |
 
-All runs use the same hardware and default server config unless noted.
-The server, probe, and shell are colocated on localhost, so latency
-numbers include loopback TCP round-trip (~50 µs on this box).
+Server, probe, and shell are colocated on localhost, so latency numbers
+include loopback TCP round-trip. Unlike the earlier macOS laptop rig,
+Linux fsync on this NVMe forces a real device flush, so the durability
+numbers reflect genuine sync cost.
 
-## Durable by default (2026-08-30)
+## Append throughput (2026-09-04)
 
-Acknowledged appends now fsync the RocksDB WAL by default
-(`AGENTDB_ROCKSDB_SYNC_WRITES=0` opts out). Group commit is backlog-aware:
-an idle append pays only its own sync; under concurrency the writer
-coalesces the queue into one synced batch (2 ms window,
-`AGENTDB_APPEND_GROUP_COMMIT_BACKLOG_US`).
+The hot path is append-then-fetch-recent. Two changes made this build
+~12x faster than the prior one: an **O(1) session-tail lookup** (an
+earlier per-append reconcile scanned and decrypted the whole session —
+O(session length) per append), and making the **changefeed optional**.
+The changefeed's per-event export-ledger index (four extra commit-ordered
+KV writes per event) is the dominant append cost, so it is now **off by
+default** — enable it with `serve --changefeed` when a consumer reads
+the feed.
 
-Reference numbers, Apple M5 laptop, release build, 256-byte payloads,
-Python thread-pool client over loopback (client overhead included; macOS
-fsync does not force platter flush, so absolute sync cost is optimistic —
-Linux numbers will differ):
+`perf-probe` spins N workers, each on its own session spread across 8
+tenants, looping append-and-fetch. 8-second runs, warm server, RocksDB,
+non-durable (`AGENTDB_ROCKSDB_SYNC_WRITES=0`):
 
-| Mode | Workers | Throughput | p50 | p99 |
-|---|---:|---:|---:|---:|
-| fsync on (default) | 1 | 426/s | 2.40 ms | 4.18 ms |
-| fsync on (default) | 32 | 3,470/s | 8.87 ms | 17.19 ms |
-| fsync off (opt-out) | 1 | 423/s | 2.31 ms | 4.62 ms |
-| fsync off (opt-out) | 32 | 1,846/s | 13.67 ms | 59.69 ms |
+| Concurrency | changefeed off (default) | changefeed on |
+|------------:|-------------------------:|--------------:|
+| 1  |  3,894/s (p50 0.19 ms) | 2,237/s (p50 0.40 ms) |
+| 8  | 17,484/s (p50 0.34 ms) | 4,555/s (p50 1.24 ms) |
+| 32 | 32,654/s (p50 0.87 ms) | 7,849/s (p50 2.18 ms) |
+| 64 | 37,627/s (p50 1.54 ms) | 7,139/s (p50 6.40 ms) |
 
-Two observations: single-writer latency is unchanged by the durable
-default (the backlog-aware window adds no idle wait), and under
-concurrency the durable path is *faster* — group commit turns 32
-contending writers into large synced batches, while the non-durable
-direct path degrades under CAS contention.
+Zero errors at every level. With the changefeed off, throughput scales
+with concurrency to ~33–38k and the median stays sub-millisecond. With
+it on, each append also writes four commit-ordered index entries, which
+caps throughput near ~8k.
+
+### Versus Postgres / MongoDB
+
+Same workload (append + fetch-recent, persistent, non-durable) run
+through the `tools/agentdb-bench` comparison harness against normalized
+event-log schemas, c=32:
+
+| Backend | append+fetch @ c=32 |
+|---|---:|
+| AgentDB (changefeed off) | **~32,000/s** |
+| PostgreSQL (event-log) | 26,763/s |
+| MongoDB (event-log) | 16,465/s |
+
+AgentDB edges both when the changefeed isn't in the write path. (AgentDB
+is measured with `perf-probe` and the baselines with `agentdb-bench`, so
+read this as order-of-magnitude, not a tuned-benchmark shootout.)
+
+## Durability
+
+Acknowledged appends fsync the RocksDB WAL when
+`AGENTDB_ROCKSDB_SYNC_WRITES=1` (the numbers above are the non-durable
+default). On this ext4 + NVMe box a synced *single-writer* append is
+fsync-bound at ~15–17 ms (≈60–70/s); the cost is the device flush, not
+CPU. Group commit amortizes the sync across concurrent writers (c=32 ≈
+800/s), so under load the lever is concurrency / batching, not a faster
+code path. (An earlier macOS-laptop measurement showed durable as
+*faster* than non-durable — that was an artifact of macOS fsync not
+forcing a platter flush, and does not hold on Linux.)
 
 Crash safety is regression-tested by
 `ops/local-ci/tests/auto/S14_acknowledged_appends_survive_sigkill.sh`:
 every acknowledged append must survive SIGKILL mid-stream across repeated
-crash/restart cycles. (SIGKILL cannot falsify fsync itself — the page
-cache survives process death; power-loss protection needs a VM-kill or
-dm-flakey rig, tracked as follow-up.)
-
-## Throughput scaling
-
-`tools/workload/cmd/perf-probe` spins N workers that each loop
-`append_and_fetch` against one of 8 tenants (worker `i` uses tenant
-`t-perf-{i mod 8}` and session `s-w{i}`). 15-second runs, warm
-server, no faults or tier transitions.
-
-| Concurrency | Requests | Errors | RPS   | p50     | p90     | p99     | max     |
-|------------:|---------:|-------:|------:|--------:|--------:|--------:|--------:|
-|           1 |    9 314 |      0 |   621 |  1.6 ms |  2.8 ms |  3.2 ms |  5.9 ms |
-|           4 |   27 945 |      0 | 1 863 |  2.1 ms |  4.1 ms |  5.2 ms |  9.0 ms |
-|          16 |   60 678 |      0 | 4 043 |  3.3 ms |  7.8 ms | 14.4 ms |105.2 ms |
-|          64 |   95 121 |      0 | 6 334 |  9.1 ms | 18.0 ms | 28.2 ms | 83.0 ms |
-
-**Reading the numbers:** throughput scales roughly linearly up to
-c=16 (FNV-1a routes the 8 tenants across 4 boxes, so most workers
-don't contend on the same box write_lock). At c=64 the box locks and
-single RocksDB instance become the bottleneck; RPS plateaus ~6.3k and
-tail latency climbs into the tens of ms. Zero HTTP errors at any
-concurrency once keep-alive is actually reused (see "Gotchas" below).
+crash/restart cycles.
 
 ## Fork latency
 
-100 sequential `POST /api/sessions/parent/fork` calls against a single
-parent session seeded with 20 events:
+100 sequential `POST .../fork` calls against a single parent session
+seeded with 20 events (`perf-probe -mode fork`):
 
 | metric | value |
 |--------|------:|
-| mean | 0.52 ms |
-| p50  | 0.20 ms |
-| p90  | 0.25 ms |
-| p99  | 0.36 ms |
-| max  | 31.8 ms |
+| mean | 0.15 ms |
+| p50  | 0.13 ms |
+| p90  | 0.16 ms |
+| p99  | 0.43 ms |
+| max  | 0.70 ms |
 
 Fork is cheap because it does not copy events — it writes one new
-`Session` record with a `ForkRef` pointer to the parent. The outlier
-(~32 ms) is likely a GC or compaction pause; 99% of forks clear in
-under 400 µs.
+`Session` record with a `ForkRef` pointer to the parent. Every one of
+the 100 forks cleared in under 0.7 ms.
 
 ## Tier transition latency
+
+*(Apple M5 laptop; not re-run on li-dev.)*
 
 Forced cold/warm transitions via `POST /api/admin/tier/force`, varying
 session size (payload ~500 bytes per event):
@@ -109,6 +117,8 @@ writing it to the object store; reactivation is mostly the segment
 read and a few batched KV puts.
 
 ## Session lifecycle — end-to-end
+
+*(Apple M5 laptop; not re-run on li-dev.)*
 
 A 90-second run of the built-in Go workload
 (`tools/workload/config.yaml`, 2 personas at 6 and 3 tickets/min) with
@@ -146,13 +156,13 @@ top-k = 10. The HNSW index is built once outside the measured region
 numbers come from an inline reference implementation in the same
 bench.
 
-| impl                     | median latency | vs brute force |
-|--------------------------|---------------:|---------------:|
-| brute force (reference)  |       2.39 ms  |          1.00× |
-| HNSW (`instant-distance`)|       0.77 ms  |          3.1×  |
+| impl                  | median latency | vs brute force |
+|-----------------------|---------------:|---------------:|
+| brute force (reference)|      2.53 ms  |          1.00× |
+| HNSW (`hnsw_rs`)      |       1.02 ms  |          2.5×  |
 
 Recall@10 (overlap between HNSW top-10 and brute-force top-10, averaged
-over 100 queries) at default `ef_construction=100`: **0.85**.
+over 100 queries) at default `ef_construction=ef_search=100`: **0.58**.
 
 **Caveat:** pseudo-random 384-dim vectors concentrate all cosine
 similarities near 0, so the "true" top-10 has tightly-bunched scores
