@@ -76,6 +76,13 @@ struct AppendLogBatchRefs<'a> {
     session: Option<&'a Session>,
 }
 
+/// Parse the trailing zero-padded seq from a key whose last '/'-separated
+/// segment is a `{seq:020}` (event and append-log keys).
+fn seq_from_key_tail(key: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(key).ok()?;
+    text.rsplit('/').next()?.parse::<u64>().ok()
+}
+
 fn append_log_key(tenant_id: &str, session_id: &str, first_seq: u64) -> String {
     format!("append_log/{tenant_id}/{session_id}/{first_seq:020}")
 }
@@ -2254,30 +2261,29 @@ impl Persist {
     /// or `None` if no events exist. Used by hydration to reconcile
     /// `Session::next_seq` against on-disk reality.
     pub fn max_event_seq(&self, tenant_id: &str, session_id: &str) -> KvResult<Option<u64>> {
-        let prefix = format!("event/{tenant_id}/{session_id}/");
-        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        // O(1) tail lookup: event and append-log keys embed a zero-padded seq
+        // as their last path segment, so the largest key under each prefix is
+        // the max seq. This runs on every append (to reconcile the session's
+        // next_seq), so a full scan+decrypt of the session — as this once did —
+        // made appends O(session length). We parse the seq straight from the
+        // key (no decrypt); for the append-log we decode only the last batch.
         let mut max_seq: Option<u64> = None;
-        for res in iter {
-            let (k, v) = res?;
-            let plaintext = self.decrypt_event_row(tenant_id, session_id, &k, &v)?;
-            let env: EventEnvelope =
-                serde_json::from_slice(&plaintext).expect("event envelope decodes");
-            max_seq = Some(match max_seq {
-                Some(m) if m >= env.seq => m,
-                _ => env.seq,
-            });
-        }
-        let log_prefix = append_log_session_prefix(tenant_id, session_id);
-        for res in self.kv.scan_prefix(log_prefix.as_bytes())? {
-            let (_k, v) = res?;
-            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
-            for event in batch.events {
-                max_seq = Some(match max_seq {
-                    Some(m) if m >= event.seq => m,
-                    _ => event.seq,
-                });
+
+        let event_prefix = format!("event/{tenant_id}/{session_id}/");
+        if let Some((key, _)) = self.kv.last_kv_with_prefix(event_prefix.as_bytes())? {
+            if let Some(seq) = seq_from_key_tail(&key) {
+                max_seq = Some(max_seq.map_or(seq, |m| m.max(seq)));
             }
         }
+
+        let log_prefix = append_log_session_prefix(tenant_id, session_id);
+        if let Some((_, value)) = self.kv.last_kv_with_prefix(log_prefix.as_bytes())? {
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &value)?;
+            for event in batch.events {
+                max_seq = Some(max_seq.map_or(event.seq, |m| m.max(event.seq)));
+            }
+        }
+
         Ok(max_seq)
     }
 

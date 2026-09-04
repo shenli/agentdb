@@ -224,6 +224,30 @@ impl KvStore for RocksKvStore {
         Ok(())
     }
 
+    fn last_kv_with_prefix(&self, prefix: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        // Reverse-seek to the largest key under `prefix`: position at the
+        // prefix upper bound and step backward once. O(1) vs the default
+        // forward scan. `upper` is bound so its borrow outlives the iterator.
+        let upper = prefix_upper_bound(prefix);
+        let mut iter = match upper.as_deref() {
+            Some(ub) => self
+                .db
+                .iterator(IteratorMode::From(ub, Direction::Reverse)),
+            None => self.db.iterator(IteratorMode::End),
+        };
+        match iter.next() {
+            Some(item) => {
+                let (k, v) = item?;
+                if k.starts_with(prefix) {
+                    Ok(Some((k.to_vec(), v.to_vec())))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
     fn export_prefix_sst(&self, prefix: &[u8], out_path: &Path) -> Result<Option<u64>> {
         Ok(Some(self.write_range_to_sst(prefix, out_path)?))
     }
