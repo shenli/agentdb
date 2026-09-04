@@ -68,6 +68,19 @@ pub trait KvStore: Send + Sync {
         })))
     }
     fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()>;
+
+    /// Return the largest (key, value) whose key starts with `prefix`, or
+    /// `None` if the prefix is empty. Used for O(1) "tail" lookups (e.g. the
+    /// max event seq in a session). The default forward-scans and keeps the
+    /// last item (O(n)); backends should override with a reverse seek.
+    fn last_kv_with_prefix(&self, prefix: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut last = None;
+        for item in self.scan_prefix(prefix)? {
+            last = Some(item?);
+        }
+        Ok(last)
+    }
+
     /// Snapshot borrows from the store, so callers keep the store alive
     /// (e.g. `Arc<dyn KvStore>`) for the snapshot's lifetime.
     ///

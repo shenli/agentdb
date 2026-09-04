@@ -305,7 +305,12 @@ an external sandbox service. See
 `docs/reference/sandbox-snapshot-contract.md` for trigger ownership, restore,
 fork, retention, and dangling-ref behavior.
 
-`GET /changes` is the one public changefeed: commit-ordered items over the
+`GET /changes` is the one public changefeed. **It is off by default**: the
+export ledger it reads is maintained only when the server is started with
+`serve --changefeed` (or `AGENTDB_CHANGEFEED=1`), because that index costs an
+extra write per event on the append hot path. With it off, `changes` returns
+`PolicyDenied` and appends run several times faster — enable it only when a
+consumer needs the feed. When on, it returns commit-ordered items over the
 export ledger with `next_cursor`, `high_watermark`, and
 `oldest_available_cursor`, an optional session `scope`, an `include` filter, an
 optional `backfill=true` mode (a pinned `snapshot_high_watermark` plus a

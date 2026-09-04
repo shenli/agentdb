@@ -815,6 +815,12 @@ struct State {
     tenants: BTreeMap<String, Tenant>,
     agents: BTreeMap<String, Agent>,
     sessions: BTreeMap<String, Session>,
+    /// In-memory cache of the max event seq this runtime has durably written
+    /// per session (keyed by session_id_str). Lets the append hot path skip the
+    /// per-append `max_event_seq` persist lookup: a session whose in-memory
+    /// `next_seq` is already past its cached durable max cannot collide, so no
+    /// reconcile is needed. A missing entry falls back to the persist lookup.
+    session_durable_max_seq: BTreeMap<String, u64>,
     /// Keyed by artifact_id_str. Hydrated at startup from
     /// `Persist::scan_all_artifacts`; updated on every `create_artifact`.
     artifacts: BTreeMap<String, Artifact>,
@@ -8157,22 +8163,6 @@ impl Runtime {
             }
             return;
         }
-        let persisted_session_max_seq = match self.persist.as_ref() {
-            Some(persist) => {
-                match persist.max_event_seq(jobs[0].req.tenant_id.as_str(), session_id.as_str()) {
-                    Ok(max_seq) => max_seq,
-                    Err(err) => {
-                        let err = internal(err);
-                        for job in jobs {
-                            let _ = job.done.send(Err(err.clone()));
-                        }
-                        return;
-                    }
-                }
-            }
-            None => None,
-        };
-
         let mut prepared = Vec::with_capacity(jobs.len());
         let mut final_session_snapshot: Option<Session> = None;
         let mut persist_session_checkpoint = false;
@@ -8184,17 +8174,44 @@ impl Runtime {
                 coalesce_sample.prepare_lock_wait_nanos = started.elapsed().as_nanos();
             }
             let prepare_work_started = coalesce_profile.map(|_| Instant::now());
-            if let Some(max_seq) = persisted_session_max_seq {
-                if let Err(err) = reconcile_session_next_seq_from_persisted_events(
-                    &mut s,
-                    &jobs[0].req.tenant_id,
-                    &session_id,
-                    max_seq,
-                ) {
-                    for job in jobs {
-                        let _ = job.done.send(Err(err.clone()));
+            // Reconcile next_seq against the persisted max event seq, but only
+            // when a collision is actually possible: if in-memory next_seq is
+            // already past the durable max this runtime has written, no event
+            // can exist at next_seq. A per-append `max_event_seq` persist lookup
+            // (once a full session scan+decrypt) otherwise dominates the hot
+            // path. The cache is seeded on the first append / after a load.
+            if let Some(persist) = self.persist.as_ref() {
+                let next_seq = s
+                    .sessions
+                    .get(session_id.as_str())
+                    .map_or(0, |sess| sess.next_seq);
+                let cached_max = s.session_durable_max_seq.get(session_id.as_str()).copied();
+                if cached_max.map_or(true, |max| next_seq <= max) {
+                    let max_seq = match persist
+                        .max_event_seq(jobs[0].req.tenant_id.as_str(), session_id.as_str())
+                    {
+                        Ok(max_seq) => max_seq,
+                        Err(err) => {
+                            let err = internal(err);
+                            for job in jobs {
+                                let _ = job.done.send(Err(err.clone()));
+                            }
+                            return;
+                        }
+                    };
+                    if let Some(max_seq) = max_seq {
+                        if let Err(err) = reconcile_session_next_seq_from_persisted_events(
+                            &mut s,
+                            &jobs[0].req.tenant_id,
+                            &session_id,
+                            max_seq,
+                        ) {
+                            for job in jobs {
+                                let _ = job.done.send(Err(err.clone()));
+                            }
+                            return;
+                        }
                     }
-                    return;
                 }
             }
             let mut policy_cache: BTreeMap<(String, String), RuntimePolicy> = BTreeMap::new();
@@ -8280,6 +8297,14 @@ impl Runtime {
         let update_state_work_started = coalesce_profile.map(|_| Instant::now());
         let mut completions = Vec::with_capacity(prepared.len());
         if let Some(session_snapshot) = final_session_snapshot {
+            if persist_enabled {
+                // Record the durable max seq just written so subsequent appends
+                // can skip the max_event_seq reconcile (next_seq is now past it).
+                s.session_durable_max_seq.insert(
+                    session_id.as_str().to_string(),
+                    session_snapshot.next_seq.saturating_sub(1),
+                );
+            }
             s.sessions
                 .insert(session_id.as_str().to_string(), session_snapshot);
         }
@@ -8544,13 +8569,6 @@ impl Runtime {
                 return self.replay_append_idempotency_record(&rec, &req).await;
             }
         }
-        let persisted_session_max_seq = self
-            .persist
-            .as_ref()
-            .map(|persist| persist.max_event_seq(req.tenant_id.as_str(), req.session_id.as_str()))
-            .transpose()
-            .map_err(internal)?
-            .flatten();
         let initial_state_lock_wait_started = path_profile.map(|_| Instant::now());
         let mut s = self.state.lock().await;
         if let Some(started) = initial_state_lock_wait_started {
@@ -8567,21 +8585,37 @@ impl Runtime {
                 return self.replay_append_idempotency_record(&rec, &req).await;
             }
         }
-        if let Some(max_seq) = persisted_session_max_seq {
-            reconcile_session_next_seq_from_persisted_events(
-                &mut s,
-                &req.tenant_id,
-                &req.session_id,
-                max_seq,
-            )?;
-        }
+        // Reconcile next_seq against the persisted max event seq, but only when
+        // a collision is possible (in-memory next_seq not yet past the cached
+        // durable max). Skips the per-append persist lookup in steady state.
         if let Some(persist) = self.persist.as_ref() {
-            advance_session_next_seq_past_persisted_collision(
-                &mut s,
-                persist,
-                &req.tenant_id,
-                &req.session_id,
-            )?;
+            let next_seq = s
+                .sessions
+                .get(req.session_id.as_str())
+                .map_or(0, |sess| sess.next_seq);
+            let cached_max = s
+                .session_durable_max_seq
+                .get(req.session_id.as_str())
+                .copied();
+            if cached_max.map_or(true, |max| next_seq <= max) {
+                if let Some(max_seq) = persist
+                    .max_event_seq(req.tenant_id.as_str(), req.session_id.as_str())
+                    .map_err(internal)?
+                {
+                    reconcile_session_next_seq_from_persisted_events(
+                        &mut s,
+                        &req.tenant_id,
+                        &req.session_id,
+                        max_seq,
+                    )?;
+                }
+                advance_session_next_seq_past_persisted_collision(
+                    &mut s,
+                    persist,
+                    &req.tenant_id,
+                    &req.session_id,
+                )?;
+            }
         }
 
         let policy = match resolved_policy {
@@ -8811,6 +8845,12 @@ impl Runtime {
             path_sample.update_state_lock_wait_nanos = started.elapsed().as_nanos();
         }
         let update_state_work_started = path_profile.map(|_| Instant::now());
+        if persist_enabled {
+            s.session_durable_max_seq.insert(
+                req.session_id.as_str().to_string(),
+                session_snapshot.next_seq.saturating_sub(1),
+            );
+        }
         s.sessions
             .insert(req.session_id.as_str().to_string(), session_snapshot);
         // In-memory backend: keep the `event_by_id` map populated. The
@@ -9036,6 +9076,13 @@ impl Runtime {
         req: ExportWatchRequest,
         through_cursor: Option<&str>,
     ) -> Result<Vec<ExportFeedItem>> {
+        if !crate::persist::changefeed_enabled() {
+            return Err(Error::new(
+                ErrorCode::PolicyDenied,
+                "changefeed is disabled on this server; start with `serve --changefeed` \
+                 (or AGENTDB_CHANGEFEED=1) to enable the export ledger",
+            ));
+        }
         validate_export_include(&req.include)?;
         if req.limit == 0 {
             return Ok(Vec::new());

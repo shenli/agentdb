@@ -46,7 +46,7 @@ You talk to it through the native HTTP API:
 | **event** | One typed JSON envelope you appended. Server assigns `event_id`, `seq`, and `created_at_ms`; your data lives under `payload`. |
 | **append + fetch-recent** | The hot-path primitive: `append` one event and, with `fetch_last_n=N`, get the last N events of the same session in one round trip. |
 | **fork** | Create a child session that inherits the parent's events at fork time, MVCC-backed. Use to branch into "what if" timelines without copying. |
-| **changefeed** | One commit-ordered feed of everything (events + fork edges), read at `GET .../changes` with a resumable cursor. The way to observe or stream a workspace. |
+| **changefeed** *(opt-in)* | One commit-ordered feed of everything (events + fork edges), read at `GET .../changes` with a resumable cursor. The way to observe or stream a workspace. Off by default (it adds a per-event write); enable with `serve --changefeed`. |
 | **event search** | Text search over an agent's past events (`GET .../events/search`) — "did I already handle this?" |
 | **artifacts** | Larger binary/text objects referenced from events instead of being inlined into payloads. |
 | **records** *(Labs)* | Searchable durable facts linked back to source events or artifacts. Requires `serve --labs`. |
@@ -136,12 +136,18 @@ Pass `session=...` or `agent=...` to search one session or one
 agent's sessions instead of the whole workspace. This searches the
 durable event log; it is distinct from records search (Labs, §3.6).
 
-### 3.4 Follow the changefeed
+### 3.4 Follow the changefeed *(opt-in)*
 
 `changes` is the one commit-ordered feed of everything that
 happened — events and fork edges — for dashboards, supervisors,
 evaluators, or a second agent. Resume from a cursor; it long-polls
 for new items.
+
+> **Off by default.** Maintaining the changefeed writes an extra index
+> entry per event on the append path, so it is opt-in: start the server
+> with `serve --changefeed` (or `AGENTDB_CHANGEFEED=1`). Without it,
+> `changes` returns a `PolicyDenied` error and appends run considerably
+> faster. Turn it on only when something consumes the feed.
 
 ```python
 page = workspace.changes(limit=100)

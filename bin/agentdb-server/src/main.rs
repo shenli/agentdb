@@ -226,6 +226,13 @@ struct ServeOpts {
     #[arg(long)]
     labs: bool,
 
+    /// Maintain the changefeed / export ledger (the `GET .../changes` feed and
+    /// exports). OFF by default: skipping the per-event export-ledger writes is
+    /// a large append-throughput win, and many deployments never consume the
+    /// changefeed. Enable when you need it.
+    #[arg(long, env = "AGENTDB_CHANGEFEED")]
+    changefeed: bool,
+
     /// Enable metadata-backed routing for this node id. When unset, the server
     /// keeps the single-node routing-disabled behavior.
     #[arg(long)]
@@ -487,6 +494,10 @@ fn open_import_runtime(
 
 async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let dev_bootstrap = opts.dev_bootstrap.clone();
+    // Changefeed / export ledger: off by default (skips per-event export-ledger
+    // writes for a large append-throughput win). Must be set before the runtime
+    // opens so hydration and the first append see the right mode.
+    agentdb_core::set_changefeed_enabled(opts.changefeed);
     let config = ResolvedServeConfig::from_serve_opts(opts)?;
     // Fail closed on a data directory that belongs to another node or
     // cluster, or whose identity marker is corrupt. This runs before any
@@ -1283,6 +1294,7 @@ fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
         data_dir: opts.data_dir,
         content_dir: None,
         in_memory: !opts.persistent,
+        changefeed: false,
         dev: !opts.persistent,
         // Labs stays off by default; use `serve --labs` to mount the Labs
         // surface.
@@ -7115,6 +7127,7 @@ mod tests {
             in_memory: false,
             dev: false,
             labs: false,
+            changefeed: false,
             route_node_id: None,
             route_shard_count: None,
             route_region: None,
