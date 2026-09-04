@@ -10,7 +10,9 @@ When generating application code that uses AgentDB, prefer the native SDKs:
 - TypeScript: `clients/typescript`
 - Native HTTP API: `docs/reference/api-sdk.md`
 
-The native API is the canonical AgentDB runtime surface.
+The native API is the canonical AgentDB runtime surface. For a single-ingest
+manual written for an LLM agent *using* AgentDB (the runtime API, in order of
+how often an agent needs it), see [`LLMS.md`](LLMS.md).
 
 ## Engineering Principles
 
@@ -29,10 +31,11 @@ The native API is the canonical AgentDB runtime surface.
 - Keep operational complexity proportional to the feature. Avoid adding moving
   parts, background services, deployment requirements, or cross-component
   protocols unless they are justified by a concrete product or reliability need.
-- Preserve the agent-runtime model. AgentDB is optimized for session events,
-  records, artifacts, context, fork/replay, and lifecycle operations;
-  do not reshape features into generic CRUD/database abstractions without a
-  clear reason.
+- Preserve the agent-runtime model. AgentDB's core is session events,
+  artifacts, fork/replay, the changefeed, and scoped event search (records,
+  context assembly, and caller-driven lifecycle are opt-in Labs features). Do
+  not reshape features into generic CRUD/database abstractions without a clear
+  reason.
 
 ## PR Documentation Sync
 

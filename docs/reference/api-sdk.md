@@ -2,7 +2,7 @@
 
 This page is the compact reference for AgentDB's native HTTP API and local SDK
 surfaces. The API is tenant-scoped and uses opaque typed IDs such as `ten_*`,
-`agt_*`, `ses_*`, `evt_*`, `art_*`, `rec_*`, and `skl_*`.
+`agt_*`, `ses_*`, `evt_*`, `art_*`, and `rec_*`.
 
 ## HTTP API
 
@@ -100,6 +100,10 @@ POST /api/admin/backups
 POST /api/admin/restores
 POST /api/policy/worker/run
 ```
+
+The cluster admin routes (`/api/admin/cluster/*`, `/scheduler`, `/drain`,
+`/cells`, `/nodes`, `/tablets*`, `/routing*`) are mounted only when
+`deployment.mode = "cluster"`; on a single-node server they return 404.
 
 `/health/live` reports whether the HTTP process is alive. `/health/ready`
 returns `503 Service Unavailable` while the local node is draining or cluster
@@ -251,8 +255,8 @@ GET  /api/tenants/{tenant_id}/sessions/{session_id}/events
 POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch  # deprecated
 POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
-POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix
-POST /api/tenants/{tenant_id}/sessions/{session_id}/context
+POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix  # labs
+POST /api/tenants/{tenant_id}/sessions/{session_id}/context  # labs
 GET  /api/tenants/{tenant_id}/changes
 GET  /api/tenants/{tenant_id}/events/search
 POST /api/tenants/{tenant_id}/exports/backfill

@@ -597,7 +597,7 @@ records depending on replay needs. Tool invocations should use `tool_call` and
 
 Map chat messages to `user_message` and `model_message`. Map tool parts to
 `tool_call`, `tool_result`, and `tool_error`. Map resumable stream state to
-`agent_status` and watch/subscription cursors.
+`agent_status`, tailing the `GET /changes` changefeed from a `ledger:` cursor.
 
 ### 5.4 MCP
 

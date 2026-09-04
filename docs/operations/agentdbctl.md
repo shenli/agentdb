@@ -230,7 +230,8 @@ install drills, and failure handling, see
 For offline restore procedures, see [restore-recovery.md](restore-recovery.md).
 For compaction guidance, see [storage-maintenance.md](storage-maintenance.md).
 
-Verify artifact lifecycle consistency for one tenant:
+Verify artifact lifecycle consistency for one tenant (Labs: requires the server
+started with `serve --labs`; returns 404 otherwise):
 
 ```bash
 TENANT_ID=ten_...
@@ -381,6 +382,9 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
     --include tenants,agents,sessions,artifacts,records \
     --backfill
 ```
+
+The `records` include requires Labs (server started with `serve --labs`); drop
+it from `--include` on a Core single-node server.
 
 Print starter dashboard queries for native AgentDB tables and ClickStack views:
 

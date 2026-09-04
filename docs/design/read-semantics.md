@@ -88,8 +88,8 @@ trip.
 | `GET /api/tenants/{t}/sessions/{s}/events` | Linearizable | read barrier before local serve |
 | `GET /api/tenants/{t}/sessions/{s}` | Linearizable | read barrier before local serve |
 | append-and-fetch (`POST …/events` returning the tail) | Read-your-writes | the append's own applied index |
-| `GET …/sessions/{s}/watch` (changefeed) | Eventually consistent | cursor advances as entries apply; caller polls |
-| `GET /api/tenants/{t}/records/search` | Eventually consistent | **unrouted** — any node serves from local index state; see note |
+| `GET /api/tenants/{t}/changes` (changefeed) | Eventually consistent | `ledger:` cursor advances as entries apply; caller polls |
+| `GET /api/tenants/{t}/records/search` (Labs) | Eventually consistent | **unrouted** — any node serves from local index state; see note |
 | `GET /api/admin/*` (raft status, cluster health) | Eventually consistent | observational; per-node local view by design |
 
 ### Note on `records/search`

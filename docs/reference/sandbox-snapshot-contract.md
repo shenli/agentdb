@@ -61,8 +61,8 @@ The sandbox service decides when to snapshot. Recommended defaults:
 
 AgentDB policy should be treated as input to the sandbox scheduler, not as a
 background snapshot worker inside AgentDB. The sandbox scheduler can read tenant
-policy, session lifecycle, and watch/export feeds, then call the core snapshot
-record operation after bytes are durable.
+policy, session lifecycle, and the `GET /changes` changefeed, then call the core
+snapshot record operation after bytes are durable.
 
 ## Resume Contract
 

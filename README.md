@@ -12,8 +12,9 @@
 <br>
 
 AgentDB is a durable session log for AI agents. It stores what happened while an
-agent was running: messages, tool calls, tool outputs, artifacts, records,
-context decisions, lifecycle state, replay metadata, and fork history.
+agent was running: messages, tool calls, tool outputs, artifacts, replay
+metadata, and fork history. Optional Labs features add searchable records and
+context assembly.
 
 Use AgentDB when agent state needs to survive process restarts, worker moves,
 sandbox failures, model retries, human review pauses, or long context windows.
@@ -26,9 +27,10 @@ runtime surface.
   reconstructing state from scattered logs.
 - **Replay and fork runs** to debug decisions, inspect lineage, or explore an
   alternate path.
-- **Keep runtime state together** across events, records, artifacts, context
-  packs, and lifecycle transitions.
-- **Stream live state** to dashboards, supervisors, evaluators, and tools.
+- **Keep runtime state together** across events, artifacts, replay, and fork
+  history.
+- **Follow live state** through the changefeed — dashboards, supervisors,
+  evaluators, and tools.
 
 General databases can store agent data. AgentDB focuses on the workload shape
 described in [docs/design/product-thesis.md](docs/design/product-thesis.md):
@@ -40,8 +42,8 @@ history, recent session-tail reads, and agent-native primitives.
 | Large records, context, logs, and files | JSON/blob columns work, but indexes and row growth become costly | Flexible documents, but item/document limits push blobs elsewhere | Handles large event flow, but files and metadata need another store | Artifacts and refs are part of the runtime model |
 | Hot sessions, idle sessions, archived runs | Partitions and retention jobs are app design | TTL and table design help; lifecycle semantics stay custom | Retention is strong; reactivation state lives elsewhere | Lifecycle is explicit on sessions and policy |
 | Large total retained history | Scales with careful schema, indexes, and storage tuning | Scales by key design, with secondary-index tradeoffs | Scales for event transport and archives | Separates hot runtime state, records, and artifacts |
-| Recent session-tail access | Needs purpose-built indexes and queries | Range queries can work if keys match the session path | Offsets replay streams, not context-ready session state | Native append-and-fetch and recent replay |
-| Agent primitives | Replay, fork, idempotency, watch, and refs are app protocols | Same primitives become app-side conventions | Replay exists, but fork/watch/source refs are not session-native | Replay, fork, watch, idempotency, refs, and SDKs are first class |
+| Recent session-tail access | Needs purpose-built indexes and queries | Range queries can work if keys match the session path | Offsets replay streams, not context-ready session state | Native append plus recent-tail fetch and replay |
+| Agent primitives | Replay, fork, idempotency, changefeed, and refs are app protocols | Same primitives become app-side conventions | Replay exists, but fork/changefeed/source refs are not session-native | Replay, fork, changefeed, idempotency, refs, and SDKs are first class |
 
 AgentDB is not a vector database, memory platform, agent framework, workflow
 engine, or general MongoDB replacement. It is the runtime-state database those

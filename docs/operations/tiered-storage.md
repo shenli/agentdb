@@ -16,7 +16,7 @@ surface, see [../reference/api-sdk.md](../reference/api-sdk.md).
 | `warm` | Session is appendable and recent mutable history is in the hot runtime path. |
 | `cold` | Older history is sealed out of the hot head; reads should remain logically equivalent. |
 | `archive` | History is compacted behind an archive manifest/bundle and may need restore before normal warm/cold operation. |
-| `derivative_only` | Raw bytes may be purged while metadata, refs, summaries, records, or other derived state remain. Full replay is not guaranteed. |
+| `derivative_only` | Raw bytes may be purged while metadata, refs, summaries, records (Labs: requires `serve --labs`), or other derived state remain. Full replay is not guaranteed. |
 
 The important operator rule is that lifecycle is part of the storage contract,
 not just a label. After every transition, verify reads, replay, and policy
@@ -54,7 +54,9 @@ restore, see [restore-recovery.md](restore-recovery.md).
 
 ## Run Lifecycle And GC Sweeps
 
-Policies can drive lifecycle and garbage-collection work:
+Policies can drive lifecycle and garbage-collection work. (Labs: the
+`policy/lifecycle-sweep` and `policy/gc-sweep` endpoints require the server
+started with `serve --labs`; they return 404 otherwise.)
 
 ```bash
 curl -fsS \
@@ -75,7 +77,9 @@ truth for what work was actually performed.
 After a lifecycle transition or sweep:
 
 1. Fetch the session and confirm lifecycle/storage summary fields changed.
-2. Replay the session and confirm event order is preserved:
+2. Replay the session and confirm event order is preserved (Labs: the
+   `replay-prefix` verify path requires `serve --labs`; a plain `replay` is
+   Core):
 
    ```bash
    curl -fsS \
@@ -83,13 +87,15 @@ After a lifecycle transition or sweep:
    ```
 
 3. Fetch context for the session and confirm the agent-facing state still
-   contains the expected recent events, records, and policy.
+   contains the expected recent events, records, and policy. (Labs: the
+   `context` endpoint requires `serve --labs`.)
 4. If the session was archived, restore it to `cold` or `warm` in a test
    tenant before relying on the archive path operationally.
 5. If derivative-only purge was used, confirm consumers understand that full
    replay is no longer guaranteed.
 
-Verify artifact lifecycle consistency for the tenant:
+Verify artifact lifecycle consistency for the tenant (Labs: requires the server
+started with `serve --labs`):
 
 ```bash
 TENANT_ID=ten_...
@@ -116,8 +122,8 @@ After purge:
 - artifact metadata may still exist
 - content download may fail or intentionally return a policy error
 - replay may preserve refs without being able to recover raw bytes
-- `agentdbctl artifacts verify-lifecycle --tenant-id <tenant>` should report
-  purged raw bytes without issues
+- `agentdbctl artifacts verify-lifecycle --tenant-id <tenant>` (Labs: requires
+  `serve --labs`) should report purged raw bytes without issues
 
 Artifact creation writes content before metadata. On a metadata persistence
 error the runtime attempts immediate blob deletion. Local filesystem content

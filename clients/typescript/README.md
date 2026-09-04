@@ -54,26 +54,33 @@ canonical session ID without exposing `tenantId` to normal app code.
 
 ## Core Surface
 
-- `AgentDB.workspace`, `AgentDB.sessionById`
-- `Workspace.agent`, `Workspace.agentById`, `Workspace.sessionById`, `Workspace.changes`
-- `Workspace.artifacts`, `Workspace.records`
+- `AgentDB.workspace`, `AgentDB.openSession`, `AgentDB.sessionById`
+- `Workspace.agent`, `Workspace.agentById`, `Workspace.sessionById`, `Workspace.changes`, `Workspace.searchEvents`
+- `Workspace.artifacts`
 - `AgentHandle.session`, `AgentHandle.sessionById`
 - `SessionHandle.append`, `appendUser`, `modelMessage`, `toolCall`, `toolResult`, `contextPackBuilt`
-- `SessionHandle.fetch`, `fetchRecent`, `replay`, `materializeReplayPrefix`, `fork`, `context`
-- `SessionHandle.artifacts`, `records`
+- `SessionHandle.fetch`, `fetchRecent`, `replay`, `fork`
+- `SessionHandle.artifacts`
 - `eventRef`, `artifactRef`
+
+## Labs Surface
+
+Available only when the server runs with `serve --labs`:
+
+- `Workspace.records`, `SessionHandle.records` — searchable records
+- `SessionHandle.context` — context assembly over the session log
+- `SessionHandle.materializeReplayPrefix`
 
 The low-level tenant-scoped API remains available:
 
 - `Client.createTenant`, `createAgent`, `createSession`, `session`
-- `Session.append`, `appendAndFetch`, `fetch`, `fetchRecent`
-- `Session.replay`, `materializeReplayPrefix`, `fork`, `context`
-- `Client.changes`
+- `Session.append`, `fetch`, `fetchRecent`, `replay`, `fork`
+- `Client.changes`, `searchEvents`
 - `Client.putArtifact`, `getArtifact`, `getArtifactBlob`
-- `Client.writeRecord`, `searchRecords`
+- Labs: `Session.context`, `materializeReplayPrefix`, `Client.writeRecord`, `searchRecords`
 
 IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
-`art_*`, `rec_*`, and `skl_*`. Mutating SDK calls generate an
+`art_*`, and `rec_*`. Mutating SDK calls generate an
 `Idempotency-Key` only when `idempotencyKey` is supplied. This keeps the
 default append path eligible for server-side same-session batching; reuse an
 explicit key when the caller may retry a mutation.
@@ -119,9 +126,10 @@ Concept mapping:
 | wake/resume handle | `agent.sessionById(...)` / `db.sessionById(...)` |
 | get events | `session.fetch(...)` |
 | append event | `session.append(...)` |
-| append and fetch | `session.appendAndFetch(...)` |
+| append and fetch recent tail | `session.append(..., { fetchLastN: N })` |
 | fork session | `session.fork(...)` |
-| build context | `session.context(...)` |
+| search past events | `workspace.searchEvents(...)` |
+| build context (Labs) | `session.context(...)` |
 | workspace/session changefeed | `workspace.changes(...)` |
 
 Use `fromSeq: lastSeenSeq + 1` when reconnecting a subscription to avoid

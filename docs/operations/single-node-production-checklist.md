@@ -130,10 +130,12 @@ deployment choices, see [deployment.md](deployment.md).
 
 - [ ] Lifecycle policy is documented for warm, cold, archive, and
   derivative-only behavior.
-- [ ] A test session has been transitioned and replay-verified.
+- [ ] A test session has been transitioned and replay-verified. (Replay-verify
+  exercises Labs features; run the server with `serve --labs` for this step.)
 - [ ] Archive restore has been tested if archive is part of the retention plan.
 - [ ] Artifact byte purge policy has legal hold and retention review.
-- [ ] Artifact lifecycle verification passes:
+- [ ] Artifact lifecycle verification passes (Labs: requires the server started
+  with `serve --labs`):
 
   ```bash
   TENANT_ID=ten_...

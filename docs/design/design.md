@@ -23,11 +23,11 @@ session events and artifacts rather than hidden inside a process.
 Agent platforms repeatedly need the same primitives:
 
 - ordered session history
-- append-and-fetch for the agent turn loop
+- `append` with `fetch_recent` for the agent turn loop (append-and-fetch deprecated)
 - artifact offload for large or binary payloads
 - searchable scoped records
 - fork and replay for branchable runs
-- subscriptions and watch cursors for observers and dashboards
+- a single ledger-ordered `changes` changefeed for observers and dashboards
 - durable observability export for ClickHouse, ClickStack, JSONL, and archive
   pipelines
 - policy, quota, retention, lifecycle, and garbage collection per tenant
@@ -73,8 +73,8 @@ AgentDB session tail from the snapshot point. Fork is a pointer in AgentDB and a
 copy-on-write relationship in the sandbox store.
 
 Memory, observability, analytics, and lakehouse data are derived tiers. They
-consume the durable session log through `watch` / `export_watch`; they do not
-own runtime truth. If a derived projection is lost or built incorrectly, it
+consume the durable session log through the single `GET /changes` ledger
+changefeed; they do not own runtime truth. If a derived projection is lost or built incorrectly, it
 should be rebuildable from AgentDB history.
 
 ## Current Commitments
@@ -102,11 +102,11 @@ AgentDB or still needs product hardening.
 |---|---|---|
 | Runtime objects | Implemented | Tenant, agent, session, event, artifact, record, policy, and tenant metadata exist in the Rust runtime and native API. |
 | Native API and SDKs | Implemented | Tenant-scoped HTTP API plus maintained Python and TypeScript SDKs. Non-loopback binds require rotating installation bearer auth; scoped admin tokens protect admin routes. Loopback development may remain open, and tenant-scoped end-user authorization remains a hosted/control-plane concern. |
-| Append loop | Implemented | Per-session serialized append, contiguous `seq`, append-and-fetch, idempotency, backpressure signals, and raw-secret write-path guards. |
-| Fork and replay | Implemented | Pointer forks, fork-aware replay, bounded ancestor reads, replay scan stats, and explicit replay-prefix materialization over core/HTTP/SDK surfaces. |
-| Changefeeds | Implemented | Cursor-based `watch`, fork-edge control items, commit-ordered durable `export_watch`, and managed export consumers with retained-cursor validation and claim/ack/rewind. |
+| Append loop | Implemented | Per-session serialized append, contiguous `seq`, `append` + `fetch_recent` (append-and-fetch deprecated), idempotency, backpressure signals, and raw-secret write-path guards. |
+| Fork and replay | Implemented | Pointer forks, fork-aware replay, bounded ancestor reads, and replay scan stats over core/HTTP/SDK surfaces. Explicit replay-prefix materialization is a Labs feature (opt-in via `serve --labs`). |
+| Changefeed | Implemented | A single ledger-ordered `GET /changes` changefeed serves events and `fork_edge` control items under monotonic `ledger:` cursors; consumers hold their own resume cursor and advance a client-side checkpoint. |
 | Artifacts | Implemented | Metadata and content bytes are stored separately with lifecycle-aware purge paths, a 128 MiB absolute object limit, local-filesystem fsync, failure cleanup, and standalone startup orphan reconciliation. The local sweep fully scans and materializes the blob listing; object-store listing/reconciliation is not yet implemented. |
-| Records and retrieval | Implemented for scoped runtime retrieval | Durable base records, local/global indexes, commit-sequence visibility repair, and source refs exist. Memory extraction, ranking, summarization, and embedding spend are application/platform responsibilities. |
+| Records and retrieval | Labs (opt-in via `serve --labs`; 404 by default) | Durable base records, local/global indexes, commit-sequence visibility repair, and source refs exist behind the Labs surface. Memory extraction, ranking, summarization, and embedding spend are application/platform responsibilities. |
 | Policy, lifecycle, and GC | Implemented | Quota/backpressure, warm/cold/archive lifecycle, archive restore, retention, legal hold, derivative-only artifact purge, and policy workers exist. |
 | Credential boundary | Implemented defense in depth | Events carry opaque `credential_refs`; SDKs and runtime sanitize/reject common raw-secret payload shapes. Real secret resolution remains in the control plane/vault. |
 | Sandbox snapshots | AgentDB refs implemented; sandbox service external | AgentDB stores `SnapshotRef` / `SnapshotLayer` metadata and resolves resume refs across fork chains. Snapshot bytes, copy-on-write fork, restore, and byte retention belong to the sandbox service. |
@@ -147,6 +147,13 @@ HTTP is the right canonical API for the current product shape: agent
 frameworks, SDKs, dashboards, examples, and local operators can use it without
 custom database drivers, it handles JSON/event payloads naturally, and SSE gives
 a simple subscription path.
+
+The application surface is tiered into Core, Labs, and Internal routes: Core is
+the stable default (including `POST /api/sessions/open`, the `append` +
+`fetch_recent` turn loop, `GET /api/tenants/{t}/events/search`, bulk
+`POST /api/tenants/{t}/events/batch`, the `GET /api/tenants/{t}/changes`
+changefeed, and `GET /metrics`), Labs routes are opt-in via `serve --labs` and
+return 404 by default, and Internal routes back cluster operation.
 
 AgentDB should not pretend HTTP is a universal database wire protocol. If the
 data plane later needs lower overhead, the expected evolution is to keep HTTP as
@@ -202,18 +209,20 @@ authentication and only expose tenant IDs as low-level escape hatches.
 ## Runtime Semantics
 
 Append is serialized per session and produces contiguous session-local `seq`
-values. `append-and-fetch` writes one event and returns a recent-event slice in
-the same runtime operation. Idempotency is part of mutating runtime calls so
-retrying clients do not duplicate events or registrations.
+values. The canonical turn-loop path is `append` with `fetch_recent`, which
+writes one event and returns a recent-event slice in the same runtime operation;
+the older `append-and-fetch` call is deprecated in favor of it. Idempotency is
+part of mutating runtime calls so retrying clients do not duplicate events or
+registrations.
 
 Fork creates a child session with fresh child-local sequence numbers and replay
 visibility over parent events through the fork point. Replay is explicit and
 fork-aware. Deep fork chains can be collapsed by materializing the non-leaf
 replay prefix into durable content and replaying that prefix plus the leaf tail.
 
-Tenant, session, and agent watch returns changefeed items with cursors for
-higher-level consumers. Fork creation is emitted as a first-class fork-edge
-control item rather than by re-emitting ancestor events.
+The single tenant-scoped `GET /changes` changefeed returns ledger-ordered items
+with `ledger:` cursors for higher-level consumers. Fork creation is emitted as a
+first-class fork-edge control item rather than by re-emitting ancestor events.
 
 Fork-aware feeds are feeds over a DAG of per-session sub-streams. Each physical
 event is emitted once on the session where it was written. A fork emits a
@@ -340,8 +349,8 @@ archival, and artifact flows.
 
 Python and TypeScript are the maintained SDKs. They should make the common
 agent path feel natural: create or open a workspace, create or open an agent,
-create or open a session, append events, fetch context, store artifacts, search
-records, and watch progress.
+create or open a session, append events, fetch recent context, store artifacts,
+and tail the `changes` changefeed for progress.
 
 The SDKs should keep tenant scope out of normal app code. Authenticated
 deployments should derive it from user-info metadata; local development can use

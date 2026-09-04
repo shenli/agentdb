@@ -1,7 +1,8 @@
 # agentdb (Python)
 
-Python client for AgentDB, the runtime database for agent sessions, artifacts,
-records, replay, and context.
+Python client for AgentDB, the runtime database for agent sessions, events,
+artifacts, replay, and fork. Records and context assembly are optional Labs
+features (start the server with `serve --labs`).
 
 ## Install
 
@@ -61,17 +62,25 @@ asyncio.run(main())
 
 ## Core Surface
 
-- `AgentDB.workspace`, `AgentDB.session_by_id`
-- `Workspace.agent`, `Workspace.agent_by_id`, `Workspace.session_by_id`, `Workspace.changes`
-- `Workspace.artifacts`, `Workspace.records`
+- `AgentDB.workspace`, `AgentDB.open_session`, `AgentDB.session_by_id`
+- `Workspace.agent`, `Workspace.agent_by_id`, `Workspace.session_by_id`, `Workspace.changes`, `Workspace.search_events`
+- `Workspace.artifacts`
 - `AgentHandle.session`, `AgentHandle.session_by_id`
 - `SessionHandle.append`, `append_user`, `model_message`, `tool_call`, `tool_result`, `context_pack_built`
-- `SessionHandle.fetch`, `fetch_recent`, `replay`, `materialize_replay_prefix`, `fork`, `context`
-- `SessionHandle.artifacts`, `records`
+- `SessionHandle.fetch`, `fetch_recent`, `replay`, `fork`
+- `SessionHandle.artifacts`
 - `event_ref`, `artifact_ref`
 
+## Labs Surface
+
+Available only when the server runs with `serve --labs`:
+
+- `Workspace.records`, `SessionHandle.records` — searchable records
+- `SessionHandle.context` — context assembly over the session log
+- `SessionHandle.materialize_replay_prefix`
+
 IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
-`art_*`, `rec_*`, and `skl_*`. Mutating SDK calls generate an
+`art_*`, and `rec_*`. Mutating SDK calls generate an
 `Idempotency-Key` only when `idempotency_key` is supplied. This keeps the
 default append path eligible for server-side same-session batching; reuse an
 explicit key when the caller may retry a mutation.
@@ -111,9 +120,10 @@ Concept mapping:
 | wake/resume handle | `agent.session_by_id(...)` |
 | get events | `session.fetch(...)` |
 | append event | `session.append(...)` |
-| append and fetch | `session.append_and_fetch(...)` |
+| append and fetch recent tail | `session.append(..., fetch_last_n=N)` |
 | fork session | `session.fork(...)` |
-| build context | `session.context(...)` |
+| search past events | `workspace.search_events(...)` |
+| build context (Labs) | `session.context(...)` |
 | workspace/session changefeed | `workspace.changes(...)` |
 
 Use `from_seq=last_seen_seq + 1` when reconnecting a subscription to avoid

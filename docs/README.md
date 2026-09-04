@@ -12,9 +12,6 @@ public docs path.
   workload requirements, positioning, and systems rationale
 - [design/design.md](design/design.md) - durable design commitments,
   implementation status, constraints, and non-goals
-- [design/product-simplification-proposal.md](design/product-simplification-proposal.md)
-  - proposal to narrow the first supported product to durable sessions, events,
-  artifacts, replay, fork, and a single changefeed
 - [product-roadmap.md](product-roadmap.md) - product progress, remaining gaps,
   deliberately out-of-scope work, and open questions
 - [design/architecture.md](design/architecture.md) - current crate
@@ -30,8 +27,6 @@ public docs path.
 - [design/encryption-at-rest.md](design/encryption-at-rest.md) - encryption at
   rest and BYOK threat model, key hierarchy, rotation semantics, code-change
   map, rollout plan, and validation requirements
-- [agentdb-messaging-house.md](agentdb-messaging-house.md)
-  - product positioning and value-prop messaging framework
 
 ## Run And Operate
 
@@ -53,6 +48,8 @@ public docs path.
   single-node upgrade, verification, and rollback procedure
 - [operations/storage-maintenance.md](operations/storage-maintenance.md) -
   storage inspection, compaction, and sizing checks
+- [operations/storage-backpressure.md](operations/storage-backpressure.md) -
+  object-store content mirror backlog, throttling, and reconcile
 - [operations/disk-full-recovery.md](operations/disk-full-recovery.md) -
   response procedure for full runtime or backup volumes
 - [operations/routine-maintenance.md](operations/routine-maintenance.md) -
@@ -103,10 +100,8 @@ small repo-wide entrypoints.
 
 ## Validation And Release
 
-- [stability-test-plan.md](stability-test-plan.md) - deterministic, hardening,
-  and seeded-chaos validation plan
-- [stability-findings-2026-05.md](stability-findings-2026-05.md) - May 2026
-  stability findings and mitigation status
+- [testing/testing-evidence-contract.md](testing/testing-evidence-contract.md)
+  - the evidence a change must carry to be considered validated
 - [release-checklist.md](release-checklist.md) - public-release and tag
   readiness checklist
 

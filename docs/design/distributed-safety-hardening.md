@@ -358,9 +358,6 @@ is:
    until an equivalent self-hosted recovery procedure has passed destructive
    drills.
 
-This sequence is expanded in
-[`metadata-self-hosting.md`](metadata-self-hosting.md).
-
 ## Explicit Non-Goals
 
 This hardening plan does not add:

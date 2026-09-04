@@ -21,19 +21,24 @@ For the conceptual motivation and positioning, see
 - Local single-node runtime modes: in-memory development and RocksDB-backed
   metadata with separate content backends for artifacts, segments, archives, and
   replay prefixes.
-- Fork and replay: pointer forks, fork-aware replay, bounded ancestor reads,
-  replay scan stats, and durable replay-prefix materialization exposed through
-  core, HTTP, and SDK methods.
+- Fork and replay: pointer forks, fork-aware replay, bounded ancestor reads, and
+  replay scan stats exposed through core, HTTP, and SDK methods. Durable
+  replay-prefix materialization is a Labs feature (opt-in via `serve --labs`).
 - Sandbox snapshot references: `SnapshotRef` / `SnapshotLayer` metadata on
   sessions, resume resolution across fork chains, dangling/expired ref fallback
   semantics, and the external sandbox-service contract.
-- Watch and export feeds: tenant/agent/session `watch`,
-  frontier cursors, fork-edge control items, commit-ordered durable
-  `export_watch`, export backfill, and managed export consumers with validated
-  retained cursors plus claim/ack/rewind.
-- Record retrieval substrate: durable base records, source refs, local/global
-  indexes, commit-sequence visibility repair, metadata filters,
-  and SDK commit-sequence propagation.
+- Changefeed and export: a single ledger-ordered `GET /api/tenants/{t}/changes`
+  changefeed carrying events and `fork_edge` control items under `ledger:`
+  cursors, export backfill, and client-side export checkpoints (consumers hold
+  their own resume cursor and advance it only after a sink accepts a batch).
+- Record retrieval substrate (Labs; opt-in via `serve --labs`, 404 by default):
+  durable base records, source refs, local/global indexes, commit-sequence
+  visibility repair, metadata filters, and SDK commit-sequence propagation.
+- App surface additions: `POST /api/sessions/open`, `fetch_recent` on append
+  (append-and-fetch deprecated), `GET /metrics`,
+  `GET /api/tenants/{t}/events/search`, bulk `POST /api/tenants/{t}/events/batch`,
+  the `agentdb import` offline importer, and Core/Labs/Internal route tiering
+  (Labs routes opt-in via `serve --labs`, 404 by default).
 - Policy, lifecycle, and cleanup: quota/backpressure, warm/cold/archive
   lifecycle, archive restore, retention, legal hold, derivative-only artifact
   purge, and policy/GC workers.
@@ -82,15 +87,14 @@ For the conceptual motivation and positioning, see
   ClickHouse/ClickStack/JSONL/Parquet operator guidance exists, but
   sink-specific diagnostics and examples still need more polish.
 - **Framework adapters.** Proofs exist. More adapters should show real recovery:
-  crash/restart, idempotent retry, artifact recovery, fork, and watch/export
+  crash/restart, idempotent retry, artifact recovery, fork, and changefeed/export
   consumption in one documented flow.
 - **Session-history demo.** The canonical demo is the developer's own Claude
   Code and Codex history, imported by `agentdbctl` — real sessions, not a
   synthetic app — explored through the MCP adapter (replay and search) and the
   dashboard timeline. The release smoke test is the recovery loop (append,
   crash, resume, artifact recovery, replay, fork) run against those imported
-  sessions. See
-  [`design/product-simplification-proposal.md`](design/product-simplification-proposal.md).
+  sessions.
 - **Distributed/tablet operation.** The codebase has substantial evaluation
   machinery, but the production-default posture is still single-node. The
   distributed story needs a clear OSS/managed boundary, stable operator
