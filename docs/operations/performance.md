@@ -1,26 +1,33 @@
 # AgentDB Performance Notes
 
-These numbers come from a single laptop. They are meant to ground the
-README and give a rough sense of what the prototype can do — not to
-make competitive claims against real databases.
+These numbers come from a single machine. They are meant to ground the
+README and give a rough sense of what the prototype can do — not to make
+competitive claims against tuned databases. The headline append / fork /
+vector numbers below were refreshed on a Linux workstation (2026-09-04);
+a few architectural micro-benchmarks further down (tier transitions,
+session lifecycle, M9–M12) still carry their original Apple M5 laptop
+measurements and are labeled where that is the case.
 
 ## Setup
 
 | | |
 |---|---|
-| Hardware | Apple M5 laptop, 16 GB RAM |
-| OS | Darwin 25.4.0 (arm64) |
+| Hardware | Intel Core i7-14700KF (20 cores / 28 threads), 32 GB RAM |
+| OS | Ubuntu 22.04.5 LTS (Linux 6.8, x86-64) |
 | Build | `cargo build --release -p agentdb-server` |
-| Storage | RocksDB on local SSD, object store = local FS |
-| Server | 4 boxes, 1 process, default Tokio multi-threaded runtime |
-| Client | Go 1.26 probe, HTTP keep-alive, single process |
-| Workload | `append_and_fetch` with 256-byte payload, `fetch_last_n=5` |
+| Storage | RocksDB on local NVMe SSD (ext4), object store = local FS |
+| Server | single `agentdb serve --dev` process, default Tokio multi-threaded runtime |
+| Client | `perf-probe` (Go), HTTP keep-alive, single process |
+| Workload | `append-and-fetch` with 256-byte payload, `last=5` |
 
 All runs use the same hardware and default server config unless noted.
 The server, probe, and shell are colocated on localhost, so latency
-numbers include loopback TCP round-trip (~50 µs on this box).
+numbers include loopback TCP round-trip. Unlike the earlier macOS laptop
+rig, `fsync` on this Linux/NVMe box forces a real device flush, so the
+durability numbers below reflect genuine sync cost rather than a
+page-cache write.
 
-## Durable by default (2026-08-30)
+## Durable by default (2026-09-04)
 
 Acknowledged appends now fsync the RocksDB WAL by default
 (`AGENTDB_ROCKSDB_SYNC_WRITES=0` opts out). Group commit is backlog-aware:
@@ -28,23 +35,28 @@ an idle append pays only its own sync; under concurrency the writer
 coalesces the queue into one synced batch (2 ms window,
 `AGENTDB_APPEND_GROUP_COMMIT_BACKLOG_US`).
 
-Reference numbers, Apple M5 laptop, release build, 256-byte payloads,
-Python thread-pool client over loopback (client overhead included; macOS
-fsync does not force platter flush, so absolute sync cost is optimistic —
-Linux numbers will differ):
+Reference numbers, li-dev (i7-14700KF, NVMe), release build, 256-byte
+payloads, `perf-probe` over loopback (client overhead included; on this
+Linux/NVMe box `fsync` forces a real device flush, so sync cost is not
+free):
 
 | Mode | Workers | Throughput | p50 | p99 |
 |---|---:|---:|---:|---:|
-| fsync on (default) | 1 | 426/s | 2.40 ms | 4.18 ms |
-| fsync on (default) | 32 | 3,470/s | 8.87 ms | 17.19 ms |
-| fsync off (opt-out) | 1 | 423/s | 2.31 ms | 4.62 ms |
-| fsync off (opt-out) | 32 | 1,846/s | 13.67 ms | 59.69 ms |
+| fsync on (default) | 1 | 7,492/s | 0.11 ms | 0.57 ms |
+| fsync on (default) | 32 | 32,890/s | 0.76 ms | 3.46 ms |
+| fsync off (opt-out) | 1 | 6,809/s | 0.12 ms | 0.60 ms |
+| fsync off (opt-out) | 32 | 46,025/s | 0.58 ms | 2.23 ms |
 
-Two observations: single-writer latency is unchanged by the durable
-default (the backlog-aware window adds no idle wait), and under
-concurrency the durable path is *faster* — group commit turns 32
-contending writers into large synced batches, while the non-durable
-direct path degrades under CAS contention.
+Two observations: single-writer latency is essentially unchanged by the
+durable default (the backlog-aware window adds no idle wait — 0.11 vs
+0.12 ms p50), and under concurrency the durable path costs throughput —
+at 32 workers `fsync` on sustains ~33k/s against ~46k/s with `fsync`
+off, because each synced batch pays a real NVMe flush. Group commit
+keeps that cost bounded by coalescing the 32 contending writers into
+shared synced batches, so the durable p99 stays at 3.5 ms rather than
+blowing out. (This is the opposite ordering from the earlier macOS
+laptop run, where `fsync` looked *free* because macOS does not force a
+platter flush; that comparison was misleading and is superseded here.)
 
 Crash safety is regression-tested by
 `ops/local-ci/tests/auto/S14_acknowledged_appends_survive_sigkill.sh`:
@@ -55,44 +67,46 @@ dm-flakey rig, tracked as follow-up.)
 
 ## Throughput scaling
 
-`tools/workload/cmd/perf-probe` spins N workers that each loop
-`append_and_fetch` against one of 8 tenants (worker `i` uses tenant
-`t-perf-{i mod 8}` and session `s-w{i}`). 15-second runs, warm
-server, no faults or tier transitions.
+`tools/workload/cmd/perf-probe` spins N workers that each open their own
+session (spread across 8 tenants) and loop `append-and-fetch` on it.
+15-second runs, warm server, no faults or tier transitions.
 
-| Concurrency | Requests | Errors | RPS   | p50     | p90     | p99     | max     |
-|------------:|---------:|-------:|------:|--------:|--------:|--------:|--------:|
-|           1 |    9 314 |      0 |   621 |  1.6 ms |  2.8 ms |  3.2 ms |  5.9 ms |
-|           4 |   27 945 |      0 | 1 863 |  2.1 ms |  4.1 ms |  5.2 ms |  9.0 ms |
-|          16 |   60 678 |      0 | 4 043 |  3.3 ms |  7.8 ms | 14.4 ms |105.2 ms |
-|          64 |   95 121 |      0 | 6 334 |  9.1 ms | 18.0 ms | 28.2 ms | 83.0 ms |
+| Concurrency | Requests | Errors | RPS    | p50     | p90     | p99     | max     |
+|------------:|---------:|-------:|-------:|--------:|--------:|--------:|--------:|
+|           1 |  112 379 |      0 |  7 492 | 0.11 ms | 0.18 ms | 0.57 ms |  1.7 ms |
+|           4 |  211 458 |      0 | 14 097 | 0.20 ms | 0.52 ms | 0.92 ms | 17.7 ms |
+|          16 |  542 257 |      0 | 36 150 | 0.33 ms | 0.74 ms | 1.85 ms | 13.2 ms |
+|          32 |  493 405 |      0 | 32 890 | 0.76 ms | 1.70 ms | 3.46 ms | 30.5 ms |
+|          64 |  543 939 |      0 | 36 259 | 1.41 ms | 3.07 ms | 6.16 ms | 20.6 ms |
 
-**Reading the numbers:** throughput scales roughly linearly up to
-c=16 (FNV-1a routes the 8 tenants across 4 boxes, so most workers
-don't contend on the same box write_lock). At c=64 the box locks and
-single RocksDB instance become the bottleneck; RPS plateaus ~6.3k and
-tail latency climbs into the tens of ms. Zero HTTP errors at any
+**Reading the numbers:** throughput climbs from 7.5k rps (c=1) to ~36k
+rps by c=16, then plateaus — a single RocksDB writer with backlog-aware
+group commit serializes durable appends, so beyond ~16 concurrent
+writers RPS holds in the 33–36k band while latency grows with the queue
+depth (p50 0.33 → 1.41 ms from c=16 to c=64). Zero HTTP errors at any
 concurrency once keep-alive is actually reused (see "Gotchas" below).
 
 ## Fork latency
 
-100 sequential `POST /api/sessions/parent/fork` calls against a single
-parent session seeded with 20 events:
+100 sequential `POST .../fork` calls against a single parent session
+seeded with 20 events (`perf-probe -mode fork`):
 
 | metric | value |
 |--------|------:|
-| mean | 0.52 ms |
-| p50  | 0.20 ms |
-| p90  | 0.25 ms |
-| p99  | 0.36 ms |
-| max  | 31.8 ms |
+| mean | 0.15 ms |
+| p50  | 0.13 ms |
+| p90  | 0.16 ms |
+| p99  | 0.43 ms |
+| max  | 0.70 ms |
 
 Fork is cheap because it does not copy events — it writes one new
-`Session` record with a `ForkRef` pointer to the parent. The outlier
-(~32 ms) is likely a GC or compaction pause; 99% of forks clear in
-under 400 µs.
+`Session` record with a `ForkRef` pointer to the parent. On li-dev every
+one of the 100 forks cleared in under 0.7 ms; the earlier laptop run
+showed a lone ~32 ms GC/compaction outlier, but this run had none.
 
 ## Tier transition latency
+
+*(Apple M5 laptop; not yet re-run on li-dev.)*
 
 Forced cold/warm transitions via `POST /api/admin/tier/force`, varying
 session size (payload ~500 bytes per event):
@@ -109,6 +123,8 @@ writing it to the object store; reactivation is mostly the segment
 read and a few batched KV puts.
 
 ## Session lifecycle — end-to-end
+
+*(Apple M5 laptop; not yet re-run on li-dev.)*
 
 A 90-second run of the built-in Go workload
 (`tools/workload/config.yaml`, 2 personas at 6 and 3 tickets/min) with
@@ -146,21 +162,22 @@ top-k = 10. The HNSW index is built once outside the measured region
 numbers come from an inline reference implementation in the same
 bench.
 
-| impl                     | median latency | vs brute force |
-|--------------------------|---------------:|---------------:|
-| brute force (reference)  |       2.39 ms  |          1.00× |
-| HNSW (`instant-distance`)|       0.77 ms  |          3.1×  |
+| impl                  | median latency | vs brute force |
+|-----------------------|---------------:|---------------:|
+| brute force (reference)|      2.53 ms  |          1.00× |
+| HNSW (`hnsw_rs`)      |       1.02 ms  |          2.5×  |
 
 Recall@10 (overlap between HNSW top-10 and brute-force top-10, averaged
-over 100 queries) at default `ef_construction=100`: **0.85**.
+over 100 queries) at default `ef_construction=ef_search=100`: **0.58**.
 
 **Caveat:** pseudo-random 384-dim vectors concentrate all cosine
 similarities near 0, so the "true" top-10 has tightly-bunched scores
-that are inherently hard for any ANN. Real embedding distributions
-(sentence transformers, CLIP, etc.) have much more cluster structure
-and typically recall ≥ 0.95 at the same settings. Setting `AGENTDB_HNSW_EF=400` before the bench gives roughly the same
-recall on this random workload — the improvement is small because the
-data itself has no structure to exploit.
+that are inherently hard for any ANN — the low recall here is a property
+of structureless data, not the index. Real embedding distributions
+(sentence transformers, CLIP, etc.) have much more cluster structure and
+typically recall far higher at the same settings. Raise
+`AGENTDB_HNSW_EF` to trade latency for recall; on this random workload
+the gain is small because the data itself has no structure to exploit.
 
 Reproduce:
 ```bash
@@ -320,20 +337,24 @@ accidentally reuse state.
 ## Reproducing
 
 ```bash
-# Build everything
+# Build the server and the probe
 cargo build --release -p agentdb-server
-(
-  cd tools/workload
-  go build -o perf-probe ./cmd/perf-probe
-  go build -o agentdb-workload ./cmd/agentdb-workload
-)
+(cd tools/workload && go build -o perf-probe ./cmd/perf-probe)
 
-# Throughput suite (c=1,4,16,64, 15 s each)
-DURATION=15 bash ops/perf/scripts/perf_suite.sh
+# Throughput sweep + durable-on rows (c=1,4,16,32,64, 15 s each).
+# perf_suite.sh starts its own `agentdb serve --dev` on a fresh data dir.
+DURATION=15 CONCURRENCY="1 4 16 32 64" bash ops/perf/scripts/perf_suite.sh
 
-# Lifecycle run with the Go persona workload (aggressive tiering)
-AGENTDB_T_COLD_SECS=3 AGENTDB_TICK_SECS=1 \
-    bash ops/perf/scripts/perf_run.sh persona_lifecycle 90
+# Durability opt-out rows (fsync off)
+AGENTDB_ROCKSDB_SYNC_WRITES=0 DURATION=15 CONCURRENCY="1 32" \
+    OUT_DIR=perf-out-nosync bash ops/perf/scripts/perf_suite.sh
+
+# Fork latency — needs a running server:
+#   ./target/release/agentdb serve --dev --data-dir /tmp/adb-fork &
+tools/workload/perf-probe -mode fork -fork-seed 20 -fork-n 100
+
+# Vector search (HNSW vs brute force, recall@10)
+cargo bench -p agentdb-index --bench vector_bench
 ```
 
 Outputs land in `perf-out/`:
