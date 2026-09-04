@@ -6115,12 +6115,21 @@ impl Runtime {
                     format!("{}", req.tenant_id),
                 ));
             }
-            if req.at_seq >= parent.next_seq {
+            // `u64::MAX` is the "fork here" sentinel the API sends when the
+            // caller omits at_seq: fork at the parent's current tip so the child
+            // inherits the full committed history. An explicit at_seq forks at
+            // an earlier point (rewind-and-branch).
+            let at_seq = if req.at_seq == u64::MAX {
+                parent.next_seq.saturating_sub(1)
+            } else {
+                req.at_seq
+            };
+            if at_seq >= parent.next_seq {
                 return Err(Error::new(
                     ErrorCode::InvalidCursor,
                     format!(
                         "fork at_seq {} is outside parent session next_seq {}",
-                        req.at_seq, parent.next_seq
+                        at_seq, parent.next_seq
                     ),
                 ));
             }
@@ -6142,7 +6151,7 @@ impl Runtime {
             });
             child.forked_from = Some(ForkRef {
                 session_id: parent.session_id,
-                at_seq: req.at_seq,
+                at_seq,
             });
             child.policy_version = parent.policy_version;
             // Reserve the alias under the lock so a concurrent fork/create

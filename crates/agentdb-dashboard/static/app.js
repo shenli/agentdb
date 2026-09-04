@@ -89,6 +89,30 @@ function bindSearchControls() {
       }
     });
   });
+
+  // Reconnect when the bearer token is entered. On a token-secured instance the
+  // overview loads once on page open — before a token exists — and the token is
+  // never persisted (cleared on reload), so without this the fleet panels stay
+  // empty. Re-run the current view's loaders (debounced) once a token is typed.
+  const tokenEl = $("token");
+  if (tokenEl) {
+    const reloadForToken = () => {
+      if (!tokenEl.value.trim()) return;
+      if (isSessionView()) {
+        loadSessionView();
+      } else {
+        loadOverview();
+      }
+    };
+    let tokenReloadTimer = null;
+    // `input` (debounced) covers typing/paste; `change` covers blur and
+    // password-manager autofill, which may not fire `input`.
+    tokenEl.addEventListener("input", () => {
+      if (tokenReloadTimer) clearTimeout(tokenReloadTimer);
+      tokenReloadTimer = setTimeout(reloadForToken, 400);
+    });
+    tokenEl.addEventListener("change", reloadForToken);
+  }
 }
 
 function dispatch(action) {
@@ -280,6 +304,10 @@ async function loadSessionView() {
     if (view.mode !== "session") return;
     await loadOverview();
     selectTenant(view.tenantId);
+    // selectTenant() clears the session field (it selects a tenant only), so
+    // restore the session from the URL before the session-scoped loaders run —
+    // otherwise readConfig() throws "session_id is required".
+    $("sessionId").value = view.sessionId;
     const session = (state.sessionsByTenant[view.tenantId] || []).find((item) => item.session_id === view.sessionId);
     if (session) {
       $("agentId").value = session.agent_id || "";
@@ -333,8 +361,22 @@ async function loadSessionStorage() {
     renderOverview();
     renderStorageDetail();
   } catch (err) {
+    // Tiered storage / lifecycle is a Labs feature: when Labs is disabled the
+    // route 404s. Degrade quietly (leave the storage panel blank) instead of
+    // erroring the whole session view — the event timeline still loads.
+    if (isNotFound(err)) {
+      state.sessionStorage = null;
+      renderStorageDetail();
+      return;
+    }
     fail(err);
   }
+}
+
+// True when a request failed with HTTP 404 — e.g. a Labs-only route that is not
+// mounted. `request()` throws `Error("404 …")`, so the status leads the message.
+function isNotFound(err) {
+  return /^404\b/.test(String(err && err.message ? err.message : err));
 }
 
 async function transitionLifecycle(target) {
@@ -899,8 +941,39 @@ function empty(text) {
 }
 
 function fail(err) {
+  const message = String(err && err.message ? err.message : err);
+  // On a token-secured instance the dashboard's eager load runs before a token
+  // is entered, so it 401s. Show a prompt (not a raw error), and reveal the
+  // Bearer token field — it lives inside the collapsed "Advanced API controls"
+  // section, so it's easy to miss. Entering the token reloads (see
+  // bindSearchControls).
+  if (/^401\b/.test(message) && !$("token").value.trim()) {
+    setConnection("enter token");
+    setRaw(
+      "This instance requires a bearer token. Paste it into the Bearer token field (just revealed) to connect."
+    );
+    revealTokenField();
+    return;
+  }
   setConnection("error");
-  setRaw(String(err && err.message ? err.message : err));
+  setRaw(message);
+}
+
+let tokenFieldRevealed = false;
+// Open the collapsed "Advanced API controls" section and focus the token field,
+// once, so a first-time visitor to a secured instance can find where to
+// authenticate instead of staring at a 401.
+function revealTokenField() {
+  if (tokenFieldRevealed) return;
+  tokenFieldRevealed = true;
+  const tokenEl = $("token");
+  if (!tokenEl) return;
+  const details = tokenEl.closest("details");
+  if (details) details.open = true;
+  try {
+    tokenEl.scrollIntoView({ block: "center", behavior: "smooth" });
+  } catch (_) {}
+  tokenEl.focus();
 }
 
 function setConnection(text) {

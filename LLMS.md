@@ -22,9 +22,11 @@ operations**.
 
 AgentDB is an **agent-native runtime database**. It stores the
 events your agent produces (thoughts, tool calls, tool outputs,
-user turns) in **sessions**, plus artifacts, searchable records,
-fork lineage, replay streams, and context packs. One
-runtime surface, one agent memory model.
+user turns) in **sessions**, plus artifacts, fork lineage, and
+replay streams, with a commit-ordered changefeed and scoped event
+search over it all. Searchable **records** and **context packs**
+are optional Labs features (start the server with `serve --labs`).
+One runtime surface, one agent memory model.
 
 You talk to it through the native HTTP API:
 
@@ -42,11 +44,13 @@ You talk to it through the native HTTP API:
 | **agent** | Runtime actor under a workspace. Sessions belong to agents. |
 | **session** | A linear sequence of events. The unit of working memory for an agent. SDKs let you create sessions by stable aliases while the server assigns canonical `ses_*` IDs. |
 | **event** | One typed JSON envelope you appended. Server assigns `event_id`, `seq`, and `created_at_ms`; your data lives under `payload`. |
-| **`append-and-fetch`** | The hot-path primitive: write one event, return the last N events of the same session, in one round trip. |
+| **append + fetch-recent** | The hot-path primitive: `append` one event and, with `fetch_last_n=N`, get the last N events of the same session in one round trip. |
 | **fork** | Create a child session that inherits the parent's events at fork time, MVCC-backed. Use to branch into "what if" timelines without copying. |
-| **records** | Searchable durable facts linked back to source events or artifacts. |
+| **changefeed** | One commit-ordered feed of everything (events + fork edges), read at `GET .../changes` with a resumable cursor. The way to observe or stream a workspace. |
+| **event search** | Text search over an agent's past events (`GET .../events/search`) — "did I already handle this?" |
 | **artifacts** | Larger binary/text objects referenced from events instead of being inlined into payloads. |
-| **context pack** | A recorded bundle of selected context with source references, so prompts are reproducible. |
+| **records** *(Labs)* | Searchable durable facts linked back to source events or artifacts. Requires `serve --labs`. |
+| **context pack** *(Labs)* | A recorded bundle of selected context with source references, so prompts are reproducible. Requires `serve --labs`. |
 
 ---
 
@@ -102,9 +106,12 @@ parent's history up to the fork point (MVCC-backed, no copy);
 subsequent writes diverge.
 
 ```python
-branch = session.fork("ticket-42-branch-a")
+branch = session.fork("ticket-42-branch-a")   # forks at the parent's tip
 branch.append({"role": "user", "text": "try the refund path"})
 ```
+
+By default `fork` branches at the parent's current tip, so the child inherits
+the full history. Pass `at_seq=N` to rewind and branch from an earlier point.
 
 Know where inherited history shows up: `append`/`fetch` on the
 child return only events written to the child itself (its working
@@ -113,41 +120,35 @@ tail), while **replay** (`GET .../sessions/{id}/replay`) and
 parent prefix plus child events. Use replay/context when the
 branch needs the pre-fork conversation.
 
-### 3.3 Search records
+### 3.3 Search your past events
 
-Use records for durable facts you want to retrieve later. Records
-can carry source refs back to the events or artifacts that produced
-them.
+Ask what an agent already did — the core "have I handled this
+before?" path. It scans event kind + payload text; narrow with a
+session or agent to keep it cheap.
 
 ```python
-record = workspace.records.write(
-    namespace=["support"],
-    text="Checkout retry is safe after inventory lock timeout.",
-    source_refs=[result.ref()],
-)
-matches = workspace.records.search(
-    namespace=["support"],
-    text="checkout retry safe",
-    limit=5,
-)
+matches = workspace.search_events("checkout retry", limit=5)
+for m in matches:
+    print(m["event"]["kind"], m["score"])
 ```
 
-Search is eventually consistent by default (an async indexer
-feeds the global index). For read-your-writes — search right
-after a write — pass the write's commit token: the HTTP write
-response carries `X-AgentDB-Record-Commit-Seq`, and search
-accepts it back as `min_visible_record_commit_seq`, which
-forces a consistent view at least that fresh. SDK record
-handles carry this token for you.
+Pass `session=...` or `agent=...` to search one session or one
+agent's sessions instead of the whole workspace. This searches the
+durable event log; it is distinct from records search (Labs, §3.6).
 
-### 3.4 Build context
+### 3.4 Follow the changefeed
 
-Context packs record what an agent selected for a prompt. That
-makes future replay/debugging possible because the prompt context
-has provenance.
+`changes` is the one commit-ordered feed of everything that
+happened — events and fork edges — for dashboards, supervisors,
+evaluators, or a second agent. Resume from a cursor; it long-polls
+for new items.
 
 ```python
-pack = session.context(max_events=20, include=["recent_events", "records"])
+page = workspace.changes(limit=100)
+for item in page["items"]:
+    if item["object_type"] == "event":
+        handle(item["data"])
+cursor = page.get("next_cursor")  # persist and pass back next time
 ```
 
 ### 3.5 Health probe
@@ -159,6 +160,31 @@ claimed.
 ```
 GET /health/ready
 ```
+
+### 3.6 Labs operations (records, context)
+
+These are **Labs** features: they only exist when the server is
+started with `serve --labs`, and return `404` otherwise. Records
+are searchable durable facts; context packs assemble a reproducible
+prompt bundle over the session log.
+
+```python
+# records — durable facts with source refs, an async global index
+record = workspace.records.write(
+    namespace=["support"],
+    text="Checkout retry is safe after inventory lock timeout.",
+    source_refs=[result.ref()],
+)
+matches = workspace.records.search(namespace=["support"], text="checkout retry safe", limit=5)
+
+# context — assemble a prompt bundle over the session log
+pack = session.context(max_events=20, include=["recent_events", "records"])
+```
+
+For read-your-writes on records (search right after a write), pass
+the write's commit token: the response carries
+`X-AgentDB-Record-Commit-Seq` and search accepts it back as
+`min_visible_record_commit_seq`. SDK record handles carry it for you.
 
 ---
 
@@ -248,6 +274,9 @@ agent should know:
 - **Working examples**:
   [`examples/agents/python/quickstart.py`](examples/agents/python/quickstart.py)
   is a 60-line three-turn agent loop;
+  [`examples/agents/python/resume.py`](examples/agents/python/resume.py) shows
+  the flagship crash-and-resume flow (checkpoint canonical IDs → new process →
+  continue from durable history);
   [`examples/agents/python/async_quickstart.py`](examples/agents/python/async_quickstart.py)
   shows the async variant with parallel writes.
 - **Why this database exists** (motivation, requirements,

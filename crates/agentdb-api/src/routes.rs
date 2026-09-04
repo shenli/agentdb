@@ -6870,7 +6870,9 @@ async fn fork_session(
             .fork_session(ForkSessionRequest {
                 tenant_id: fork_tid,
                 session_id: fork_sid,
-                at_seq: body.at_seq,
+                // Omitted at_seq -> fork at the parent tip (the runtime resolves
+                // the u64::MAX sentinel against the parent's next_seq).
+                at_seq: body.at_seq.unwrap_or(u64::MAX),
                 alias: body.alias,
             })
             .await

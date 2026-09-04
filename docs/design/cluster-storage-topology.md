@@ -922,7 +922,7 @@ Raft committed entry
   -> apply tablet command
   -> write base tablet state
   -> write tablet-local changefeed/outbox row with applied_index
-  -> publish watch/changefeed item after local visibility
+  -> publish `/changes` changefeed item after local visibility
 ```
 
 Changefeed cursors should include enough information to survive movement:
@@ -1304,8 +1304,8 @@ changefeed, compaction, and split/merge lifecycle.
    - restore can include or rebuild tablet-local changefeed state
    - split/merge/migration publish cutover epochs without duplicate events
 
-   Current implementation status: routed watch requests run inside the tablet
-   context and emitted changefeed items include `cell_id`,
+   Current implementation status: routed `/changes` changefeed requests run
+   inside the tablet context and emitted changefeed items include `cell_id`,
    `placement_scope_id`, `tablet_id`, `tablet_epoch`, and `applied_index` when
    the node can resolve them. Cursor strings are versioned and include the same
    provenance. Split/merge publish cutover epochs remain higher-level lifecycle
@@ -1425,8 +1425,8 @@ lifecycle validation:
 1. Prove process restart from persisted raft-engine and KV directories.
 2. Add an explicit tablet replacement flow, including replacement from
    checkpoint in the real-cluster smoke path.
-3. Add split and merge under active writes with routed watch cursor assertions
-   across the cutover epoch.
+3. Add split and merge under active writes with routed `/changes` changefeed
+   cursor assertions across the cutover epoch.
 4. Add an AZ-failure simulation for multi-AZ cells and document the expected
    single-AZ profile behavior.
 5. Add rolling restart and rolling upgrade drills per cell.

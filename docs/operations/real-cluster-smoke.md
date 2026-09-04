@@ -201,8 +201,9 @@ and catch-up smoke:
 - restarts every node one at a time and verifies writes after each restart
 - runs explicit tablet replacement prepare/complete with a source applied-index
   watermark and verifies writes through the new metadata owner
-- prepares and completes split/merge metadata cutover while asserting watch
-  cursors still observe writes committed during the prepared split window
+- prepares and completes split/merge metadata cutover while asserting the
+  `/changes` changefeed cursors still observe writes committed during the
+  prepared split window
 
 Individual probes can be run with `--restart-persistence`, `--checkpoint-replacement`,
 `--replacement`, `--az-failure`, `--rolling-restart`, or `--split-merge`.

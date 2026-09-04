@@ -155,7 +155,7 @@ runtime semantics.
 For AgentDB, this suggests a split:
 
 - The live runtime path needs strict session semantics: ordered append,
-  idempotency, replay, fork, watch, and policy.
+  idempotency, replay, fork, the `/changes` changefeed, and policy.
 - Large artifacts, cold event history, and derived searchable records should be
   designed so they can eventually sit on cheap durable storage with a cache and
   index layer above them.
@@ -179,8 +179,8 @@ Agent runtime queries cluster into a small set:
 - **Replay**: reconstruct a fork-aware event view.
 - **Scoped search**: find records or observations by tenant, namespace, scope,
   tags, metadata, and text/vector signals.
-- **Watch**: follow changes for dashboards, supervisors, or test
-  harnesses.
+- **Changefeed**: tail the single `/changes` feed for dashboards, supervisors,
+  or test harnesses.
 - **Lifecycle and policy scans**: move sessions through retention and cleanup.
 
 This concentration is a design opportunity. AgentDB does not need to be a
@@ -211,7 +211,7 @@ Agent operations aggregate naturally by session:
 - writes in one agent iteration belong to the same session
 - context loading is usually a recent session scan plus scoped records
 - debugging and replay operate on sessions and forks
-- watch streams are useful at tenant, agent, and session scope
+- the `/changes` changefeed is useful at tenant, agent, and session scope
 - artifacts and records often point back to source events
 
 Aligning APIs and storage semantics with sessions reduces coordination cost and
@@ -250,7 +250,7 @@ AgentDB therefore needs:
 
 The product is single-node first, but the tenant model is deliberate. Tenant
 boundaries are part of the architecture: routes, policies, quotas, lifecycle
-work, watch scopes, storage accounting, and placement decisions all preserve
+work, changefeed scopes, storage accounting, and placement decisions all preserve
 tenant scope. Distributed and managed deployments should extend those concepts
 instead of inventing a second product surface.
 
@@ -287,9 +287,12 @@ AgentDB's native objects are intentionally close to the runtime domain:
 - **Event**: typed append-only entry with JSON payload, sequence, idempotency,
   source refs, artifact refs, and policy metadata.
 - **Artifact**: metadata plus content bytes for large or binary payloads.
-- **Record**: searchable memory, note, observation, or retrieved context entry.
 - **Policy**: quota, lifecycle, retention, context budget, legal hold, and GC
   behavior.
+
+**Record** — searchable memory, note, observation, or retrieved context entry —
+is now a Labs feature rather than a core primitive: records and record search are
+opt-in via `serve --labs` and return 404 by default.
 
 The hot path is:
 
@@ -332,8 +335,9 @@ them can. The better question is: **what runtime guarantees does the application
 still have to build above the database?**
 
 AgentDB's claim is that agent-runtime state needs a product-level abstraction:
-tenant, agent, session, event, artifact, record, policy, replay, fork,
-watch, and lifecycle. Existing databases can implement parts of this, but they
+tenant, agent, session, event, artifact, policy, replay, fork,
+the `/changes` changefeed, and lifecycle (with records/search as a Labs feature).
+Existing databases can implement parts of this, but they
 do not expose that abstraction directly.
 
 **Wide-column stores, such as HBase.** HBase is strong when the application can
@@ -370,7 +374,7 @@ pattern:
 - Transactions exist but are bounded; broad runtime invariants still become
   application-managed protocols.
 - Streams can notify consumers of table changes, but they are not the same as a
-  session-aware replay, fork, and watch model.
+  session-aware replay, fork, and changefeed model.
 
 DynamoDB is excellent infrastructure for some keyed runtime data. AgentDB's
 value is making the agent-session semantics the API rather than asking every
@@ -433,8 +437,9 @@ architecture can make previously uneconomic product experiences practical. For
 search, the winning abstraction is not "Postgres table with embeddings"; it is a
 search-native system with different storage economics. For agent runtime state,
 the analogous abstraction is not "documents plus streams plus blob storage"; it
-is a runtime-native system with sessions, events, artifacts, records, replay,
-fork, watch, policy, and lifecycle as first-class behavior.
+is a runtime-native system with sessions, events, artifacts, replay, fork, the
+`/changes` changefeed, policy, and lifecycle as first-class behavior (records and
+search are available as a Labs feature).
 
 ### Multi-Tool Decomposition
 
@@ -467,11 +472,11 @@ have hit hard limits, and the team can sustain a storage project.
 The missing pieces are less about bytes and more about semantics:
 
 1. Native session lifecycle.
-2. Idempotent append-and-fetch for agent loops.
+2. Idempotent `append` + `fetch_recent` for agent loops.
 3. Fork-aware replay.
 4. Unified tenant policy and cleanup.
 5. Durable artifact references tied to events.
-6. Watch behavior for supervisors and dashboards.
+6. The `/changes` changefeed for supervisors and dashboards.
 7. SDK ergonomics that make the session path natural.
 
 AgentDB should earn its place by solving these cleanly.
@@ -540,9 +545,9 @@ AgentDB is intended to be a strong fit for:
 
 | Workload | Why AgentDB Should Fit |
 |---|---|
-| Agent turn loops | One append-and-fetch operation instead of several database calls |
+| Agent turn loops | One `append` + `fetch_recent` operation instead of several database calls |
 | Long-running sessions | Ordered durable history with replay and lifecycle |
-| Agent debugging | Session replay, fork, watch, and event envelopes are first-class |
+| Agent debugging | Session replay, fork, the `/changes` changefeed, and event envelopes are first-class |
 | Retry-heavy execution | Idempotency keys and ordered append are runtime semantics |
 | Large retained traces | Cold/archive storage can reduce hot database footprint |
 | Framework adapters | Adapters map to primitives instead of rebuilding them |
@@ -568,7 +573,7 @@ append event + fetch last N events
 append event + build context under budget
 replay 1k / 10k / 100k event sessions
 fork + continue
-watch active sessions
+tail the /changes changefeed for active sessions
 retain 1M / 100M / 1B events for 90 or 365 days
 restore or replay archived history
 ```

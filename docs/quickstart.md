@@ -55,6 +55,16 @@ lines as your agents write them:
 agentdbctl import claude-code --watch
 ```
 
+`agentdbctl import` streams over the API, so it works against a running or
+remote server. For a large one-shot bulk load, `agentdb import` writes directly
+into the local store instead (faster, no HTTP) — stop the server first, since
+the store is single-writer. It can also keep oversized tool outputs as
+artifacts rather than skipping them:
+
+```bash
+agentdb import codex --large-events artifact
+```
+
 ## 4. See it
 
 Open the dashboard timeline in a browser:

@@ -14,7 +14,7 @@ bin/agentdb-server
         |
         v
 crates/agentdb-api        bearer-protected tenant-scoped /api/... HTTP routes
-        |                 export/watch/backfill/consumer admin routes
+        |                 changes changefeed, export/backfill, admin routes
         |                 public liveness/readiness and embedded dashboard
         |
         v
@@ -40,7 +40,7 @@ bin/agentdbctl            operations CLI
 ```
 
 Runtime data is always tenant-scoped. Tenant IDs are the server-side boundary
-for routing, policy, quota, lifecycle, storage accounting, watch/changefeed
+for routing, policy, quota, lifecycle, storage accounting, changefeed
 visibility, and future placement. SDKs may bind that scope from authentication,
 but the runtime model remains explicitly multi-tenant.
 
@@ -84,7 +84,7 @@ durable data semantics.
 
 ## Runtime Model
 
-- **Tenant**: isolation, policy, quota, lifecycle, and watch boundary.
+- **Tenant**: isolation, policy, quota, lifecycle, and changefeed boundary.
 - **Agent**: runtime actor within a tenant.
 - **Session**: ordered event log for one run or thread. Sessions can be forked.
 - **Event**: append-only payload with tenant, agent, session, event ID, `seq`,
@@ -95,7 +95,7 @@ durable data semantics.
 - **Policy**: quota, lifecycle, retention, legal hold, and priority settings.
 
 All public IDs are opaque typed strings: `ten_*`, `agt_*`, `ses_*`, `evt_*`,
-`art_*`, `rec_*`, `skl_*`, and `pol_*`.
+`art_*`, `rec_*`, and `pol_*`.
 
 ## HTTP Surface
 
@@ -108,7 +108,7 @@ POST /api/tenants/{tenant_id}/agents
 POST /api/tenants/{tenant_id}/agents/{agent_id}/sessions
 POST /api/tenants/{tenant_id}/sessions/{session_id}/events
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/events
-POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
+POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch  # deprecated: use POST .../events with fetch_recent
 POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
@@ -152,7 +152,7 @@ tokens, and scrubs `token` / `access_token` query parameters from the URL.
 
 Hosted/authenticated deployments should provide user-info metadata so SDKs can
 bind the authenticated principal to a tenant/workspace. The server-side runtime
-still treats tenant IDs as the routing, policy, quota, lifecycle, watch,
+still treats tenant IDs as the routing, policy, quota, lifecycle, changefeed,
 storage-accounting, and admin boundary; this is SDK/API ergonomics on top of a
 multi-tenant runtime, not a tenantless data model.
 
@@ -162,7 +162,9 @@ The native HTTP API is the only client protocol.
 
 ## Record Index Consistency
 
-Record search follows DynamoDB-style secondary-index behavior:
+Records and record search are a Labs feature: they are opt-in via `serve --labs`
+and return 404 by default. When enabled, record search follows DynamoDB-style
+secondary-index behavior:
 
 - Searches with `sharding_key` use the owner-local LSI-like record index. This
   is the read-after-write path for a caller that knows the placement key.
@@ -211,16 +213,17 @@ and returns either the append result or an append-and-fetch response. Retries
 with the same `Idempotency-Key` return the same result unless the payload
 conflicts.
 
-`append-and-fetch` is the hot path for agent loops: write the current turn and
-return recent context in one request.
+`append` with `fetch_recent` is the hot path for agent loops: write the current
+turn and return recent context in one request. The older `append-and-fetch`
+endpoint is deprecated in favor of it.
 
 ## Replay, Changes, Context
 
 - `replay` reconstructs a fork-aware event view.
 - `changes` (`GET /api/tenants/{tenant_id}/changes`) is the single public
-  changefeed: commit-ordered tenant/session-scoped items over the export ledger.
-  It supersedes the removed public `watch` HTTP endpoint; the runtime watch
-  engine that feeds these cursors still exists internally.
+  changefeed: ledger-ordered tenant/session-scoped items over the export ledger,
+  addressed by `ledger:` cursors. It is the only changefeed; the earlier
+  per-session `watch`/`subscribe` endpoints have been removed.
 - `context` builds a budgeted pack from recent events, searched records, and
   policy.
 
@@ -257,10 +260,9 @@ serialized KV commit boundary in a single-tablet runtime. This orders cursor
 delivery by commit rather than by wall-clock time. Page `next_cursor`
 identifies the last delivered row; request results stop at the captured
 `high_watermark`, while metadata pagination retains one first-page
-`snapshot_high_watermark`. Managed ack/rewind verifies that a cursor is an
-actual retained row for the same tenant, scope, and include filter; metadata
-snapshot acks normalize to the captured ledger high watermark. Retained legacy
-timestamp-based cursors remain readable during migration. Snapshot-routed
+`snapshot_high_watermark`. Because consumers hold their own client-side
+checkpoint, the runtime does not track per-consumer acks; a worker simply
+re-requests from its last durable cursor after a crash. Snapshot-routed
 clusters reject export endpoints until a cross-tablet frontier is implemented.
 
 ```text
@@ -389,7 +391,6 @@ indexes during startup. A preflight applies these defaults before hydration:
 | `AGENTDB_STARTUP_MAX_SESSIONS` | 250,000 | Sessions; session aliases |
 | `AGENTDB_STARTUP_MAX_ARTIFACTS` | 250,000 | Artifact metadata |
 | `AGENTDB_STARTUP_MAX_RECORDS` | 100,000 | Records; record-index outbox rows; record commit rows |
-| `AGENTDB_STARTUP_MAX_EXPORT_CONSUMERS` | 10,000 | Managed export consumers |
 | `AGENTDB_STARTUP_MAX_TENANT_META` | 500,000 | Tenant metadata rows |
 | `AGENTDB_STARTUP_MAX_IDEMPOTENCY` | 1,000,000 | Idempotency rows |
 | `AGENTDB_STARTUP_MAX_CONTENT_OBJECTS` | 500,000 | Local content entries listed for orphan reconciliation; separate from the serialized hydration-byte total |
@@ -416,7 +417,7 @@ sealed segments, and warm-head events into one ordered event stream.
 
 ```mermaid
 flowchart TD
-    A["append / append-and-fetch"] --> B["Warm session head<br/>KvStore metadata + hot event rows"]
+    A["append + fetch_recent"] --> B["Warm session head<br/>KvStore metadata + hot event rows"]
 
     B -->|seal to cold| C["Session row<br/>lifecycle = cold<br/>warm_head_from_seq = next_seq<br/>sealed_segments = [seg_...]"]
     C --> D["ContentBackend segment blob<br/>seg_....json.enc<br/>full-fidelity events for one seq range"]
@@ -450,10 +451,11 @@ session lifecycle, storage, and restore endpoints.
   content, configured by `agentdb.toml`.
 - **Docker and Compose**: containerized single-node server with a mounted config
   file and data volume. The image contains both `agentdb` and `agentdbctl`.
-- **Observability export workers**: `agentdbctl` processes that tail managed
-  export consumers into ClickHouse/ClickStack or JSONL/Parquet archives. They
-  can run as systemd services or AWS deployment helpers and fail over through
-  consumer lease expiry.
+- **Observability export workers**: `agentdbctl` processes that tail the
+  `GET /changes` ledger changefeed into ClickHouse/ClickStack or JSONL/Parquet
+  archives. They can run as systemd services or AWS deployment helpers and hold
+  their own client-side checkpoint, advancing it only after a sink accepts a
+  batch.
 - **Helm**: evaluation-oriented Kubernetes deployment that mounts config through
   a ConfigMap and uses the same health endpoints as the binary.
 

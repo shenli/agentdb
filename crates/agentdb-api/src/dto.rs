@@ -147,7 +147,11 @@ pub struct AppendAndFetchBody {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ForkSessionBody {
-    pub at_seq: u64,
+    /// Fork point: the child inherits parent events up to and including this
+    /// seq. Omit it to fork at the parent's current tip (inherit the full
+    /// history) — the common case; pass an earlier seq to rewind-and-branch.
+    #[serde(default)]
+    pub at_seq: Option<u64>,
     #[serde(default)]
     pub alias: Option<String>,
 }
