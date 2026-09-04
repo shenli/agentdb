@@ -378,12 +378,17 @@ class AsyncSession:
         return [Event.from_dict(e) for e in data.get("events", [])]
 
     async def fork(
-        self, child_session_id: Optional[str] = None, *, at_seq: int = 0, alias: Optional[str] = None
+        self, child_session_id: Optional[str] = None, *, at_seq: Optional[int] = None, alias: Optional[str] = None
     ) -> "AsyncSession":
+        # Omit at_seq to fork at the parent's current tip (inherit the full
+        # history) — the common case. Pass an earlier seq to rewind-and-branch.
+        body: dict = {"alias": alias or child_session_id}
+        if at_seq is not None:
+            body["at_seq"] = at_seq
         data = await self._client._request(
             "POST",
             f"/api/tenants/{_quote(self.tenant_id)}/sessions/{_quote(self.session_id)}/fork",
-            json={"at_seq": at_seq, "alias": alias or child_session_id},
+            json=body,
         )
         return AsyncSession(self._client, self.tenant_id, data["session_id"], data["agent_id"])
 

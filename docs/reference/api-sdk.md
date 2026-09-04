@@ -264,6 +264,34 @@ GET  /api/tenants/{tenant_id}/exports/status
 GET  /api/admin/exports
 ```
 
+Request bodies for the two most-used mutations (the session is in the path):
+
+`POST .../events` (append):
+
+```json
+{ "agent_id": "agt_...", "kind": "message", "payload": {}, "fetch_recent": 5 }
+```
+
+- `agent_id` (**required**) — the agent that produced the event.
+- `kind` (**required**) — event kind, any string (e.g. `message`, `tool_call`).
+- `payload` (**required**) — arbitrary JSON.
+- `fetch_recent` (optional, N) — also return the last N events in the response
+  (folds in append-and-fetch). `artifact_refs` / `source_refs` /
+  `credential_refs` are optional ref arrays. Send an `Idempotency-Key` header to
+  make a retried append return the original event instead of duplicating it.
+
+`POST .../fork`:
+
+```json
+{ "alias": "branch-a", "at_seq": 7 }
+```
+
+- `at_seq` (optional) — the fork point; the child inherits parent events up to
+  and including this seq. **Omit it to fork at the parent's current tip**
+  (inherit the full history) — the common case. Pass an earlier seq to
+  rewind-and-branch.
+- `alias` (optional) — a stable child session alias.
+
 `replay` returns the stitched logical session history plus scan stats:
 `fork_depth`, `segments_scanned`, `events_scanned`, and
 `materialized_prefix`. Fork ancestor reads are bounded to the fork point
@@ -619,7 +647,7 @@ SessionHandle / Session
   fetch_recent(last_n=10)
   replay(from_seq=None, limit=100)
   materialize_replay_prefix(from_seq=None, limit=100)
-  fork(child_session_id=None, at_seq=0, alias=None)
+  fork(child_session_id=None, at_seq=None, alias=None)   # at_seq=None forks at the tip
   context(max_events=None, max_bytes=None, include=None, record_query=None)
 ```
 

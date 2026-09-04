@@ -106,9 +106,12 @@ parent's history up to the fork point (MVCC-backed, no copy);
 subsequent writes diverge.
 
 ```python
-branch = session.fork("ticket-42-branch-a")
+branch = session.fork("ticket-42-branch-a")   # forks at the parent's tip
 branch.append({"role": "user", "text": "try the refund path"})
 ```
+
+By default `fork` branches at the parent's current tip, so the child inherits
+the full history. Pass `at_seq=N` to rewind and branch from an earlier point.
 
 Know where inherited history shows up: `append`/`fetch` on the
 child return only events written to the child itself (its working
@@ -271,6 +274,9 @@ agent should know:
 - **Working examples**:
   [`examples/agents/python/quickstart.py`](examples/agents/python/quickstart.py)
   is a 60-line three-turn agent loop;
+  [`examples/agents/python/resume.py`](examples/agents/python/resume.py) shows
+  the flagship crash-and-resume flow (checkpoint canonical IDs → new process →
+  continue from durable history);
   [`examples/agents/python/async_quickstart.py`](examples/agents/python/async_quickstart.py)
   shows the async variant with parallel writes.
 - **Why this database exists** (motivation, requirements,

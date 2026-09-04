@@ -98,9 +98,10 @@ def main() -> None:
             print(f"  [{ev.seq:>3}] {actor:>9}: {text}")
         print()
 
-    # Fork: branch the agent off into an alternate timeline.
+    # Fork: branch the agent off into an alternate timeline. Fork defaults to
+    # the parent's tip, so the child inherits the full history.
     print("# Forking into an alternate timeline...")
-    branch = sess.fork(f"{SESSION_ID}-branch-a", at_seq=last_parent_seq)
+    branch = sess.fork(f"{SESSION_ID}-branch-a")
     branch_result = branch.append(
         {"role": "user", "text": "What if it were 3 + 3 instead?"},
         fetch_last_n=10,

@@ -450,7 +450,7 @@ export class SessionHandle {
     return await this.session.materializeReplayPrefix(opts);
   }
 
-  async fork(opts: { atSeq: number; alias?: string | null } | string): Promise<SessionHandle> {
+  async fork(opts: { atSeq?: number; alias?: string | null } | string): Promise<SessionHandle> {
     return new SessionHandle(this.workspace, await this.session.fork(opts), this.opts);
   }
 
@@ -941,10 +941,13 @@ export class Session {
     return Array.isArray(data.events) ? data.events.map(eventFromDict) : [];
   }
 
-  async fork(opts: { atSeq: number; alias?: string | null } | string): Promise<Session> {
-    const body = typeof opts === "string"
-      ? { at_seq: 0, alias: opts }
-      : { at_seq: opts.atSeq, alias: opts.alias ?? null };
+  async fork(opts: { atSeq?: number; alias?: string | null } | string): Promise<Session> {
+    // Omit atSeq to fork at the parent's current tip (inherit the full
+    // history) — the common case. Pass an earlier seq to rewind-and-branch.
+    const body: Record<string, unknown> =
+      typeof opts === "string"
+        ? { alias: opts }
+        : { alias: opts.alias ?? null, ...(opts.atSeq !== undefined ? { at_seq: opts.atSeq } : {}) };
     const d = await this._client._request("POST", `/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/fork`, {
       ...body,
     });
