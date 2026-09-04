@@ -723,44 +723,34 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     let mut artifact_stats = ArtifactStats::default();
     for tenant_idx in 0..config.tenants {
         let external_key = format!("bench-{run_id}-tenant-{tenant_idx}");
-        let tenant = post_json(
-            &client,
-            &args.base_url,
-            "/api/tenants",
-            &json!({
-                "external_key": external_key,
-                "policy": {"bench_run_id": run_id}
-            }),
-        )
-        .await?;
-        let tenant_id = required_str(&tenant, "tenant_id")?.to_string();
+        // The dedicated tenant/agent creation routes were retired; sessions
+        // (and their tenant + agent) are now resolved-or-created through the
+        // idempotent open endpoint. Reusing the same workspace/agent alias
+        // keeps every session under one canonical tenant and agent.
+        let mut tenant_id = String::new();
         let mut agents = Vec::new();
 
         for agent_idx in 0..config.agents_per_tenant {
-            let alias = format!("bench-agent-{tenant_idx}-{agent_idx}");
-            let agent = post_json(
-                &client,
-                &args.base_url,
-                &format!("/api/tenants/{tenant_id}/agents"),
-                &json!({
-                    "alias": alias,
-                    "config": {"bench_run_id": run_id, "agent_index": agent_idx}
-                }),
-            )
-            .await?;
-            let agent_id = required_str(&agent, "agent_id")?.to_string();
+            let agent_alias = format!("bench-agent-{tenant_idx}-{agent_idx}");
+            let mut agent_id = String::new();
             let mut sessions = Vec::new();
 
             for session_idx in 0..config.sessions_per_agent {
                 let alias = format!("bench-session-{tenant_idx}-{agent_idx}-{session_idx}");
-                let session = post_json(
+                let opened = post_json(
                     &client,
                     &args.base_url,
-                    &format!("/api/tenants/{tenant_id}/agents/{agent_id}/sessions"),
-                    &json!({ "alias": alias }),
+                    "/api/sessions/open",
+                    &json!({
+                        "workspace": external_key,
+                        "agent": agent_alias,
+                        "session": alias
+                    }),
                 )
                 .await?;
-                let session_id = required_str(&session, "session_id")?.to_string();
+                tenant_id = required_str(&opened, "tenant_id")?.to_string();
+                agent_id = required_str(&opened, "agent_id")?.to_string();
+                let session_id = required_str(&opened, "session_id")?.to_string();
                 let mut artifacts = Vec::new();
 
                 for seq in 0..config.events_per_session {
@@ -865,7 +855,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
 
             agents.push(AgentFixture {
                 agent_id,
-                alias,
+                alias: agent_alias,
                 sessions,
             });
         }
