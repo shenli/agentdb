@@ -92,6 +92,21 @@ loader like Postgres `COPY` or Mongo `insert_many` is hard to beat.
 apples-to-apples; the small gap vs the 285k `perf-probe` peak above is
 harness/dataset overhead, not a real 285-vs-233 difference.)
 
+### Tuning: turn off RocksDB compression for encrypted data
+
+`AGENTDB_ROCKSDB_COMPRESSION=none` raised batched-append throughput
+**~12%** (batch=50, c=32: 266,763 → 297,804 events/s; interleaved,
+order-controlled A/B, `none` winning every rep). RocksDB defaults to LZ4,
+but AgentDB seals every value with AES-GCM before it reaches the store,
+and encrypted bytes are high-entropy — they don't compress — so LZ4 is
+pure CPU spent shrinking nothing on the write path. A CPU profile of the
+batch load confirms the shape: the hot cycles are memory copies,
+allocator churn, and JSON (de)serialization plus RocksDB's own
+crc32c/LZ4 — **not** crypto (~1%, AES-NI) and **not** lock contention
+(~0.3%). Set `none` whenever encryption-at-rest is in use; keep LZ4 only
+if you store large, compressible *un*encrypted values and want a smaller
+on-disk footprint more than write throughput.
+
 ### Versus Postgres / MongoDB
 
 Same workload (append + fetch-recent, persistent, non-durable) run
