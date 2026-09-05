@@ -69,12 +69,28 @@ limit, and each request's latency grows with the batch. (With the
 changefeed *on*, batches do **not** amortize — every event still writes
 four index entries — so keep it off for bulk ingest.)
 
-This table is AgentDB's *own* single→batch scaling, **not** a comparison:
-Postgres (multi-row `INSERT` / `COPY`) and MongoDB (`insertMany`) batch
-too and would scale into the same range (`COPY` especially — it's a
-purpose-built bulk loader). The apples-to-apples head-to-head is the
-single-append-vs-single-insert table below; the baselines there insert
-one row per append, matching AgentDB's one-event append.
+**Batching is not an AgentDB advantage — every engine has it.** Run the
+same batched append through the `agentdb-bench` harness for all three
+backends (append-only, c=32, 64 sessions, non-durable; Postgres uses a
+single-tx multi-row `INSERT ... UNNEST`, MongoDB uses `insert_many`,
+AgentDB uses `POST .../events/batch`), and everyone lands in the same
+few-hundred-k range — MongoDB's bulk insert actually wins:
+
+| events / request | AgentDB | PostgreSQL | MongoDB |
+|-----------------:|--------:|-----------:|--------:|
+| 1  |  55,046 |  43,186 |  18,956 |
+| 10 | 161,848 | 249,607 | 203,747 |
+| 50 | 233,475 | 266,395 | **491,155** |
+
+So read the AgentDB `perf-probe` table above as AgentDB's *own*
+single→batch scaling, not a competitive number: batched, the three are
+within ~2× of each other and MongoDB leads. AgentDB's real edge is the
+**single append** (next section) plus its agent-native semantics and
+horizontal scale-out — not raw bulk-load rate, where a purpose-built
+loader like Postgres `COPY` or Mongo `insert_many` is hard to beat.
+(All three measured on the same harness here, so this table is
+apples-to-apples; the small gap vs the 285k `perf-probe` peak above is
+harness/dataset overhead, not a real 285-vs-233 difference.)
 
 ### Versus Postgres / MongoDB
 
