@@ -8164,16 +8164,26 @@ impl Runtime {
             return;
         }
         let mut prepared = Vec::with_capacity(jobs.len());
-        let mut final_session_snapshot: Option<Session> = None;
+        // Set unconditionally at the start of Phase B (every early return before
+        // then diverges without reading it).
+        let mut final_session_snapshot: Option<Session>;
         let mut persist_session_checkpoint = false;
 
+        // Phase A — under the global state lock: reconcile next_seq, then
+        // capture the session snapshot + policy. Everything after (per-event
+        // envelope construction and the durable write) runs OFF this lock. The
+        // per-session commit lock, held for this whole batch, already
+        // serializes same-session appends, so reading the snapshot here and
+        // writing it back after the durable write is race-free — the same
+        // window the durable write already opens today. Keeping per-event CPU
+        // off the global mutex is what stops concurrent sessions convoying on
+        // it (it was ~90% utilized under a 32-way batched load).
         let prepare_lock_wait_started = coalesce_profile.map(|_| Instant::now());
-        {
+        let (initial_snapshot, batch_policy) = {
             let mut s = self.state.lock().await;
             if let Some(started) = prepare_lock_wait_started {
                 coalesce_sample.prepare_lock_wait_nanos = started.elapsed().as_nanos();
             }
-            let prepare_work_started = coalesce_profile.map(|_| Instant::now());
             // Reconcile next_seq against the persisted max event seq, but only
             // when a collision is actually possible: if in-memory next_seq is
             // already past the durable max this runtime has written, no event
@@ -8214,40 +8224,75 @@ impl Runtime {
                     }
                 }
             }
-            let mut policy_cache: BTreeMap<(String, String), RuntimePolicy> = BTreeMap::new();
-            let mut metadata_key_cache: BTreeMap<String, KeyResolution> = BTreeMap::new();
-            for job in jobs {
-                let SimpleAppendJob {
-                    req,
-                    fetch_recent,
-                    context_max_bytes,
-                    done,
-                } = job;
+            let snapshot = s.sessions.get(session_id.as_str()).cloned();
+            let policy =
+                resolve_policy_for_agent_in_state(&s, &jobs[0].req.tenant_id, &jobs[0].req.agent_id);
+            (snapshot, policy)
+        };
 
-                let result = self.prepare_simple_append_under_state(
-                    &s,
-                    req,
-                    fetch_recent,
-                    context_max_bytes,
-                    final_session_snapshot.take(),
-                    &mut policy_cache,
-                    &mut metadata_key_cache,
-                );
-                match result {
-                    Ok((prepared_append, session_snapshot, checkpoint)) => {
-                        persist_session_checkpoint |= checkpoint;
-                        final_session_snapshot = Some(session_snapshot);
-                        prepared.push((prepared_append, done));
+        // One tenant+session (validated in append_batch) → one snapshot, one
+        // policy, one metadata key covers every event in the batch.
+        let batch_policy = match batch_policy {
+            Ok(policy) => policy,
+            Err(err) => {
+                for job in jobs {
+                    let _ = job.done.send(Err(err.clone()));
+                }
+                return;
+            }
+        };
+        let Some(initial_snapshot) = initial_snapshot else {
+            let err = Error::new(ErrorCode::SessionNotFound, format!("{}", session_id));
+            for job in jobs {
+                let _ = job.done.send(Err(err.clone()));
+            }
+            return;
+        };
+        let metadata_key =
+            match self.resolve_key(&jobs[0].req.tenant_id, KeyOperation::MetadataWrite) {
+                Ok(key) => key,
+                Err(err) => {
+                    for job in jobs {
+                        let _ = job.done.send(Err(err.clone()));
                     }
-                    Err((err, session_snapshot)) => {
-                        final_session_snapshot = session_snapshot;
-                        let _ = done.send(Err(err));
-                    }
+                    return;
+                }
+            };
+
+        // Phase B — off-lock: build every envelope, threading the snapshot.
+        let prepare_work_started = coalesce_profile.map(|_| Instant::now());
+        final_session_snapshot = Some(initial_snapshot);
+        for job in jobs {
+            let SimpleAppendJob {
+                req,
+                fetch_recent,
+                context_max_bytes,
+                done,
+            } = job;
+            let prior = final_session_snapshot
+                .take()
+                .expect("session snapshot threaded across the batch");
+            match self.prepare_simple_append_locked_free(
+                req,
+                fetch_recent,
+                context_max_bytes,
+                prior,
+                &batch_policy,
+                &metadata_key,
+            ) {
+                Ok((prepared_append, session_snapshot, checkpoint)) => {
+                    persist_session_checkpoint |= checkpoint;
+                    final_session_snapshot = Some(session_snapshot);
+                    prepared.push((prepared_append, done));
+                }
+                Err((err, session_snapshot)) => {
+                    final_session_snapshot = Some(session_snapshot);
+                    let _ = done.send(Err(err));
                 }
             }
-            if let Some(started) = prepare_work_started {
-                coalesce_sample.prepare_work_nanos = started.elapsed().as_nanos();
-            }
+        }
+        if let Some(started) = prepare_work_started {
+            coalesce_sample.prepare_work_nanos = started.elapsed().as_nanos();
         }
 
         if prepared.is_empty() {
@@ -8359,33 +8404,26 @@ impl Runtime {
     }
 
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-    fn prepare_simple_append_under_state(
+    /// Build one event envelope with NO access to the global `State`. The
+    /// caller resolves the session snapshot, policy, and metadata key once
+    /// under the state lock, then drives this per event OFF the lock, so
+    /// concurrent sessions don't serialize their per-event CPU (payload
+    /// sanitize/serialize, envelope + id creation) on the global mutex. The
+    /// session snapshot is threaded forward (seq++ per event); on error it is
+    /// returned unchanged so the batch can continue with later events.
+    fn prepare_simple_append_locked_free(
         &self,
-        s: &State,
         mut req: AppendRequest,
         fetch_recent: Option<usize>,
         context_max_bytes: Option<usize>,
-        prior_session_snapshot: Option<Session>,
-        policy_cache: &mut BTreeMap<(String, String), RuntimePolicy>,
-        metadata_key_cache: &mut BTreeMap<String, KeyResolution>,
-    ) -> std::result::Result<(PreparedSimpleAppend, Session, bool), (Error, Option<Session>)> {
+        mut snapshot: Session,
+        policy: &RuntimePolicy,
+        metadata_key: &KeyResolution,
+    ) -> std::result::Result<(PreparedSimpleAppend, Session, bool), (Error, Session)> {
         sanitize_append_payload(&req.kind, &mut req.payload);
         let payload_len = serde_json::to_vec(&req.payload)
             .map(|v| v.len())
             .unwrap_or(usize::MAX);
-        let policy_cache_key = (
-            req.tenant_id.as_str().to_string(),
-            req.agent_id.as_str().to_string(),
-        );
-        let policy = match policy_cache.get(&policy_cache_key) {
-            Some(policy) => policy.clone(),
-            None => {
-                let policy = resolve_policy_for_agent_in_state(s, &req.tenant_id, &req.agent_id)
-                    .map_err(|err| (err, prior_session_snapshot.clone()))?;
-                policy_cache.insert(policy_cache_key, policy.clone());
-                policy
-            }
-        };
         if let Some(max_bytes) = context_max_bytes {
             if let Some(max) = policy.quota.max_context_bytes {
                 if max_bytes > max {
@@ -8397,13 +8435,14 @@ impl Runtime {
                                 policy.version
                             ),
                         ),
-                        prior_session_snapshot,
+                        snapshot,
                     ));
                 }
             }
         }
-        validate_append_secret_handling_policy(&req.payload, &policy)
-            .map_err(|err| (err, prior_session_snapshot.clone()))?;
+        if let Err(err) = validate_append_secret_handling_policy(&req.payload, policy) {
+            return Err((err, snapshot));
+        }
         if payload_len > policy.artifact_size.max_inline_event_bytes {
             return Err((
                 Error::new(
@@ -8416,34 +8455,21 @@ impl Runtime {
                 .with_suggestion(
                     "store the payload as an artifact and reference it via artifact_refs",
                 ),
-                prior_session_snapshot,
+                snapshot,
             ));
         }
 
-        let mut snapshot = match prior_session_snapshot {
-            Some(snapshot) => snapshot,
-            None => s
-                .sessions
-                .get(req.session_id.as_str())
-                .cloned()
-                .ok_or_else(|| {
-                    (
-                        Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id)),
-                        None,
-                    )
-                })?,
-        };
         if snapshot.deleted_at_ms.is_some() || snapshot.tenant_id.as_str() != req.tenant_id.as_str()
         {
             return Err((
                 Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id)),
-                Some(snapshot),
+                snapshot,
             ));
         }
         if snapshot.agent_id.as_str() != req.agent_id.as_str() {
             return Err((
                 Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)),
-                Some(snapshot),
+                snapshot,
             ));
         }
         if let Some(max) = policy.quota.max_events_per_session {
@@ -8456,21 +8482,11 @@ impl Runtime {
                             policy.version
                         ),
                     ),
-                    Some(snapshot),
+                    snapshot,
                 ));
             }
         }
 
-        let metadata_key = match metadata_key_cache.get(req.tenant_id.as_str()) {
-            Some(key) => key.clone(),
-            None => {
-                let key = self
-                    .resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)
-                    .map_err(|err| (err, Some(snapshot.clone())))?;
-                metadata_key_cache.insert(req.tenant_id.as_str().to_string(), key.clone());
-                key
-            }
-        };
         let prior_lifecycle = snapshot.lifecycle;
         let prior_policy_version = snapshot.policy_version;
         if snapshot.lifecycle != Lifecycle::Warm {
@@ -8496,8 +8512,8 @@ impl Runtime {
             credential_refs: Vec::new(),
             idempotency_key: None,
             policy_version: policy.version,
-            metadata_key_id: Some(metadata_key.key_id),
-            metadata_key_version: metadata_key.key_version,
+            metadata_key_id: Some(metadata_key.key_id.clone()),
+            metadata_key_version: metadata_key.key_version.clone(),
         });
         let appended = AppendResponse {
             event_id: envelope.event_id.clone(),
@@ -8508,7 +8524,7 @@ impl Runtime {
                 tenant_id: req.tenant_id,
                 envelope,
                 appended,
-                policy,
+                policy: policy.clone(),
                 session_after_append: snapshot.clone(),
                 fetch_recent,
             },
