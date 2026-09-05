@@ -69,6 +69,13 @@ limit, and each request's latency grows with the batch. (With the
 changefeed *on*, batches do **not** amortize — every event still writes
 four index entries — so keep it off for bulk ingest.)
 
+This table is AgentDB's *own* single→batch scaling, **not** a comparison:
+Postgres (multi-row `INSERT` / `COPY`) and MongoDB (`insertMany`) batch
+too and would scale into the same range (`COPY` especially — it's a
+purpose-built bulk loader). The apples-to-apples head-to-head is the
+single-append-vs-single-insert table below; the baselines there insert
+one row per append, matching AgentDB's one-event append.
+
 ### Versus Postgres / MongoDB
 
 Same workload (append + fetch-recent, persistent, non-durable) run
