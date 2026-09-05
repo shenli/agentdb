@@ -135,6 +135,11 @@ struct RunArgs {
     duration: String,
     #[arg(long, default_value_t = 20)]
     fetch_last_n: usize,
+    /// Events written per append_only op. >1 issues one batched write per op
+    /// (agentdb /events/batch, Postgres multi-row INSERT, Mongo insert_many),
+    /// so events/sec = ops_per_sec * append_batch. Only affects append-only.
+    #[arg(long, default_value_t = 1)]
+    append_batch: usize,
     #[arg(long, value_enum, default_value_t = SessionSelection::Uniform)]
     session_selection: SessionSelection,
     #[arg(long, default_value_t = 1.2)]
@@ -1603,6 +1608,29 @@ async fn run_one_operation(
             .await
     } else {
         match operation {
+            Operation::AppendOnly if args.append_batch > 1 => {
+                let events = (0..args.append_batch)
+                    .map(|_| {
+                        json!({
+                            "kind": "message",
+                            "payload": {
+                                "role": "assistant",
+                                "content": deterministic_string(128, rng),
+                                "bench_op": "append_only"
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                append_batch(
+                    client,
+                    &args.base_url,
+                    &fixture.tenant_id,
+                    &fixture.agent_id,
+                    &fixture.session_id,
+                    events,
+                )
+                .await
+            }
             Operation::AppendOnly => append_event(
                 client,
                 &args.base_url,
@@ -1798,6 +1826,7 @@ impl RunArgs {
             warmup: self.warmup.clone(),
             duration: self.duration.clone(),
             fetch_last_n: self.fetch_last_n,
+            append_batch: self.append_batch,
             session_selection: self.session_selection,
             zipf_exponent: self.zipf_exponent,
             no_raw_jsonl: self.no_raw_jsonl,
@@ -2021,6 +2050,24 @@ async fn append_event(
     .await
 }
 
+async fn append_batch(
+    client: &Client,
+    base_url: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    events: Vec<Value>,
+) -> Result<()> {
+    post_json(
+        client,
+        base_url,
+        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events/batch"),
+        &json!({ "agent_id": agent_id, "events": events }),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn append_and_fetch(
     client: &Client,
     base_url: &str,
@@ -2178,6 +2225,27 @@ async fn run_one_postgres_operation(
     operation: Operation,
 ) -> Result<()> {
     match operation {
+        Operation::AppendOnly if args.append_batch > 1 => {
+            let payloads = (0..args.append_batch)
+                .map(|_| {
+                    json!({
+                        "role": "assistant",
+                        "content": deterministic_string(128, rng),
+                        "bench_op": "append_only"
+                    })
+                })
+                .collect::<Vec<_>>();
+            pg_append_batch(
+                pool,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.agent_id,
+                &fixture.session_id,
+                "message",
+                &payloads,
+            )
+            .await
+        }
         Operation::AppendOnly => pg_append_event(
             pool,
             &args.run_id,
@@ -2528,6 +2596,53 @@ async fn pg_append_event(
     .await?;
     tx.commit().await?;
     Ok(seq)
+}
+
+async fn pg_append_batch(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    kind: &str,
+    payloads: &[Value],
+) -> Result<()> {
+    let n = payloads.len() as i64;
+    let mut tx = pool.begin().await?;
+    // One seq reservation for the whole batch.
+    let base: i64 = sqlx::query_scalar(
+        "UPDATE agentdb_bench.sessions
+         SET next_seq = next_seq + $4, updated_at = now()
+         WHERE run_id = $1 AND tenant_id = $2 AND session_id = $3
+         RETURNING next_seq - $4",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(n)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // Single multi-row INSERT via UNNEST — the idiomatic Postgres bulk write.
+    let seqs: Vec<i64> = (0..n).map(|i| base + i).collect();
+    let payload_strs: Vec<String> = payloads.iter().map(|p| p.to_string()).collect();
+    sqlx::query(
+        "INSERT INTO agentdb_bench.events
+         (run_id, tenant_id, agent_id, session_id, seq, kind, payload)
+         SELECT $1, $2, $3, $4, s.seq, $5, s.payload::jsonb
+         FROM UNNEST($6::bigint[], $7::text[]) AS s(seq, payload)",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(agent_id)
+    .bind(session_id)
+    .bind(kind)
+    .bind(&seqs)
+    .bind(&payload_strs)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn pg_fetch_recent(
@@ -2982,6 +3097,59 @@ async fn mongo_append_event(
     Ok(seq)
 }
 
+async fn mongo_append_batch(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    kind: &str,
+    payloads: &[Value],
+) -> Result<()> {
+    let n = payloads.len() as i64;
+    let sessions = db.collection::<Document>("sessions");
+    let options = FindOneAndUpdateOptions::builder()
+        .return_document(Some(ReturnDocument::After))
+        .build();
+    // One seq reservation for the whole batch.
+    let session = sessions
+        .find_one_and_update(
+            doc! {"run_id": run_id, "tenant_id": tenant_id, "session_id": session_id},
+            doc! {"$inc": {"next_seq": n}, "$set": {"updated_at": BsonDateTime::now()}},
+            options,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("mongodb session not found: {session_id}"))?;
+    let after = session
+        .get_i64("next_seq")
+        .or_else(|_| session.get_i32("next_seq").map(i64::from))?;
+    let base = after - n;
+
+    // insert_many — the idiomatic MongoDB bulk write.
+    let docs = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, payload)| {
+            Ok(doc! {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "seq": base + i as i64,
+                "kind": kind,
+                "payload": bson::to_bson(payload)?,
+                "artifact_refs": Bson::Array(Vec::new()),
+                "source_refs": Bson::Array(Vec::new()),
+                "created_at": BsonDateTime::now(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    db.collection::<Document>("events")
+        .insert_many(docs, None)
+        .await?;
+    Ok(())
+}
+
 async fn mongo_fetch_recent(
     db: &MongoDatabase,
     run_id: &str,
@@ -3112,6 +3280,27 @@ async fn run_one_mongodb_operation(
     operation: Operation,
 ) -> Result<()> {
     match operation {
+        Operation::AppendOnly if args.append_batch > 1 => {
+            let payloads = (0..args.append_batch)
+                .map(|_| {
+                    json!({
+                        "role": "assistant",
+                        "content": deterministic_string(128, rng),
+                        "bench_op": "append_only"
+                    })
+                })
+                .collect::<Vec<_>>();
+            mongo_append_batch(
+                db,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.agent_id,
+                &fixture.session_id,
+                "message",
+                &payloads,
+            )
+            .await
+        }
         Operation::AppendOnly => mongo_append_event(
             db,
             &args.run_id,
