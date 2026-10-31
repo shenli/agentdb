@@ -42,7 +42,11 @@ async fn append_with_fetch_recent_returns_the_tail() {
     // Three plain appends.
     for i in 0..3 {
         let r = append(json!({ "n": i }), None).await.unwrap();
-        assert!(r.status().is_success(), "plain append failed: {}", r.status());
+        assert!(
+            r.status().is_success(),
+            "plain append failed: {}",
+            r.status()
+        );
     }
 
     // Append with fetch_recent=2 → the response carries the recent tail.

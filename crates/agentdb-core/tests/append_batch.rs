@@ -74,7 +74,13 @@ async fn append_batch_assigns_contiguous_ordered_seqs() {
 
     // A second batch continues the same seq sequence.
     let more = rt
-        .append_batch(vec![AppendRequest::simple(&t, &a, &s, "msg", json!({ "i": 10 }))])
+        .append_batch(vec![AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "msg",
+            json!({ "i": 10 }),
+        )])
         .await
         .unwrap();
     assert_eq!(more[0].seq, 10);

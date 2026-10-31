@@ -62,5 +62,8 @@ fn catalog_covers_all_three_labels() {
     let has = |want: Stability| route_catalog().iter().any(|(s, _)| *s == want);
     assert!(has(Stability::Core), "catalog must classify Core routes");
     assert!(has(Stability::Labs), "catalog must classify Labs routes");
-    assert!(has(Stability::Internal), "catalog must classify Internal routes");
+    assert!(
+        has(Stability::Internal),
+        "catalog must classify Internal routes"
+    );
 }

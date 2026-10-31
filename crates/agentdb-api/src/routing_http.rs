@@ -1285,8 +1285,9 @@ mod tests {
         let mut incoming = HeaderMap::new();
         insert_header(&mut incoming, HDR_FORWARDED_FOR, "edge-a");
 
-        let req = prepare_forward_request(&target, "/api/tenants/ten_1/changes", &incoming, "node-b")
-            .unwrap();
+        let req =
+            prepare_forward_request(&target, "/api/tenants/ten_1/changes", &incoming, "node-b")
+                .unwrap();
 
         assert_eq!(
             req.headers[HDR_FORWARDED_FOR].to_str().unwrap(),
@@ -1303,8 +1304,9 @@ mod tests {
         let mut incoming = HeaderMap::new();
         insert_header(&mut incoming, HDR_FORWARDED_BY, "node-a");
 
-        let err = prepare_forward_request(&target, "/api/tenants/ten_1/changes", &incoming, "node-b")
-            .unwrap_err();
+        let err =
+            prepare_forward_request(&target, "/api/tenants/ten_1/changes", &incoming, "node-b")
+                .unwrap_err();
 
         assert_eq!(err.status, StatusCode::MISDIRECTED_REQUEST);
         assert_eq!(err.code, "ROUTE_FORWARD_LOOP");

@@ -16,6 +16,7 @@
 name: docker
 
 on:
+  pull_request:
   push:
     branches: [main]
     tags: ['v*.*.*']
@@ -25,6 +26,10 @@ permissions:
   contents: read
   packages: write   # ghcr.io push
 
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -32,6 +37,7 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +48,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -72,8 +79,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # GHA-cache for the buildx cross-arch build. First
@@ -81,3 +89,16 @@ jobs:
           # subsequent builds reuse the dep layer.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - uses: actions/setup-python@v5
+        if: github.event_name == 'pull_request'
+        with:
+          python-version: '3.12'
+      - name: Smoke-test PR image
+        if: github.event_name == 'pull_request'
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          python -m pip install -e clients/python
+          image="${IMAGE_TAGS%%$'\n'*}"
+          python scripts/docker-smoke.py --image "$image"

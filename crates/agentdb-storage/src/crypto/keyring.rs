@@ -195,11 +195,7 @@ pub trait EnvelopeCrypto: Send + Sync {
     fn open(&self, context: &CryptoContext<'_>, envelope: &[u8]) -> Result<Vec<u8>, CryptoError>;
 
     /// Metadata for the active DEK of a (tenant, purpose).
-    fn active_key(
-        &self,
-        tenant_id: &str,
-        purpose: KeyPurpose,
-    ) -> Result<KeyMetadata, CryptoError>;
+    fn active_key(&self, tenant_id: &str, purpose: KeyPurpose) -> Result<KeyMetadata, CryptoError>;
 
     /// Drop cached plaintext DEK leases for a tenant (e.g. on a policy-epoch
     /// change or revocation) so the next operation re-fetches from the provider.
@@ -315,11 +311,7 @@ impl AeadTenantKeyring {
         }
     }
 
-    fn active_lease(
-        &self,
-        tenant_id: &str,
-        purpose: KeyPurpose,
-    ) -> Result<DekLease, CryptoError> {
+    fn active_lease(&self, tenant_id: &str, purpose: KeyPurpose) -> Result<DekLease, CryptoError> {
         if let Some(lease) = self
             .cache
             .lock()
@@ -384,14 +376,16 @@ impl EnvelopeCrypto for AeadTenantKeyring {
         // purpose, or any tampered header field) makes the tag verification
         // below fail.
         let aad = derive_aad(context, parts.dek_id, parts.dek_version, parts.suite);
-        aead_open(parts.suite, lease.key(), parts.nonce, parts.ciphertext, &aad)
+        aead_open(
+            parts.suite,
+            lease.key(),
+            parts.nonce,
+            parts.ciphertext,
+            &aad,
+        )
     }
 
-    fn active_key(
-        &self,
-        tenant_id: &str,
-        purpose: KeyPurpose,
-    ) -> Result<KeyMetadata, CryptoError> {
+    fn active_key(&self, tenant_id: &str, purpose: KeyPurpose) -> Result<KeyMetadata, CryptoError> {
         Ok(self.active_lease(tenant_id, purpose)?.meta.clone())
     }
 
@@ -415,7 +409,11 @@ impl EnvelopeCrypto for AeadTenantKeyring {
 pub struct DisabledEnvelopeCrypto;
 
 impl EnvelopeCrypto for DisabledEnvelopeCrypto {
-    fn seal(&self, _context: &CryptoContext<'_>, _plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    fn seal(
+        &self,
+        _context: &CryptoContext<'_>,
+        _plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         Err(CryptoError::Disabled)
     }
     fn open(&self, _context: &CryptoContext<'_>, _envelope: &[u8]) -> Result<Vec<u8>, CryptoError> {
@@ -437,7 +435,12 @@ impl EnvelopeCrypto for DisabledEnvelopeCrypto {
 /// Canonical AAD: domain-separated, length-prefixed binding of the context plus
 /// the DEK version and suite. Reproduced exactly on read; never stored (it is
 /// recomputed), so it cannot be tampered independently of the ciphertext.
-fn derive_aad(context: &CryptoContext<'_>, dek_id: &str, dek_version: u32, suite: Suite) -> Vec<u8> {
+fn derive_aad(
+    context: &CryptoContext<'_>,
+    dek_id: &str,
+    dek_version: u32,
+    suite: Suite,
+) -> Vec<u8> {
     let mut aad = Vec::new();
     aad.extend_from_slice(b"AGDB-AAD-v2");
     for field in [
@@ -536,7 +539,9 @@ mod tests {
     #[test]
     fn ciphertext_does_not_contain_plaintext() {
         let kr = keyring(Suite::XChaCha20Poly1305);
-        let sealed = kr.seal(&ctx("ten_a", "art_1"), b"TOP-SECRET-MARKER").unwrap();
+        let sealed = kr
+            .seal(&ctx("ten_a", "art_1"), b"TOP-SECRET-MARKER")
+            .unwrap();
         assert!(!sealed
             .windows(b"TOP-SECRET-MARKER".len())
             .any(|w| w == b"TOP-SECRET-MARKER"));

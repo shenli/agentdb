@@ -1,8 +1,11 @@
 # AgentDB Observability Export Design
 
-Status: draft
+Status: design background with implementation notes; proposed additions are not
+a support commitment. For current commands and behavior, see
+[CDC/export operations](../operations/cdc-export.md) and the
+[API reference](../reference/api-sdk.md).
 
-Date: 2026-05-14
+Original design date: 2026-05-14
 
 ## Purpose
 

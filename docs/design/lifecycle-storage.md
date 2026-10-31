@@ -2,7 +2,9 @@
 
 This document describes AgentDB's warm/cold/archive/derivative-only storage
 model for session history and artifact bytes. It is a forward-looking design
-document. For the current implementation shape, see [`architecture.md`](architecture.md).
+document; “today” in the original problem statement describes the design
+baseline. For current behavior, see [tiered storage operations](../operations/tiered-storage.md)
+and the [architecture map](architecture.md).
 For the tablet-local hot storage engine, see
 [`tablet-storage-engine.md`](tablet-storage-engine.md). For the product
 motivation behind lifecycle-aware runtime storage, see

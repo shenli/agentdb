@@ -16,9 +16,9 @@ use std::io::{BufRead, BufReader};
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 
+use agentdb_core::event::ArtifactRef;
 use agentdb_core::runtime::{AppendRequest, Runtime};
 use agentdb_core::{Id, IdKind, NewAgent, NewArtifact, NewSession, NewTenant};
-use agentdb_core::event::ArtifactRef;
 use agentdb_import::{
     classify_line, collect_jsonl, derive_identity, read_prefix_lines, resolve_dir, LineClass,
     Source, State,
@@ -155,9 +155,9 @@ async fn import_file(
 
     // Stream the file line by line so memory stays bounded to one line plus one
     // batch, regardless of file size.
-    let reader = BufReader::new(std::fs::File::open(file).with_context(|| {
-        format!("open {}", file.display())
-    })?);
+    let reader = BufReader::new(
+        std::fs::File::open(file).with_context(|| format!("open {}", file.display()))?,
+    );
     let mut batch: Vec<AppendRequest> = Vec::new();
     let mut batch_bytes = 0usize;
     let mut appended = 0usize;
@@ -195,9 +195,12 @@ async fn import_file(
                     // then append the externalized event (single append — the
                     // batch path does not carry artifact refs).
                     flush_batch!(idx);
-                    let bytes = externalize_event(runtime, &tenant_id, &agent_id, &session_id, parsed)
-                        .await
-                        .with_context(|| format!("externalize line {idx} of {}", file.display()))?;
+                    let bytes =
+                        externalize_event(runtime, &tenant_id, &agent_id, &session_id, parsed)
+                            .await
+                            .with_context(|| {
+                                format!("externalize line {idx} of {}", file.display())
+                            })?;
                     appended += 1;
                     totals.externalized += 1;
                     totals.externalized_bytes += bytes;
@@ -381,8 +384,12 @@ mod tests {
             payload_bytes: 70_000,
         };
 
-        let b1 = externalize_event(&rt, &tid, &aid, &sid, parsed()).await.unwrap();
-        let b2 = externalize_event(&rt, &tid, &aid, &sid, parsed()).await.unwrap();
+        let b1 = externalize_event(&rt, &tid, &aid, &sid, parsed())
+            .await
+            .unwrap();
+        let b2 = externalize_event(&rt, &tid, &aid, &sid, parsed())
+            .await
+            .unwrap();
         assert_eq!(b1, b2);
 
         let events = rt
@@ -401,7 +408,11 @@ mod tests {
         // Both events reference the SAME artifact — identical payloads dedup.
         let a0 = events[0].artifact_refs[0].artifact_id.clone();
         let a1 = events[1].artifact_refs[0].artifact_id.clone();
-        assert_eq!(a0.as_str(), a1.as_str(), "identical payloads dedup to one blob");
+        assert_eq!(
+            a0.as_str(),
+            a1.as_str(),
+            "identical payloads dedup to one blob"
+        );
 
         // The blob round-trips to the original payload bytes.
         let blob = rt.get_artifact_blob(&tid, &a0).await.unwrap();

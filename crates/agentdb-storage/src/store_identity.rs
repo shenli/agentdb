@@ -141,8 +141,12 @@ pub fn record_cluster_watermark(data_dir: &Path, generation: i64) -> Result<()> 
     })
     .map_err(|error| Error::Other(format!("serialize cluster watermark: {error}")))?;
     let path = cluster_watermark_path(data_dir);
-    std::fs::write(&path, bytes)
-        .map_err(|error| Error::Other(format!("write cluster watermark {}: {error}", path.display())))
+    std::fs::write(&path, bytes).map_err(|error| {
+        Error::Other(format!(
+            "write cluster watermark {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// Load and verify the store identity, or initialize it on first boot.

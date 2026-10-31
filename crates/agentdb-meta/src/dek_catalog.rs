@@ -51,10 +51,7 @@ const SELECT_COLS: &str =
 /// present, then return the row that is now stored — the caller's, or the one a
 /// racing node inserted first. This is the coordinated provisioning primitive:
 /// the winner's wrapped DEK is authoritative and every node reads it back.
-pub async fn provision_if_absent(
-    pool: &AnyPool,
-    row: &DekCatalogRow,
-) -> MetaResult<DekCatalogRow> {
+pub async fn provision_if_absent(pool: &AnyPool, row: &DekCatalogRow) -> MetaResult<DekCatalogRow> {
     sqlx::query(
         "INSERT INTO dek_catalog \
          (tenant_id, purpose, version, wrapping_key_ref, nonce, ciphertext, status, created_at_ms) \
@@ -74,9 +71,7 @@ pub async fn provision_if_absent(
     get_version(pool, &row.tenant_id, &row.purpose, row.version)
         .await?
         .ok_or_else(|| {
-            crate::error::MetaError::Invariant(
-                "dek_catalog row vanished after provision".into(),
-            )
+            crate::error::MetaError::Invariant("dek_catalog row vanished after provision".into())
         })
 }
 
@@ -247,22 +242,40 @@ mod tests {
         let b = provision_if_absent(&pool, &row("ten_a", 1, b"wrapped-B"))
             .await
             .unwrap();
-        assert_eq!(b.ciphertext, b"wrapped-A", "first writer's DEK is authoritative");
+        assert_eq!(
+            b.ciphertext, b"wrapped-A",
+            "first writer's DEK is authoritative"
+        );
     }
 
     #[tokio::test]
     async fn get_active_and_version_and_list() {
         let pool = pool().await;
-        provision_if_absent(&pool, &row("ten_a", 1, b"a1")).await.unwrap();
-        provision_if_absent(&pool, &row("ten_b", 1, b"b1")).await.unwrap();
+        provision_if_absent(&pool, &row("ten_a", 1, b"a1"))
+            .await
+            .unwrap();
+        provision_if_absent(&pool, &row("ten_b", 1, b"b1"))
+            .await
+            .unwrap();
 
         assert_eq!(
-            get_active(&pool, "ten_a", "content").await.unwrap().unwrap().ciphertext,
+            get_active(&pool, "ten_a", "content")
+                .await
+                .unwrap()
+                .unwrap()
+                .ciphertext,
             b"a1"
         );
-        assert!(get_active(&pool, "ten_c", "content").await.unwrap().is_none());
+        assert!(get_active(&pool, "ten_c", "content")
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(
-            get_version(&pool, "ten_b", "content", 1).await.unwrap().unwrap().ciphertext,
+            get_version(&pool, "ten_b", "content", 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .ciphertext,
             b"b1"
         );
         assert_eq!(list_all(&pool).await.unwrap().len(), 2);
@@ -271,52 +284,95 @@ mod tests {
     #[tokio::test]
     async fn revoke_tenant_soft_marks_all_then_destroy_deletes() {
         let pool = pool().await;
-        provision_if_absent(&pool, &row("ten_a", 1, b"a1")).await.unwrap();
-        provision_if_absent(&pool, &row("ten_a", 2, b"a2")).await.unwrap();
-        provision_if_absent(&pool, &row("ten_b", 1, b"b1")).await.unwrap();
+        provision_if_absent(&pool, &row("ten_a", 1, b"a1"))
+            .await
+            .unwrap();
+        provision_if_absent(&pool, &row("ten_a", 2, b"a2"))
+            .await
+            .unwrap();
+        provision_if_absent(&pool, &row("ten_b", 1, b"b1"))
+            .await
+            .unwrap();
 
         // Soft revoke ten_a: both versions marked revoked, rows still present.
         assert_eq!(revoke_tenant(&pool, "ten_a", false).await.unwrap(), 2);
-        assert!(get_active(&pool, "ten_a", "content").await.unwrap().is_none());
+        assert!(get_active(&pool, "ten_a", "content")
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(
-            get_version(&pool, "ten_a", "content", 1).await.unwrap().unwrap().status,
+            get_version(&pool, "ten_a", "content", 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "revoked"
         );
         // ten_b is untouched.
-        assert!(get_active(&pool, "ten_b", "content").await.unwrap().is_some());
+        assert!(get_active(&pool, "ten_b", "content")
+            .await
+            .unwrap()
+            .is_some());
 
         // Crypto-shred ten_a: the rows are gone.
         assert_eq!(revoke_tenant(&pool, "ten_a", true).await.unwrap(), 2);
-        assert!(get_version(&pool, "ten_a", "content", 1).await.unwrap().is_none());
-        assert!(get_version(&pool, "ten_a", "content", 2).await.unwrap().is_none());
+        assert!(get_version(&pool, "ten_a", "content", 1)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_version(&pool, "ten_a", "content", 2)
+            .await
+            .unwrap()
+            .is_none());
         // ten_b still present.
-        assert!(get_version(&pool, "ten_b", "content", 1).await.unwrap().is_some());
+        assert!(get_version(&pool, "ten_b", "content", 1)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
     async fn retire_drained_versions_respects_in_use_and_status() {
         let pool = pool().await;
         // v1 (read_only) and v2 (active).
-        provision_if_absent(&pool, &row("ten_a", 1, b"a1")).await.unwrap();
-        set_status(&pool, "ten_a", "content", 1, "read_only").await.unwrap();
-        provision_if_absent(&pool, &row("ten_a", 2, b"a2")).await.unwrap();
+        provision_if_absent(&pool, &row("ten_a", 1, b"a1"))
+            .await
+            .unwrap();
+        set_status(&pool, "ten_a", "content", 1, "read_only")
+            .await
+            .unwrap();
+        provision_if_absent(&pool, &row("ten_a", 2, b"a2"))
+            .await
+            .unwrap();
 
         // v1 still reported in use → not retired.
         assert_eq!(
-            retire_drained_versions(&pool, "ten_a", "content", &[1, 2]).await.unwrap(),
+            retire_drained_versions(&pool, "ten_a", "content", &[1, 2])
+                .await
+                .unwrap(),
             0
         );
         // Only v2 in use → v1 (drained, read_only) retired; active v2 untouched.
         assert_eq!(
-            retire_drained_versions(&pool, "ten_a", "content", &[2]).await.unwrap(),
+            retire_drained_versions(&pool, "ten_a", "content", &[2])
+                .await
+                .unwrap(),
             1
         );
         assert_eq!(
-            get_version(&pool, "ten_a", "content", 1).await.unwrap().unwrap().status,
+            get_version(&pool, "ten_a", "content", 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "retired"
         );
         assert_eq!(
-            get_version(&pool, "ten_a", "content", 2).await.unwrap().unwrap().status,
+            get_version(&pool, "ten_a", "content", 2)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "active"
         );
     }
@@ -324,13 +380,24 @@ mod tests {
     #[tokio::test]
     async fn set_status_retires_a_version() {
         let pool = pool().await;
-        provision_if_absent(&pool, &row("ten_a", 1, b"a1")).await.unwrap();
-        assert!(set_status(&pool, "ten_a", "content", 1, "revoked").await.unwrap());
+        provision_if_absent(&pool, &row("ten_a", 1, b"a1"))
+            .await
+            .unwrap();
+        assert!(set_status(&pool, "ten_a", "content", 1, "revoked")
+            .await
+            .unwrap());
         // No longer the active row.
-        assert!(get_active(&pool, "ten_a", "content").await.unwrap().is_none());
+        assert!(get_active(&pool, "ten_a", "content")
+            .await
+            .unwrap()
+            .is_none());
         // But still fetchable by version (status enforced by the caller).
         assert_eq!(
-            get_version(&pool, "ten_a", "content", 1).await.unwrap().unwrap().status,
+            get_version(&pool, "ten_a", "content", 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "revoked"
         );
     }

@@ -679,7 +679,10 @@ async fn reconcile_redrives_objects_the_mirror_is_missing() {
     let mirror = in_memory();
     let backend = AsyncMirrorContentBackend::new(primary.clone(), mirror.clone(), 8);
 
-    primary.put("ten_a", "art_lost", b"recover me").await.unwrap();
+    primary
+        .put("ten_a", "art_lost", b"recover me")
+        .await
+        .unwrap();
     assert!(!mirror.head("ten_a", "art_lost").await.unwrap());
 
     // Reconcile re-queues the missing object off the durable primary.
@@ -694,7 +697,10 @@ async fn reconcile_redrives_objects_the_mirror_is_missing() {
     // The worker drains it into the mirror.
     wait_for_mirror(&backend, 1).await;
     assert!(mirror.head("ten_a", "art_lost").await.unwrap());
-    assert_eq!(mirror.get("ten_a", "art_lost").await.unwrap(), b"recover me");
+    assert_eq!(
+        mirror.get("ten_a", "art_lost").await.unwrap(),
+        b"recover me"
+    );
 
     // Idempotent: a second pass finds it already mirrored and re-queues nothing.
     let report = backend.reconcile_unmirrored(1_000).await.unwrap();
@@ -714,7 +720,10 @@ async fn cache_sweep_redrives_unmirrored_objects_instead_of_only_retaining() {
     let backend = AsyncMirrorContentBackend::new(primary.clone(), mirror.clone(), 8)
         .with_local_cache_ttl_ms(0);
 
-    primary.put("ten_a", "seg_only", b"unmirrored").await.unwrap();
+    primary
+        .put("ten_a", "seg_only", b"unmirrored")
+        .await
+        .unwrap();
 
     let report = backend
         .run_cache_sweep_once(now_wallclock_ms() + 10_000, 1_000)

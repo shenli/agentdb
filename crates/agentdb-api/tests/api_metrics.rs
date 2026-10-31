@@ -44,6 +44,12 @@ async fn metrics_serves_prometheus_text_with_fleet_gauges() {
     assert!(body.contains("agentdb_build_info{version="));
     assert!(body.contains("agentdb_sessions_by_lifecycle{lifecycle=\"warm\"}"));
     // One tenant and one session were just created.
-    assert!(body.contains("\nagentdb_tenants 1\n"), "expected 1 tenant:\n{body}");
-    assert!(body.contains("\nagentdb_sessions 1\n"), "expected 1 session:\n{body}");
+    assert!(
+        body.contains("\nagentdb_tenants 1\n"),
+        "expected 1 tenant:\n{body}"
+    );
+    assert!(
+        body.contains("\nagentdb_sessions 1\n"),
+        "expected 1 session:\n{body}"
+    );
 }

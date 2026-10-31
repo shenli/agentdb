@@ -5,7 +5,7 @@ It is intentionally biased toward commands that can run from a clean checkout.
 
 ## Public Surface
 
-- Confirm the README quickstart reaches a stored agent session in a few minutes:
+- Confirm the README quickstart reaches an agent session after the initial build:
 
   ```bash
   cargo run -p agentdb-server -- dev
@@ -18,16 +18,23 @@ It is intentionally biased toward commands that can run from a clean checkout.
   AGENTDB_URL=http://127.0.0.1:7878 python3 examples/agents/python/quickstart.py
   ```
 
-- Scan for private hostnames, local paths, private run IDs, and old planning
-  archive references. Replace the placeholder terms with any maintainer-local
-  names that should never appear in public docs:
-
-  ```bash
-  rg -n 'PRIVATE_HOST|PRIVATE_HOME_PATH|PRIVATE_RUN_ID|PRIVATE_ARCHIVE_PATH' \
-    README.md docs CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md THIRD_PARTY_NOTICES.md \
-    .github scripts infra ops tools clients adapters examples bin crates AGENTS.md CLAUDE.md LLMS.md \
-    -g '!target/**' -g '!.git/**' -g '!.devroom/**'
-  ```
+- Keep the README alpha boundary explicit: local/single-node evaluation, mutable
+  API/storage formats, and experimental distributed operation. Do not advertise
+  Cell-level fault isolation or stable cluster support.
+- Run `python3 scripts/check-secrets.py` with Gitleaks 8.30.1. It scans all local
+  Git refs and a snapshot of tracked/unignored working files, with redacted output.
+  Fetch any refs intended for publication before this check. Review any finding;
+  exceptions must name exact demonstration values or test vectors, never whole
+  directories. A pattern scan is not proof that no private data exists.
+- Review historical Git content before changing repository visibility. Removing
+  a file from the current tree does not remove it from history. If a real secret
+  is found, revoke it before coordinating any history rewrite. The checked-in
+  Gitleaks exceptions cover documentation placeholders and public test fixtures.
+- Generated `test-sessions/` logs are ignored and excluded from Docker builds.
+  Keep raw logs outside Git; publish reviewed summaries with commands, commit,
+  assertions, and coverage limits instead.
+- Confirm [private vulnerability reporting](https://github.com/shenli/agentdb/security/advisories/new)
+  is enabled before making the repository public.
 
 - Check for stale command paths after repository layout changes:
 
@@ -42,21 +49,30 @@ It is intentionally biased toward commands that can run from a clean checkout.
 Run these from a clean checkout:
 
 ```bash
-cargo fmt --check
+cargo fmt --all --check
 cargo check -q -p agentdb-server
-cargo test -q -p agentdb-api --test api_smoke create_tenant_agent_session_append_fetch_round_trip
+ops/testing/expected-count.sh 1 -- test -q -p agentdb-api --test api_smoke create_tenant_agent_session_append_fetch_round_trip
 python3 -m pytest -q examples/agents/python/test_session_first_demo.py \
   examples/agents/python/test_session_tiering_demo.py \
   examples/agents/python/test_ticket_agent_tiered_demo.py
 python3 -m py_compile examples/agents/python/quickstart.py \
   examples/agents/python/openai_agents_quickstart.py \
   examples/agents/python/async_quickstart.py \
-  examples/agents/python/pubsub_quickstart.py \
   examples/agents/python/session_first_demo.py \
   examples/agents/python/session_tiering_demo.py
-scripts/license-check.sh
+LICENSE_CHECK_STRICT=1 scripts/license-check.sh
+python3 scripts/check-release-inputs.py
+actionlint -shellcheck=
+python3 scripts/check-secrets.py
+cargo build --locked -p agentdb-server -p agentdbctl
+python3 scripts/release-smoke.py
 git diff --check
 ```
+
+The recovery smoke uses synthetic data in a temporary directory. It appends
+through the native Python SDK, kills the server, reopens the same store, and
+checks exact replay, artifact bytes, idempotent retry, and fork isolation. This
+is a process-crash test, not a host power-loss or cluster-availability test.
 
 For a fuller local CI run:
 
@@ -87,12 +103,15 @@ ops/local-ci/scripts/local-ci.sh
   docker build -t agentdb:local .
   docker run --rm agentdb:local --version
   docker run --rm --entrypoint /usr/local/bin/agentdbctl agentdb:local --version
+  python3 scripts/docker-smoke.py --image agentdb:local
   ```
 
   The manifest-only dependency stage must include every workspace member so a
   clean cache build succeeds. The final image must contain both `agentdb` and
   `agentdbctl`; non-loopback startup also requires
   `AGENTDB_API_AUTH_TOKEN` at runtime.
+  The smoke script uses a generated token and disposable named volume, checks
+  an acknowledged event after container restart, and removes its own resources.
 
 - Verify release workflows and tag naming in `.github/workflows/release.yml`.
   For an archive matching the validation host, verify its separate checksum,
@@ -107,6 +126,9 @@ ops/local-ci/scripts/local-ci.sh
   agentdb-vX.Y.Z-PLATFORM/agentdbctl --version
   ```
 
+- Tagged workflows create draft prereleases. Validate all matrix jobs and the
+  downloaded archives before publishing. The finalizer must fail when any build
+  fails. The Intel macOS target uses GitHub's `macos-15-intel` runner.
 - Confirm generated artifacts are ignored and not staged:
 
   ```bash
@@ -116,8 +138,12 @@ ops/local-ci/scripts/local-ci.sh
 
 ## Benchmark Claims
 
-- Keep the README benchmark framed as a single-node, localhost,
-  `single-node-wal` comparison unless rerun under a different configuration.
+- State the actual durability and changefeed settings. Persistent RocksDB writes
+  fsync by default; `AGENTDB_ROCKSDB_SYNC_WRITES=0` explicitly opts out. The
+  changefeed/export ledger is disabled unless `--changefeed` is enabled.
+- Do not treat results from different harnesses as a head-to-head comparison.
+  Historical 8-second, sync-disabled measurements are not default throughput
+  or sustained-production SLOs.
 - For new benchmark numbers, document hardware, OS/kernel, database versions,
   durability profile, working-set shape, workload mix, concurrency, warmup,
   measured duration, repeats, and caveats.

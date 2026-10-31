@@ -1,0 +1,26 @@
+title = "AgentDB secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Literal documentation placeholder, never an issued credential"
+regexTarget = "secret"
+regexes = ['''^replace-with-at-least-16-characters$''']
+
+[[allowlists]]
+description = "Published SCRAM test-vector keys in the historical SCRAM unit test"
+condition = "AND"
+paths = ['''^crates/agentdb-meta/src/scram\.rs$''']
+regexTarget = "secret"
+regexes = [
+  '''^WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=$''',
+  '''^wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=$''',
+]
+
+[[allowlists]]
+description = "Historical localhost walkthrough uses the invented user-a/pw-a fixture"
+condition = "AND"
+paths = ['''^docs/2026-04-28-m27-auth-bound-tenant-plan\.md$''']
+regexTarget = "secret"
+regexes = ['''^user-a:pw-a$''']

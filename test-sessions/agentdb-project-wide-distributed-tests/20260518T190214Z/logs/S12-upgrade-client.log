@@ -1,5 +1,0 @@
-S12: starting old server /home/lishen/work/agentdb-s12-old/target/debug/agentdb on 127.0.0.1:32120
-old-write verified tenant=ten_019e40ee-ace0-7ab0-883f-c18e97232dcd session=ses_019e40ee-ace2-7de0-8f96-1420c6cff6df seqs=[0,1]
-S12: starting new server /home/lishen/work/agentdb/target/debug/agentdb on 127.0.0.1:32120
-new-verify verified tenant=ten_019e40ee-ace0-7ab0-883f-c18e97232dcd session=ses_019e40ee-ace2-7de0-8f96-1420c6cff6df seqs=[0,1,2]
-PASS: single-node upgrade preserved fetch/watch/export state and accepted a post-upgrade append

@@ -1,117 +1,106 @@
-# AgentDB Docs
+# AgentDB Documentation
 
-This directory contains the public AgentDB documentation. Start with the current
-docs below; historical planning artifacts are intentionally not part of the main
-public docs path.
+AgentDB is alpha software. Persistent single-node operation is the primary
+release path; multi-node and Cell isolation work remain experimental. Start
+with the guides below, and check each design's implementation status before
+using it as a deployment contract.
 
 ## Start Here
 
-- [quickstart.md](quickstart.md) - shortest path from checkout to a stored and
-  replayable agent session
-- [design/product-thesis.md](design/product-thesis.md) - product thesis,
-  workload requirements, positioning, and systems rationale
-- [design/design.md](design/design.md) - durable design commitments,
-  implementation status, constraints, and non-goals
-- [product-roadmap.md](product-roadmap.md) - product progress, remaining gaps,
-  deliberately out-of-scope work, and open questions
-- [design/architecture.md](design/architecture.md) - current crate
-  boundaries, request flow, storage, routing, and operational model
-- [design/tablet-storage-engine.md](design/tablet-storage-engine.md) - hot
-  tablet storage engine, Raft commit path, and split-LSM improvement plan
-- [design/cluster-storage-topology.md](design/cluster-storage-topology.md)
-  - next-step design for cells, AZ-aware placement, tenant blast radius, and
-  distributed storage validation
-- [design/distributed-safety-hardening.md](design/distributed-safety-hardening.md)
-  - prioritized plan for read consistency, partition testing, cluster/store
-  identity, manifest safety, and bounded tenant backpressure
-- [design/encryption-at-rest.md](design/encryption-at-rest.md) - encryption at
-  rest and BYOK threat model, key hierarchy, rotation semantics, code-change
-  map, rollout plan, and validation requirements
+- [Quickstart](quickstart.md): run AgentDB and store a replayable session.
+- [Native API and SDKs](reference/api-sdk.md): application integration with
+  Python, TypeScript, and HTTP.
+- [Agent runtime manual](../LLMS.md): the runtime API in one document for LLM agents.
+- [Product thesis](design/product-thesis.md): workload fit and non-goals.
+- [Roadmap](product-roadmap.md): progress, remaining gaps, and open questions.
 
-## Run And Operate
+## API And Integration Contracts
 
-- [operations/deployment.md](operations/deployment.md) - supported deployment
-  paths, packaging modes, and current cluster status
-- [operations/operations.md](operations/operations.md) - start/stop, backup,
-  restore, upgrade, and troubleshooting for the supported single-node shape
-- [operations/single-node-production-checklist.md](operations/single-node-production-checklist.md)
-  - preflight gate before exposing a persistent single node
-- [operations/recovery.md](operations/recovery.md) - object storage as the
-  recovery root: recovery manifests, `recovery_lag_ms`, and
-  `agentdb restore-from-bucket`.
-- [operations/backup-verification.md](operations/backup-verification.md) -
-  backup manifest validation, tablet checkpoint checks, scratch install drills,
-  and recovery boundaries
-- [operations/restore-recovery.md](operations/restore-recovery.md) - offline
-  single-node restore and recovery procedure
-- [operations/single-node-upgrade.md](operations/single-node-upgrade.md) -
-  single-node upgrade, verification, and rollback procedure
-- [operations/storage-maintenance.md](operations/storage-maintenance.md) -
-  storage inspection, compaction, and sizing checks
-- [operations/storage-backpressure.md](operations/storage-backpressure.md) -
-  object-store content mirror backlog, throttling, and reconcile
-- [operations/disk-full-recovery.md](operations/disk-full-recovery.md) -
-  response procedure for full runtime or backup volumes
-- [operations/routine-maintenance.md](operations/routine-maintenance.md) -
-  daily, weekly, and pre-maintenance checklist
-- [operations/cdc-export.md](operations/cdc-export.md) - CDC/export operation,
-  ClickHouse, JSONL/Parquet archives, cursors, and consumer recovery
-- [operations/tiered-storage.md](operations/tiered-storage.md) -
-  warm/cold/archive/derivative-only lifecycle operation and verification
-- [operations/agentdbctl.md](operations/agentdbctl.md) - human and AI-agent
-  friendly admin workflows
-- [operations/performance.md](operations/performance.md) - benchmark commands
-  and current performance notes
-- [operations/agentdb-bench.md](operations/agentdb-bench.md) - design and
-  testing plan for comparing AgentDB with MongoDB and Postgres on agent-runtime
-  workloads
-- [operations/local-ci.md](operations/local-ci.md) - local validation profiles
-  used instead of always-on hosted CI
-- [runbooks/README.md](runbooks/README.md) - operator runbooks for API error
-  codes and `doc_url` links
+- [Session event conventions](reference/session-event-conventions.md)
+- [Sandbox snapshot contract](reference/sandbox-snapshot-contract.md)
+- [Adapter readiness checklist](reference/adapter-readiness-checklist.md)
 
-Operational assets live outside `docs/`: cloud provisioning is under
-`infra/`, local CI and smoke/perf operations are under `ops/`, benchmark tooling
-is under `tools/agentdb-bench/`, and top-level `scripts/` is reserved for
-small repo-wide entrypoints.
+## Deploy And Operate
 
-## Cluster Work
+Start with [deployment](operations/deployment.md), the
+[operations guide](operations/operations.md), and the
+[single-node preflight checklist](operations/single-node-production-checklist.md).
 
-- [operations/cluster-status.md](operations/cluster-status.md) - honest status
-  of multi-node support and missing operator workflows today
-- [operations/cluster-deployment.md](operations/cluster-deployment.md) -
-  forward-looking target deployment model for a real AgentDB cluster
-- [operations/cluster-operations.md](operations/cluster-operations.md) -
-  forward-looking day-2 workflows for add/remove/replace/drain/upgrade
-- [operations/cluster-alerts.md](operations/cluster-alerts.md) - evaluation
-  cluster alert triage
-- [operations/real-cluster-smoke.md](operations/real-cluster-smoke.md) -
-  local multi-process Raft smoke harness
+| Task | Guides |
+|---|---|
+| Administer and maintain | [agentdbctl](operations/agentdbctl.md), [routine maintenance](operations/routine-maintenance.md), [single-node upgrades](operations/single-node-upgrade.md) |
+| Back up and restore | [Backup verification](operations/backup-verification.md), [offline restore](operations/restore-recovery.md), [object-store recovery](operations/recovery.md) |
+| Manage storage | [Storage maintenance](operations/storage-maintenance.md), [backpressure](operations/storage-backpressure.md), [disk-full recovery](operations/disk-full-recovery.md), [tiered storage](operations/tiered-storage.md) |
+| Export events | [CDC and export](operations/cdc-export.md) |
+| Investigate API errors | [Error runbooks](runbooks/README.md) |
+| Measure performance | [Performance notes](operations/performance.md), [benchmark methodology](operations/agentdb-bench.md) |
 
-## Reference
+Operational tooling lives outside this directory: [infra](../infra/) holds cloud
+provisioning, [ops](../ops/) holds local validation and smoke/performance
+operations, [tools/agentdb-bench](../tools/agentdb-bench/) holds the benchmark
+suite, and [scripts](../scripts/) holds repository-wide entrypoints.
 
-- [reference/api-sdk.md](reference/api-sdk.md) - native HTTP API and SDK surface
-- [reference/session-event-conventions.md](reference/session-event-conventions.md)
-  - canonical event payload conventions
-- [reference/sandbox-snapshot-contract.md](reference/sandbox-snapshot-contract.md)
-  - contract between AgentDB snapshot refs and an external sandbox service
-- [reference/adapter-readiness-checklist.md](reference/adapter-readiness-checklist.md)
-  - adapter behavior and validation expectations
+## Architecture And Design
 
-## Validation And Release
+The [design overview](design/design.md) records commitments and implementation
+status; the [architecture map](design/architecture.md) describes crate
+boundaries, request flow, and runtime storage.
 
-- [testing/testing-evidence-contract.md](testing/testing-evidence-contract.md)
-  - the evidence a change must carry to be considered validated
-- [release-checklist.md](release-checklist.md) - public-release and tag
-  readiness checklist
+- [Tablet storage engine](design/tablet-storage-engine.md): storage, replication,
+  movement, and remaining hardening work.
+- [Encryption at rest](design/encryption-at-rest.md): implemented surface,
+  threat model, key lifecycle, and qualification requirements.
+- [Clustered read semantics](design/read-semantics.md): consistency labels,
+  barriers, and endpoint classification.
+- [Tablet attachment evaluation](design/tablet-attachment-evaluation.md):
+  opt-in SST movement evidence and deferred lazy attachment.
 
-## Forward-Looking Designs
+## Experimental Cluster Work
 
-- [design/observability-export.md](design/observability-export.md)
-  - design for exporting AgentDB runtime truth into observability and analytics
-  sinks
-- [design/lifecycle-storage.md](design/lifecycle-storage.md)
-  - warm/cold/archive session storage semantics and large artifact
-  content handling
-- [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) - dependency license
-  and release notice guidance
+Read [cluster status](operations/cluster-status.md) first for current support
+boundaries. The target topology and operational workflows below do not establish
+production Cell-level failure isolation.
+
+- [Cluster storage topology](design/cluster-storage-topology.md): Cells,
+  placement, and failure domains.
+- [Distributed safety hardening](design/distributed-safety-hardening.md):
+  correctness requirements and validation work.
+- [Cluster deployment](operations/cluster-deployment.md)
+- [Cluster operations](operations/cluster-operations.md)
+- [Cluster alert triage](operations/cluster-alerts.md)
+- [Multi-process cluster smoke](operations/real-cluster-smoke.md)
+
+## Proposals And Design Background
+
+These documents contain target behavior and implementation history. Consult
+linked API and operations guides for supported behavior today.
+
+- [Lifecycle storage](design/lifecycle-storage.md): lifecycle design background;
+  current operation is documented in [tiered storage](operations/tiered-storage.md).
+- [Observability export](design/observability-export.md): export design and
+  delivery notes; current operation is documented in [CDC/export](operations/cdc-export.md).
+- [S3 committed-log archive](design/s3-committed-log-archive.md): proposed,
+  unimplemented continuous log archiving.
+
+## Contribute, Validate, And Release
+
+- [Contribution guide](../CONTRIBUTING.md)
+- [Local and hosted CI](operations/local-ci.md)
+- [Testing evidence contract](testing/testing-evidence-contract.md)
+- [Protocol model](formal/auto/S14_protocol_models_preserve_quorum_routing_movement_and_export_ack_invariants.tla)
+  and [TLC configuration](formal/auto/S14_protocol_models_preserve_quorum_routing_movement_and_export_ack_invariants.cfg)
+- [Release checklist](release-checklist.md)
+- [Third-party notices](../THIRD_PARTY_NOTICES.md)
+
+## Historical Records
+
+Archived notes preserve earlier results and implementation stages. Their
+“current” statements, defaults, and plans are historical, not operational guidance.
+
+- [Benchmark evaluation history](archive/benchmark-evaluation-history.md)
+- [Encryption implementation history](archive/encryption-implementation-history.md)
+
+When updating documentation, keep current instructions in the relevant guide,
+label proposed behavior explicitly, and move superseded run logs or milestone
+narratives into `archive/`. Preserve canonical guide paths and update links when
+moving material.

@@ -21,10 +21,7 @@ struct RecordingProvisioner {
 #[async_trait::async_trait]
 impl TenantKeyProvisioner for RecordingProvisioner {
     async fn provision_tenant(&self, tenant_id: &str) -> Result<()> {
-        self.provisioned
-            .lock()
-            .unwrap()
-            .push(tenant_id.to_string());
+        self.provisioned.lock().unwrap().push(tenant_id.to_string());
         Ok(())
     }
 }

@@ -1,9 +1,0 @@
-{
-  "backend": "agentdb-native-rocksdb",
-  "storage_engine": "rocksdb",
-  "content_engine": "localfs",
-  "data_dir": "/home/lishen/work/agentdb-author-bench-s13/state/author-s13-20260518-204140/rocksdb",
-  "content_dir": "/home/lishen/work/agentdb-author-bench-s13/state/author-s13-20260518-204140/content",
-  "durability_profile": "single-node-wal",
-  "note": "For agentdb-native-rocksdb, RocksDB stores metadata/indexes; artifact bytes are stored by the content engine."
-}

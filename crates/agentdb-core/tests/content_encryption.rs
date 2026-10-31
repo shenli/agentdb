@@ -16,7 +16,9 @@ use agentdb_storage::{
 
 fn envelope_keyring() -> Arc<dyn EnvelopeCrypto> {
     Arc::new(AeadTenantKeyring::new(
-        Arc::new(LocalKeyProvider::from_secret(b"content-encryption-test-root")),
+        Arc::new(LocalKeyProvider::from_secret(
+            b"content-encryption-test-root",
+        )),
         Suite::XChaCha20Poly1305,
         DekCacheConfig::default(),
     ))
@@ -129,16 +131,16 @@ async fn identical_content_for_two_tenants_is_independent_ciphertext() {
         .get(b.tenant_id.as_str(), art_b.artifact_id.as_str())
         .await
         .unwrap();
-    assert_ne!(raw_a, raw_b, "identical plaintext must not share ciphertext");
+    assert_ne!(
+        raw_a, raw_b,
+        "identical plaintext must not share ciphertext"
+    );
 }
 
 /// Every raw value in the KV store, so a test can prove a plaintext marker is
 /// absent from what actually lands on disk.
 fn raw_kv_values(kv: &Arc<dyn KvStore + Send + Sync>) -> Vec<Vec<u8>> {
-    kv.scan_prefix(b"")
-        .unwrap()
-        .map(|r| r.unwrap().1)
-        .collect()
+    kv.scan_prefix(b"").unwrap().map(|r| r.unwrap().1).collect()
 }
 
 fn marker_present(values: &[Vec<u8>], marker: &[u8]) -> bool {
@@ -297,7 +299,10 @@ async fn envelope_runtime_reads_legacy_plaintext_content() {
         .get(t.tenant_id.as_str(), art.artifact_id.as_str())
         .await
         .unwrap();
-    assert!(!is_envelope_v2(&raw), "disabled path must not write v2 frames");
+    assert!(
+        !is_envelope_v2(&raw),
+        "disabled path must not write v2 frames"
+    );
 
     // 2. An envelope-enabled runtime hydrates from the same store and reads the
     //    legacy content back as plaintext.

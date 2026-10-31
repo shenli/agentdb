@@ -30,7 +30,8 @@ export AGENTDB_TOKEN=...
 
 `AGENTDB_TOKEN` may be the installation-wide static bearer token, an `admin`
 metadata token, or a `readonly` metadata token for GET-only admin commands.
-Metadata admin tokens do not authorize tenant data/export routes. The server
+Admin and read-only tokens also authorize data routes within their method
+limits; tenant-scoped tokens authorize only their bound tenant data routes. The server
 returns a minted token plaintext once from `POST /api/admin/tokens`; list and
 revoke it with `agentdbctl raw` until dedicated token subcommands are added.
 

@@ -34,6 +34,7 @@ jobs:
   build:
     name: build (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -48,10 +49,9 @@ jobs:
             # enough on a Linux runner; avoids paying for an arm64
             # runner just for one binary.
             linker: aarch64-linux-gnu-gcc
-            apt-packages: gcc-aarch64-linux-gnu
+            apt-packages: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           - platform: darwin-x86_64
-            runner: macos-13     # Intel runners are deprecated;
-            # macos-13 is the last with x86_64 support.
+            runner: macos-15-intel
             target: x86_64-apple-darwin
           - platform: darwin-aarch64
             runner: macos-latest # Apple Silicon by default.
@@ -100,19 +100,24 @@ jobs:
       - name: Build release binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.linker }}
+          CXX_aarch64_unknown_linux_gnu: ${{ matrix.platform == 'linux-aarch64' && 'aarch64-linux-gnu-g++' || '' }}
         run: |
           cargo build --release --locked -p agentdb-server -p agentdbctl --target ${{ matrix.target }}
 
       - name: Strip + package
         id: pack
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ github.event.inputs.tag }}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$REQUESTED_TAG"
             if [ -z "$tag" ]; then tag="dev-$(date -u +%Y%m%d%H%M%S)"; fi
           fi
+          [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "Invalid archive tag" >&2; exit 1; }
           stage="agentdb-${tag}-${{ matrix.platform }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/agentdb" "$stage/agentdb"
@@ -122,7 +127,7 @@ jobs:
           # doesn't shrink the binary.
           strip "$stage/agentdb" || true
           strip "$stage/agentdbctl" || true
-          cp README.md LICENSE "$stage/" 2>/dev/null || true
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md "$stage/"
           tar -C "$(dirname "$stage")" -czf "${stage}.tar.gz" "$(basename "$stage")"
           shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
           echo "asset=${stage}.tar.gz" >> "$GITHUB_OUTPUT"
@@ -144,7 +149,8 @@ jobs:
           files: |
             ${{ steps.pack.outputs.asset }}
             ${{ steps.pack.outputs.checksum }}
-          draft: false
+          draft: true
+          prerelease: true
           fail_on_unmatched_files: true
           generate_release_notes: true
 
@@ -158,6 +164,7 @@ jobs:
     steps:
       - name: Summary
         run: |
-          echo "All build jobs finished."
+          test "${{ needs.build.result }}" = success
+          echo "All build jobs passed."
           echo "Trigger: ${{ github.event_name }}"
           echo "Ref:     ${{ github.ref }}"

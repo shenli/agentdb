@@ -37,14 +37,23 @@ async fn open_ids(app: &TestApp) -> (String, String) {
 fn labs_routes(t: &str, s: &str) -> Vec<(&'static str, String)> {
     vec![
         ("POST", format!("/api/tenants/{t}/records")),
-        ("GET", format!("/api/tenants/{t}/records/search?namespace=mem")),
+        (
+            "GET",
+            format!("/api/tenants/{t}/records/search?namespace=mem"),
+        ),
         ("POST", format!("/api/tenants/{t}/records/upsert")),
         ("POST", format!("/api/tenants/{t}/sessions/{s}/context")),
-        ("POST", format!("/api/tenants/{t}/sessions/{s}/replay-prefix")),
+        (
+            "POST",
+            format!("/api/tenants/{t}/sessions/{s}/replay-prefix"),
+        ),
         ("POST", format!("/api/tenants/{t}/sessions/{s}/lifecycle")),
         ("GET", format!("/api/tenants/{t}/sessions/{s}/storage")),
         ("POST", format!("/api/tenants/{t}/policy/gc-sweep")),
-        ("GET", format!("/api/tenants/{t}/artifacts/verify-lifecycle")),
+        (
+            "GET",
+            format!("/api/tenants/{t}/artifacts/verify-lifecycle"),
+        ),
     ]
 }
 
@@ -83,7 +92,12 @@ async fn labs_routes_are_not_mounted_by_default() {
         "core session get must stay mounted",
     );
     assert_ne!(
-        status(&app, "GET", &format!("/api/tenants/{t}/sessions/{s}/replay")).await,
+        status(
+            &app,
+            "GET",
+            &format!("/api/tenants/{t}/sessions/{s}/replay")
+        )
+        .await,
         StatusCode::NOT_FOUND,
         "core replay must stay mounted (only replay-prefix is Labs)",
     );

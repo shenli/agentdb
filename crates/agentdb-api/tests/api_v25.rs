@@ -217,7 +217,6 @@ async fn context_and_watch_work_over_http() {
     assert_eq!(context["events"].as_array().unwrap().len(), 1);
     assert_eq!(context["records"].as_array().unwrap().len(), 1);
     assert!(context["policy"].is_object());
-
 }
 
 #[tokio::test]
@@ -351,14 +350,7 @@ async fn export_status_reports_durable_export_capabilities() {
     assert_eq!(status["durable_ledger"], false);
     assert_eq!(
         status["supported_object_types"],
-        json!([
-            "event",
-            "tenant",
-            "agent",
-            "session",
-            "artifact",
-            "record"
-        ])
+        json!(["event", "tenant", "agent", "session", "artifact", "record"])
     );
 }
 

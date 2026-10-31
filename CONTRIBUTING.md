@@ -12,7 +12,9 @@ Required tools:
 - Python 3.9+
 - Node.js 20+
 - `cargo-deny` for full dependency license audits:
-  `cargo install cargo-deny`
+  `cargo install cargo-deny --version 0.20.2 --locked`
+- Python 3.11+ for release scripts (`tomllib`), Gitleaks 8.30.1 and
+  actionlint 1.7.12 for public-release checks. The SDK itself supports Python 3.9+.
 
 Start the dev server:
 
@@ -36,6 +38,16 @@ For a fuller local CI-style run:
 ```bash
 ops/local-ci/scripts/local-ci.sh
 ```
+
+Pull requests and pushes to `main` run bounded Linux Rust/SDK, release-hygiene,
+and container checks. Distributed chaos/soak remains local/nightly. To exercise
+the same live SDK tests locally, build the server first and set
+`AGENTDB_PYTHON_SMOKE=1` / `AGENTDB_TYPESCRIPT_SMOKE=1` for the respective suite.
+Run `python3 scripts/release-smoke.py` to verify persistent crash recovery,
+artifacts, idempotent retry, replay, and fork through the native Python SDK.
+
+Before publication, follow [the release checklist](docs/release-checklist.md).
+Keep raw test logs outside Git; `test-sessions/` is an ignored local fallback.
 
 ## Pull Requests
 

@@ -1141,7 +1141,10 @@ single-session appends or record writes.
    caught-up local source, or fetches one from a healthy caught-up remote source
    replica over the authenticated internal movement snapshot endpoint, installs
    it into the destination tablet, and updates that node's destination
-   `tablet_replicas` progress and health. `tablet_replicas` changes emit the
+   `tablet_replicas` progress and health. Both the HTTP export endpoint and the
+   movement executor decode snapshots through `TabletStateSnapshot::decode`,
+   accepting the current `ADBS` binary encoding and legacy JSON payloads.
+   `tablet_replicas` changes emit the
    tablet metadata notification used by cluster workers, so split/merge-created
    destination replicas are opened as local `raft-rs` runtime groups by the
    same registry sync path used at startup. After cutover, the scheduler deletes

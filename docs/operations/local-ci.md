@@ -1,7 +1,11 @@
 # Local CI
 
-GitHub CI is manual-only to control cost. The default validation path is a local
-CI runner backed by `ops/local-ci/scripts/local-ci.sh`.
+GitHub CI runs bounded Linux checks on pull requests and pushes to `main`,
+with a manual dispatch option. It checks formatting, clippy, Rust and SDK tests,
+the persistent release recovery journey, Docker workspace inputs, workflow
+syntax, strict dependency license policy, and secret history. Distributed chaos
+and soak tests remain on the local/nightly runner:
+`ops/local-ci/scripts/local-ci.sh`.
 
 ## Run Profiles
 
@@ -146,7 +150,7 @@ systemctl --user start agentdb-local-ci-nightly.service
 ## Distributed Test Plan Gates
 
 The distributed test plan gates run from the same clean
-`~/work/agentdb-nightly` checkout. Install the user timer on `li-dev`:
+`~/work/agentdb-nightly` checkout. Install the user timer on your Linux CI host:
 
 ```bash
 mkdir -p ~/work
@@ -209,3 +213,8 @@ ops/local-ci/scripts/local-ci-prune.sh --root ~/agentdb-ci-runs --keep 30
 `ops/local-ci/scripts/local-ci-nightly.sh` runs `git pull --ff-only` before testing and
 refuses to pull if the checkout is dirty. Use a clean checkout for scheduled CI.
 For one-off testing against local changes, run `ops/local-ci/scripts/local-ci.sh` directly.
+
+Generated test logs and machine-specific diagnostics belong outside source control.
+The `test-sessions/` fallback is ignored; use `AGENTDB_DISTRIBUTED_RUN_ROOT`
+for retained evidence. Share a reviewed summary with command, commit, result,
+and coverage limits rather than committing raw logs.

@@ -5,9 +5,10 @@ reports.
 
 ## Reporting A Vulnerability
 
-Use GitHub private vulnerability reporting if it is enabled for the repository.
-If it is not available, email the maintainer at the address listed on the GitHub
-profile for this repository owner. Include:
+Use [GitHub private vulnerability reporting](https://github.com/shenli/agentdb/security/advisories/new).
+If that form is unavailable, contact the maintainer through the contact details
+on [the repository owner's profile](https://github.com/shenli) and request a
+private reporting channel before sharing vulnerability details. Include:
 
 - affected component or API;
 - reproduction steps or proof of concept;

@@ -53,7 +53,11 @@ async fn batch_appends_events_in_one_call_with_contiguous_seqs() {
         .map(|i| json!({ "kind": "message", "payload": { "n": i } }))
         .collect();
     let resp = batch(&app, &s, json!(events)).await;
-    assert!(resp.status().is_success(), "batch failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "batch failed: {}",
+        resp.status()
+    );
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["count"], 5);
     let appended = body["appended"].as_array().unwrap();
@@ -84,7 +88,12 @@ async fn batch_appends_events_in_one_call_with_contiguous_seqs() {
     assert_eq!(event_count, 5);
 
     // A second batch continues the seq sequence.
-    let resp = batch(&app, &s, json!([{ "kind": "message", "payload": { "n": 5 } }])).await;
+    let resp = batch(
+        &app,
+        &s,
+        json!([{ "kind": "message", "payload": { "n": 5 } }]),
+    )
+    .await;
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["appended"][0]["seq"], 5);
 }

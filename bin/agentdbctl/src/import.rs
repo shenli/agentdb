@@ -18,10 +18,10 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
+pub(crate) use agentdb_import::Source;
 use agentdb_import::{
     classify_line, collect_jsonl, derive_identity, read_prefix_lines, resolve_dir, LineClass, State,
 };
-pub(crate) use agentdb_import::Source;
 
 use crate::{Api, ImportArgs};
 
@@ -80,12 +80,7 @@ pub(crate) async fn run(api: &Api, source: Source, args: ImportArgs) -> Result<V
     }
 }
 
-async fn import_once(
-    api: &Api,
-    source: Source,
-    dir: &Path,
-    state: &mut State,
-) -> Result<Summary> {
+async fn import_once(api: &Api, source: Source, dir: &Path, state: &mut State) -> Result<Summary> {
     let mut summary = Summary::default();
     let mut files = Vec::new();
     collect_jsonl(dir, &mut files)?;
@@ -189,9 +184,12 @@ async fn flush(
 ) -> Result<usize> {
     let n = batch.len();
     let body = json!({ "agent_id": agent_id, "events": std::mem::take(batch) });
-    api.post(path, body)
-        .await
-        .with_context(|| format!("append batch ending at line {last_idx} of {}", file.display()))?;
+    api.post(path, body).await.with_context(|| {
+        format!(
+            "append batch ending at line {last_idx} of {}",
+            file.display()
+        )
+    })?;
     Ok(n)
 }
 
@@ -204,7 +202,10 @@ async fn ensure_workspace(api: &Api, external_key: &str) -> Result<String> {
         return id_field(found, "tenant_id");
     }
     let created = api
-        .post("/api/tenants", json!({ "external_key": external_key, "policy": {} }))
+        .post(
+            "/api/tenants",
+            json!({ "external_key": external_key, "policy": {} }),
+        )
         .await?;
     id_field(&created, "tenant_id")
 }
@@ -227,7 +228,9 @@ async fn ensure_agent(api: &Api, tenant_id: &str, alias: &str) -> Result<String>
 }
 
 async fn ensure_session(api: &Api, tenant_id: &str, agent_id: &str, alias: &str) -> Result<String> {
-    let list = api.get(&format!("/api/tenants/{tenant_id}/sessions")).await?;
+    let list = api
+        .get(&format!("/api/tenants/{tenant_id}/sessions"))
+        .await?;
     if let Some(found) = list["sessions"]
         .as_array()
         .and_then(|a| a.iter().find(|x| x["alias"] == json!(alias)))

@@ -33,7 +33,7 @@ Current default timing:
 | `AGENTDB_SCHEDULER_RENEW_INTERVAL_MS` | 10 s | Scheduler tick cadence for ownership reconciliation, rebalance, and cleanup. |
 | `AGENTDB_NODE_HEARTBEAT_MS` | 5 s | Node control-plane heartbeat cadence. |
 | `AGENTDB_STALE_NODE_THRESHOLD_MS` | 180 s | Time before an `alive` node is marked `dead`. |
-| `AGENTDB_REAPER_SAFETY_MARGIN_MS` | 5 s | Extra ownership-lease grace before expired leases are cleared. |
+| `AGENTDB_REAPER_SAFETY_MARGIN_MS` | 60 s | Extra ownership-lease grace before expired leases are cleared. |
 
 Expected single-node failure RTO when quorum remains is:
 

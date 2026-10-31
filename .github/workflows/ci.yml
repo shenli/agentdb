@@ -1,28 +1,10 @@
-# Manual CI. Automatic GitHub CI is intentionally disabled for
-# cost control; the default pre-merge validation path is the
-# local runner:
-#
-#   ops/local-ci/scripts/local-ci.sh
-#
-# Keep this workflow as an on-demand cloud fallback when a PR
-# needs GitHub-hosted verification.
-#
-# Linux-only by design. macOS minutes on GH Actions are 10×
-# Linux minutes; we don't need OS coverage for build correctness
-# (the release workflow handles cross-platform binaries on tag
-# push). Linux fast-fails any logic / API regression cheaply.
-#
-# Two jobs run in parallel:
-#
-#   * `cargo` — fmt, clippy, full workspace test. The bulk of
-#     PR signal.
-#   * `sdks` — Python + TypeScript SDK smoke tests against
-#     `agentdb serve --dev`. Ensures the public client surface
-#     keeps working as the server changes.
-
+# Bounded Linux PR/main checks; distributed chaos and soak remain local/nightly.
 name: ci
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       run_sdks:
@@ -30,6 +12,9 @@ on:
         required: false
         default: true
         type: boolean
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -52,6 +37,36 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  release-hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: false
+      - name: Install audit tools
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          go install github.com/gitleaks/gitleaks/v8@v8.30.1
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Public release checks
+        run: |
+          python3 scripts/check-release-inputs.py
+          actionlint -shellcheck=
+          python3 scripts/check-secrets.py
+          LICENSE_CHECK_STRICT=1 scripts/license-check.sh
+
   cargo:
     name: cargo (fmt + clippy + test)
     runs-on: ubuntu-latest
@@ -96,11 +111,8 @@ jobs:
           restore-keys: |
             cargo-ci-${{ runner.os }}-
 
-      # `cargo fmt --check` is intentionally not enabled yet —
-      # the workspace has pre-existing drift across many files
-      # and a one-shot `cargo fmt --all` cleanup is a separate
-      # follow-up PR (so the diff stays scoped). Re-enable here
-      # once that runs.
+      - name: cargo fmt
+        run: cargo fmt --all --check
 
       - name: cargo clippy
         run: cargo clippy --workspace --tests -- -D warnings
@@ -115,7 +127,7 @@ jobs:
 
   sdks:
     name: SDK smoke (Python + TypeScript)
-    if: ${{ inputs.run_sdks }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_sdks }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -154,8 +166,8 @@ jobs:
 
       # The SDK smoke tests each spawn `agentdb serve --dev`
       # as a subprocess — they need the debug binary present.
-      - name: cargo build (server only)
-        run: cargo build -p agentdb-server --locked
+      - name: cargo build (server and CLI)
+        run: cargo build -p agentdb-server -p agentdbctl --locked
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -170,12 +182,15 @@ jobs:
           python -m pip install -e 'clients/python[async]' pytest
 
       - name: pytest (Python SDK smoke)
-        run: pytest clients/python -q
+        run: AGENTDB_PYTHON_SMOKE=1 pytest clients/python -q
+
+      - name: Persistent release recovery journey
+        run: python scripts/release-smoke.py --bin target/debug/agentdb --ctl target/debug/agentdbctl
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: clients/typescript/package-lock.json
 
@@ -190,4 +205,4 @@ jobs:
         # `npm test` re-runs the build inside the script; that's
         # fast on the warm cache and ensures the test runs
         # against the just-built dist/.
-        run: npm test
+        run: AGENTDB_TYPESCRIPT_SMOKE=1 npm test

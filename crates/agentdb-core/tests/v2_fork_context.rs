@@ -479,9 +479,7 @@ async fn export_watch_cursor_includes_tablet_context_and_applied_index() {
     assert_eq!(items[0].tablet_epoch, Some(9));
     assert!(items[0].applied_index.unwrap_or_default() > 0);
     assert!(items[0].cursor.starts_with("ledger:"));
-    assert!(items[0]
-        .cursor
-        .contains(session.session_id.as_str()));
+    assert!(items[0].cursor.contains(session.session_id.as_str()));
 
     let resumed_without_route_context = rt
         .export_watch(ExportWatchRequest {

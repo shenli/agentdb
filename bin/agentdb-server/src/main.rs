@@ -693,8 +693,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             // The rotator/revoker are the same provider; keep handles to install
             // on the runtime after it is built (the admin key-management paths).
             let cluster_rotator = cluster_crypto.as_ref().map(|(_, _, r, _, _)| Arc::clone(r));
-            let cluster_revoker = cluster_crypto.as_ref().map(|(_, _, _, rv, _)| Arc::clone(rv));
-            let cluster_retirer = cluster_crypto.as_ref().map(|(_, _, _, _, rt)| Arc::clone(rt));
+            let cluster_revoker = cluster_crypto
+                .as_ref()
+                .map(|(_, _, _, rv, _)| Arc::clone(rv));
+            let cluster_retirer = cluster_crypto
+                .as_ref()
+                .map(|(_, _, _, _, rt)| Arc::clone(rt));
             let runtime = match config.tablet_store_layout {
                 TabletStoreLayoutKind::PrefixScoped => match cluster_crypto {
                     Some((keyring, provisioner, _rotator, _revoker, _retirer)) => {
@@ -855,7 +859,11 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         })
         .with_tablet_store_status(tablet_store_status(&config))
         .with_disk_budget(
-            if config.in_memory { 0 } else { config.disk_budget_bytes },
+            if config.in_memory {
+                0
+            } else {
+                config.disk_budget_bytes
+            },
             if config.in_memory {
                 Vec::new()
             } else {
@@ -952,8 +960,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             // Plain mirror (no managed cache) has no periodic cache sweep, so a
             // dedicated reconcile loop provides the same ongoing re-drive that
             // cache-mode deployments get from the sweep above.
-            let reconcile_interval =
-                Duration::from_millis(config.content_cache_sweep_interval_ms);
+            let reconcile_interval = Duration::from_millis(config.content_cache_sweep_interval_ms);
             let mirror = content_mirror.clone();
             tokio::spawn(async move {
                 loop {
@@ -2392,8 +2399,12 @@ fn keyring_from_settings(
 /// Parse the KEK + AEAD suite from `AGENTDB_ENCRYPTION_*`. `None` when disabled;
 /// fails closed if envelope mode lacks a KEK secret. Shared by the single-node
 /// (KV catalog) and cluster (meta catalog) keyring builders.
-fn encryption_kek_and_suite(
-) -> anyhow::Result<Option<(Arc<dyn agentdb_storage::KekProvider>, agentdb_storage::Suite)>> {
+fn encryption_kek_and_suite() -> anyhow::Result<
+    Option<(
+        Arc<dyn agentdb_storage::KekProvider>,
+        agentdb_storage::Suite,
+    )>,
+> {
     let mode = std::env::var("AGENTDB_ENCRYPTION_MODE").unwrap_or_else(|_| "disabled".to_string());
     match mode.trim() {
         "" | "disabled" => Ok(None),
@@ -2453,8 +2464,7 @@ async fn build_cluster_keyring_and_provisioner(
     if refresh_ms > 0 {
         let refresher = provider.clone();
         tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_millis(refresh_ms));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(refresh_ms));
             ticker.tick().await; // the first tick fires immediately; skip it
             loop {
                 ticker.tick().await;
@@ -3432,7 +3442,9 @@ fn service_install(bind: Option<SocketAddr>, no_start: bool) -> anyhow::Result<(
             println!("Enabled and started. AgentDB will run at login.");
             println!("(For it to run while logged out: `loginctl enable-linger $USER`.)");
         } else {
-            println!("Wrote the unit, but `systemctl --user enable --now` failed; enable it manually:");
+            println!(
+                "Wrote the unit, but `systemctl --user enable --now` failed; enable it manually:"
+            );
             println!("  systemctl --user enable --now {SYSTEMD_UNIT}");
         }
     } else {
@@ -3453,7 +3465,10 @@ fn service_uninstall() -> anyhow::Result<()> {
         std::fs::remove_file(&unit_path)?;
         println!("Removed {}", unit_path.display());
     } else {
-        println!("No service unit at {} (nothing to remove)", unit_path.display());
+        println!(
+            "No service unit at {} (nothing to remove)",
+            unit_path.display()
+        );
     }
     if cfg!(target_os = "linux") {
         run_ok("systemctl", &["--user", "daemon-reload"]);
@@ -3472,7 +3487,9 @@ fn service_status() -> anyhow::Result<()> {
         println!("Runtime state (`launchctl list | grep {SERVICE_LABEL}`):");
         let _ = std::process::Command::new("sh")
             .arg("-c")
-            .arg(format!("launchctl list | grep {SERVICE_LABEL} || echo '  not loaded'"))
+            .arg(format!(
+                "launchctl list | grep {SERVICE_LABEL} || echo '  not loaded'"
+            ))
             .status();
     } else if cfg!(target_os = "linux") {
         let _ = std::process::Command::new("systemctl")
@@ -6848,8 +6865,7 @@ async fn run_local_tablet_movement_executor_tick(
                     .await?
                     .payload()?
             };
-            let snapshot: agentdb_core::tablet_state::TabletStateSnapshot =
-                serde_json::from_slice(&payload)?;
+            let snapshot = agentdb_core::tablet_state::TabletStateSnapshot::decode(&payload)?;
             let installed = match movement_type {
                 "split" | "manual_split" => runtime
                     .install_tablet_snapshot_payload(movement.destination_tablet_id, &payload)
@@ -7034,9 +7050,11 @@ mod tests {
     #[test]
     fn keyring_settings_disabled_or_unset_yields_none() {
         let kv = test_kv();
-        assert!(keyring_from_settings("disabled", None, "local:v1", None, &kv)
-            .unwrap()
-            .is_none());
+        assert!(
+            keyring_from_settings("disabled", None, "local:v1", None, &kv)
+                .unwrap()
+                .is_none()
+        );
         assert!(keyring_from_settings("", None, "local:v1", None, &kv)
             .unwrap()
             .is_none());
@@ -7286,7 +7304,10 @@ mod tests {
             super::xml_escape("/opt/a & b/<agentdb>"),
             "/opt/a &amp; b/&lt;agentdb&gt;"
         );
-        assert_eq!(super::xml_escape("/usr/local/bin/agentdb"), "/usr/local/bin/agentdb");
+        assert_eq!(
+            super::xml_escape("/usr/local/bin/agentdb"),
+            "/usr/local/bin/agentdb"
+        );
     }
 
     #[test]

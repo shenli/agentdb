@@ -1,5 +1,10 @@
 # CDC And Export
 
+Start the server with `serve --changefeed` (or `AGENTDB_CHANGEFEED=1`) before
+using this runbook. The ledger and export feed are disabled by default. Enabling
+it later does not retroactively record mutations made while it was disabled.
+
+
 This runbook covers the single-node CDC/export operator story. AgentDB exposes
 runtime change data through one public changefeed over the durable export
 ledger. Use it for replication into observability, archive, and lakehouse sinks.

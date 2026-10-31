@@ -187,11 +187,7 @@ pub struct CommandKekProvider {
 }
 
 impl CommandKekProvider {
-    pub fn new(
-        program: impl Into<String>,
-        args: Vec<String>,
-        kek_ref: impl Into<String>,
-    ) -> Self {
+    pub fn new(program: impl Into<String>, args: Vec<String>, kek_ref: impl Into<String>) -> Self {
         Self {
             program: program.into(),
             args,
@@ -220,7 +216,10 @@ impl CommandKekProvider {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
-                CryptoError::Config(format!("KEK command {:?} failed to start: {e}", self.program))
+                CryptoError::Config(format!(
+                    "KEK command {:?} failed to start: {e}",
+                    self.program
+                ))
             })?;
         // The payload (a 32-byte DEK or a small wrapped blob) is far below any
         // pipe buffer, so writing it in full before reading stdout cannot
@@ -314,7 +313,9 @@ mod tests {
         let wrapped = kek.wrap_dek("ten_a", KeyPurpose::Content, &dek).unwrap();
         assert_eq!(wrapped.wrapping_key_ref, "local:v1");
         assert_ne!(wrapped.ciphertext, dek.to_vec(), "DEK stored in the clear");
-        let unwrapped = kek.unwrap_dek("ten_a", KeyPurpose::Content, &wrapped).unwrap();
+        let unwrapped = kek
+            .unwrap_dek("ten_a", KeyPurpose::Content, &wrapped)
+            .unwrap();
         assert_eq!(unwrapped.as_slice(), &dek);
     }
 
@@ -323,7 +324,9 @@ mod tests {
         let kek = LocalKekProvider::from_secret(b"kek-secret", "local:v1");
         let dek = [7u8; 32];
         let wrapped = kek.wrap_dek("ten_a", KeyPurpose::Content, &dek).unwrap();
-        assert!(kek.unwrap_dek("ten_b", KeyPurpose::Content, &wrapped).is_err());
+        assert!(kek
+            .unwrap_dek("ten_b", KeyPurpose::Content, &wrapped)
+            .is_err());
         assert!(kek
             .unwrap_dek("ten_a", KeyPurpose::Metadata, &wrapped)
             .is_err());
@@ -333,17 +336,25 @@ mod tests {
     fn unwrap_under_a_different_kek_fails_closed() {
         let kek1 = LocalKekProvider::from_secret(b"secret-1", "local:v1");
         let kek2 = LocalKekProvider::from_secret(b"secret-2", "local:v2");
-        let wrapped = kek1.wrap_dek("ten_a", KeyPurpose::Content, &[7u8; 32]).unwrap();
+        let wrapped = kek1
+            .wrap_dek("ten_a", KeyPurpose::Content, &[7u8; 32])
+            .unwrap();
         // Different ref → rejected before even attempting decryption.
-        assert!(kek2.unwrap_dek("ten_a", KeyPurpose::Content, &wrapped).is_err());
+        assert!(kek2
+            .unwrap_dek("ten_a", KeyPurpose::Content, &wrapped)
+            .is_err());
     }
 
     #[test]
     fn tampered_wrapped_dek_fails() {
         let kek = LocalKekProvider::from_secret(b"kek-secret", "local:v1");
-        let mut wrapped = kek.wrap_dek("ten_a", KeyPurpose::Content, &[7u8; 32]).unwrap();
+        let mut wrapped = kek
+            .wrap_dek("ten_a", KeyPurpose::Content, &[7u8; 32])
+            .unwrap();
         wrapped.ciphertext[0] ^= 0x01;
-        assert!(kek.unwrap_dek("ten_a", KeyPurpose::Content, &wrapped).is_err());
+        assert!(kek
+            .unwrap_dek("ten_a", KeyPurpose::Content, &wrapped)
+            .is_err());
     }
 
     // A portable mock "KMS": `wrap` prepends a fixed 4-byte header, `unwrap`
@@ -365,8 +376,14 @@ mod tests {
             wrapped.ciphertext.starts_with(b"WRP1"),
             "the external command actually ran and transformed the DEK"
         );
-        assert_ne!(wrapped.ciphertext, dek.to_vec(), "DEK is not stored in the clear");
-        let unwrapped = kek.unwrap_dek("ten_a", KeyPurpose::Content, &wrapped).unwrap();
+        assert_ne!(
+            wrapped.ciphertext,
+            dek.to_vec(),
+            "DEK is not stored in the clear"
+        );
+        let unwrapped = kek
+            .unwrap_dek("ten_a", KeyPurpose::Content, &wrapped)
+            .unwrap();
         assert_eq!(unwrapped.as_slice(), &dek);
     }
 
@@ -378,22 +395,24 @@ mod tests {
             nonce: vec![],
             ciphertext: b"WRP1anything".to_vec(),
         };
-        assert!(kek.unwrap_dek("ten_a", KeyPurpose::Content, &wrapped).is_err());
+        assert!(kek
+            .unwrap_dek("ten_a", KeyPurpose::Content, &wrapped)
+            .is_err());
     }
 
     #[test]
     fn command_kek_fails_closed_on_a_nonzero_exit() {
         let kek = CommandKekProvider::new("sh", vec!["-c".into(), "exit 3".into()], "cmd:v1");
-        assert!(kek.wrap_dek("ten_a", KeyPurpose::Content, &[9u8; 32]).is_err());
+        assert!(kek
+            .wrap_dek("ten_a", KeyPurpose::Content, &[9u8; 32])
+            .is_err());
     }
 
     #[test]
     fn command_kek_fails_closed_when_the_program_is_missing() {
-        let kek = CommandKekProvider::new(
-            "agentdb-nonexistent-kek-helper-xyz",
-            vec![],
-            "cmd:v1",
-        );
-        assert!(kek.wrap_dek("ten_a", KeyPurpose::Content, &[9u8; 32]).is_err());
+        let kek = CommandKekProvider::new("agentdb-nonexistent-kek-helper-xyz", vec![], "cmd:v1");
+        assert!(kek
+            .wrap_dek("ten_a", KeyPurpose::Content, &[9u8; 32])
+            .is_err());
     }
 }

@@ -148,7 +148,9 @@ pub fn classify_line(line: &str) -> LineClass {
         Ok(v) => v,
         Err(_) => return LineClass::Skip, // skip a malformed line rather than abort the file
     };
-    let payload_bytes = serde_json::to_vec(&value).map(|v| v.len()).unwrap_or(usize::MAX);
+    let payload_bytes = serde_json::to_vec(&value)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
     let kind = value
         .get("type")
         .and_then(Value::as_str)
@@ -170,8 +172,7 @@ pub fn classify_line(line: &str) -> LineClass {
 /// derivation (`session_meta` / first `cwd`) without loading the whole file.
 pub fn read_prefix_lines(path: &Path, max_lines: usize) -> Result<Vec<String>> {
     use std::io::BufRead;
-    let file =
-        std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut out = Vec::new();
     for line in std::io::BufReader::new(file).lines() {
         if out.len() >= max_lines {
@@ -284,7 +285,10 @@ mod tests {
         assert!(matches!(classify_line("   "), LineClass::Skip));
         assert!(matches!(classify_line("not json"), LineClass::Skip));
         // Oversized carries the parsed payload so a sink can externalize it.
-        let big = format!(r#"{{"type":"big","x":"{}"}}"#, "a".repeat(MAX_PAYLOAD_BYTES));
+        let big = format!(
+            r#"{{"type":"big","x":"{}"}}"#,
+            "a".repeat(MAX_PAYLOAD_BYTES)
+        );
         match classify_line(&big) {
             LineClass::Oversized(p) => {
                 assert_eq!(p.kind, "big");

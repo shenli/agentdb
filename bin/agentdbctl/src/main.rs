@@ -2104,7 +2104,8 @@ fn read_jsonl_checkpoint(path: &std::path::Path) -> Result<Option<String>> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => {
-            Err(anyhow::Error::from(error).context(format!("read checkpoint file {}", path.display())))
+            Err(anyhow::Error::from(error)
+                .context(format!("read checkpoint file {}", path.display())))
         }
     }
 }

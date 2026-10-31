@@ -26,7 +26,6 @@ import {
   SessionEventKind,
   agentStatus,
   contextPackBuilt,
-  contextSourceRefs,
   modelMessage,
   toolCall,
   toolResult,
@@ -192,16 +191,17 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
         sourceRefs: [{ event_id: call.eventId }],
       }
     );
-    const context = await session.context({ include: ["recent_events"], maxEvents: 10 });
-    assert.ok(Array.isArray(context.events) && context.events.length > 0);
+    // Context selection belongs to the harness; core recovery needs no Labs API.
+    const recent = (await session.fetchRecent(10)).recent;
+    assert.equal(recent.length, 3);
     const contextEvent = await session.append(
       contextPackBuilt("ctx_recovery_1", ["recent_events"], {
         maxEvents: 10,
-        selectedEventCount: (context.events as unknown[]).length,
+        selectedEventCount: recent.length,
       }),
       {
         kind: SessionEventKind.ContextPackBuilt,
-        sourceRefs: contextSourceRefs(context),
+        sourceRefs: recent.map((event) => ({ event_id: event.eventId })),
       }
     );
     await session.append(

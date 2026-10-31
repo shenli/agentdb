@@ -1,6 +1,0 @@
-AgentDB listening on http://127.0.0.1:7890
-  deployment: single_node
-  mode: persistent (kv: rocksdb, content: localfs, data: /home/lishen/work/agentdb-cont-bench-s13/state/author-s13-20260519-092506/rocksdb, artifacts: /home/lishen/work/agentdb-cont-bench-s13/state/author-s13-20260519-092506/content)
-  health:    http://127.0.0.1:7890/health/ready
-  dashboard: http://127.0.0.1:7890/dashboard/
-  internal raft rpc: disabled

@@ -301,7 +301,10 @@ impl CatalogKeyProvider {
     ) -> Result<KeyMetadata, CryptoError> {
         if let Some(version) = self.catalog.active_version(tenant_id, purpose)? {
             if let Some(record) = self.catalog.get_record(tenant_id, purpose, version)? {
-                return Ok(self.lease_from_record(tenant_id, purpose, &record)?.metadata().clone());
+                return Ok(self
+                    .lease_from_record(tenant_id, purpose, &record)?
+                    .metadata()
+                    .clone());
             }
         }
         Ok(self.generate_active(tenant_id, purpose)?.metadata().clone())
@@ -534,7 +537,10 @@ mod tests {
         let b = p.dek_version("ten_a", KeyPurpose::Content, 1).unwrap();
         assert_eq!(a.metadata(), b.metadata());
         // Catalog holds only a WRAPPED dek — the raw KV value must not be the key.
-        let raw = kv.get(&record_key("ten_a", KeyPurpose::Content, 1)).unwrap().unwrap();
+        let raw = kv
+            .get(&record_key("ten_a", KeyPurpose::Content, 1))
+            .unwrap()
+            .unwrap();
         assert!(!raw.windows(4).any(|w| w == b"\0\0\0\0"), "sanity");
     }
 
@@ -562,7 +568,9 @@ mod tests {
 
     #[test]
     fn catalog_backed_keyring_survives_restart_and_needs_the_kek() {
-        use crate::crypto::{AeadTenantKeyring, CryptoContext, DekCacheConfig, EnvelopeCrypto, Suite};
+        use crate::crypto::{
+            AeadTenantKeyring, CryptoContext, DekCacheConfig, EnvelopeCrypto, Suite,
+        };
 
         let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
         let ctx = CryptoContext {
@@ -594,7 +602,9 @@ mod tests {
 
         // A keyring with a DIFFERENT KEK cannot open it: the wrapped DEK will not
         // unwrap, so losing/rotating-away the KEK crypto-shreds the data.
-        assert!(keyring(b"other-kek", "local:v2").open(&ctx, &sealed).is_err());
+        assert!(keyring(b"other-kek", "local:v2")
+            .open(&ctx, &sealed)
+            .is_err());
     }
 
     #[test]
@@ -609,7 +619,13 @@ mod tests {
         // Explicit provisioning creates it; then serve succeeds.
         let meta = p.provision("ten_a", KeyPurpose::Content).unwrap();
         assert_eq!(meta.version, 1);
-        assert_eq!(p.active_dek("ten_a", KeyPurpose::Content).unwrap().metadata().version, 1);
+        assert_eq!(
+            p.active_dek("ten_a", KeyPurpose::Content)
+                .unwrap()
+                .metadata()
+                .version,
+            1
+        );
         // Provisioning is idempotent.
         assert_eq!(p.provision("ten_a", KeyPurpose::Content).unwrap(), meta);
     }
@@ -642,7 +658,9 @@ mod tests {
 
     #[test]
     fn kek_rewrap_rotates_the_kek_without_re_encrypting_data() {
-        use crate::crypto::{AeadTenantKeyring, CryptoContext, DekCacheConfig, EnvelopeCrypto, Suite};
+        use crate::crypto::{
+            AeadTenantKeyring, CryptoContext, DekCacheConfig, EnvelopeCrypto, Suite,
+        };
 
         let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
         let ctx = CryptoContext {
@@ -667,20 +685,21 @@ mod tests {
         // Rotate the KEK: re-wrap every DEK from v1 to v2. Data is untouched.
         let catalog = KeyCatalog::new(kv.clone());
         assert_eq!(
-            catalog.rewrap_all(kek_v1.as_ref(), kek_v2.as_ref()).unwrap(),
+            catalog
+                .rewrap_all(kek_v1.as_ref(), kek_v2.as_ref())
+                .unwrap(),
             1
         );
         // Idempotent: a second rewrap re-wraps nothing.
         assert_eq!(
-            catalog.rewrap_all(kek_v1.as_ref(), kek_v2.as_ref()).unwrap(),
+            catalog
+                .rewrap_all(kek_v1.as_ref(), kek_v2.as_ref())
+                .unwrap(),
             0
         );
 
         // The same ciphertext now opens under KEK v2 (the DEK bytes are the same).
-        assert_eq!(
-            keyring(kek_v2).open(&ctx, &sealed).unwrap(),
-            b"payload"
-        );
+        assert_eq!(keyring(kek_v2).open(&ctx, &sealed).unwrap(), b"payload");
         // KEK v1 alone can no longer serve it — the catalog references v2, so the
         // old KEK is retired.
         assert!(keyring(kek_v1).open(&ctx, &sealed).is_err());
@@ -822,7 +841,10 @@ mod tests {
             .get_record("ten_a", KeyPurpose::Content, 2)
             .unwrap()
             .is_none());
-        assert!(cat.active_version("ten_a", KeyPurpose::Content).unwrap().is_none());
+        assert!(cat
+            .active_version("ten_a", KeyPurpose::Content)
+            .unwrap()
+            .is_none());
         // Idempotent: shredding again affects nothing.
         assert_eq!(provider.revoke_tenant("ten_a", true).unwrap(), 0);
     }
@@ -838,31 +860,43 @@ mod tests {
 
         // v1 is reported still in use → NOT retired.
         assert_eq!(
-            p.retire_drained_versions("ten_a", KeyPurpose::Content, &[1, 2]).unwrap(),
+            p.retire_drained_versions("ten_a", KeyPurpose::Content, &[1, 2])
+                .unwrap(),
             0
         );
         assert_eq!(
-            cat.get_record("ten_a", KeyPurpose::Content, 1).unwrap().unwrap().status,
+            cat.get_record("ten_a", KeyPurpose::Content, 1)
+                .unwrap()
+                .unwrap()
+                .status,
             DekStatus::ReadOnly
         );
 
         // Now only v2 is in use → v1 (drained, read-only) is retired.
         assert_eq!(
-            p.retire_drained_versions("ten_a", KeyPurpose::Content, &[2]).unwrap(),
+            p.retire_drained_versions("ten_a", KeyPurpose::Content, &[2])
+                .unwrap(),
             1
         );
         assert_eq!(
-            cat.get_record("ten_a", KeyPurpose::Content, 1).unwrap().unwrap().status,
+            cat.get_record("ten_a", KeyPurpose::Content, 1)
+                .unwrap()
+                .unwrap()
+                .status,
             DekStatus::Retired
         );
         // The active version is never retired.
         assert_eq!(
-            cat.get_record("ten_a", KeyPurpose::Content, 2).unwrap().unwrap().status,
+            cat.get_record("ten_a", KeyPurpose::Content, 2)
+                .unwrap()
+                .unwrap()
+                .status,
             DekStatus::Active
         );
         // Idempotent: nothing left to retire.
         assert_eq!(
-            p.retire_drained_versions("ten_a", KeyPurpose::Content, &[2]).unwrap(),
+            p.retire_drained_versions("ten_a", KeyPurpose::Content, &[2])
+                .unwrap(),
             0
         );
     }

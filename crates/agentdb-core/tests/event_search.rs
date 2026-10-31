@@ -75,7 +75,10 @@ async fn search_events_matches_and_ranks_over_persistent_log() {
         .await
         .unwrap();
     assert_eq!(matches.len(), 2);
-    assert_eq!(matches[0].event.payload["text"], "deploy the service to staging");
+    assert_eq!(
+        matches[0].event.payload["text"],
+        "deploy the service to staging"
+    );
     assert!(matches[0].score > matches[1].score);
 
     // Empty query and no-hit query both return no matches (not an error).

@@ -24,7 +24,6 @@ from agentdb import (
     Session,
     agent_status,
     context_pack_built,
-    context_source_refs,
     model_message,
     tool_call,
     tool_result,
@@ -168,17 +167,18 @@ def test_harness_recovers_session_from_ids(server):
         ],
         source_refs=[{"event_id": call.event_id}],
     )
-    context = session.context(include=["recent_events"], max_events=10)
-    assert context.get("events"), "context should include recent events"
+    # Context selection belongs to the harness; core recovery needs no Labs API.
+    recent = session.fetch_recent(last_n=10)
+    assert len(recent) == 3, "recent tail should include all pre-context events"
     context_event = session.append(
         context_pack_built(
             "ctx_recovery_1",
             ["recent_events"],
             max_events=10,
-            selected_event_count=len(context.get("events", [])),
+            selected_event_count=len(recent),
         ),
         kind=SessionEventKind.CONTEXT_PACK_BUILT.value,
-        source_refs=context_source_refs(context),
+        source_refs=[{"event_id": event.event_id} for event in recent],
     )
     session.append(
         model_message(

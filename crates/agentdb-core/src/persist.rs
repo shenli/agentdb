@@ -30,8 +30,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
-    agent_alias_key, agent_record_key, artifact_by_sha256_key,
-    artifact_record_key, event_by_id_key, event_key, record_by_namespace_key, record_commit_key,
+    agent_alias_key, agent_record_key, artifact_by_sha256_key, artifact_record_key,
+    event_by_id_key, event_key, record_by_namespace_key, record_commit_key,
     record_index_outbox_key, record_key, session_alias_key, session_record_key,
     session_segment_key, tenant_alias_key, tenant_record_key,
 };
@@ -209,7 +209,12 @@ fn event_session_from_key(key: &[u8]) -> Option<&str> {
 
 /// The seq (fourth segment) of an event key `event/{tenant}/{session}/{seq}`.
 fn event_seq_from_key(key: &[u8]) -> Option<u64> {
-    std::str::from_utf8(key).ok()?.split('/').nth(3)?.parse().ok()
+    std::str::from_utf8(key)
+        .ok()?
+        .split('/')
+        .nth(3)?
+        .parse()
+        .ok()
 }
 
 /// The AAD object id an individual event row is sealed under: `{session}:{seq}`.
@@ -1132,9 +1137,7 @@ impl Persist {
 
     /// The keyring `CryptoContext` for a metadata value: the tenant object,
     /// under the `Metadata` key purpose.
-    fn metadata_keyring_context<'a>(
-        context: &'a MetadataCryptoContext<'a>,
-    ) -> CryptoContext<'a> {
+    fn metadata_keyring_context<'a>(context: &'a MetadataCryptoContext<'a>) -> CryptoContext<'a> {
         CryptoContext {
             tenant_id: context.tenant_id,
             purpose: KeyPurpose::Metadata,
@@ -2400,7 +2403,8 @@ impl Persist {
         let (tenant_id, object_id) = key_str
             .rsplit_once('/')
             .and_then(|(rest, object_id)| {
-                rest.rsplit_once('/').map(|(_, tenant_id)| (tenant_id, object_id))
+                rest.rsplit_once('/')
+                    .map(|(_, tenant_id)| (tenant_id, object_id))
             })
             .ok_or_else(|| {
                 agentdb_storage::Error::Other(format!("unexpected primary record key {key_str}"))
@@ -2441,7 +2445,9 @@ impl Persist {
         };
         let plaintext = self.decrypt_metadata(&context, value)?;
         serde_json::from_slice(&plaintext).map_err(|err| {
-            agentdb_storage::Error::Other(format!("tenant record at {key_str} does not decode: {err}"))
+            agentdb_storage::Error::Other(format!(
+                "tenant record at {key_str} does not decode: {err}"
+            ))
         })
     }
 
@@ -2470,10 +2476,22 @@ impl Persist {
 
         // Primary-record prefixes whose object id is the last key segment.
         let record_groups = [
-            (format!("record/agent/{tenant_id}/"), MetadataObjectKind::Agent),
-            (format!("record/session/{tenant_id}/"), MetadataObjectKind::Session),
-            (format!("record/searchable/{tenant_id}/"), MetadataObjectKind::Record),
-            (format!("record/artifact/{tenant_id}/"), MetadataObjectKind::Artifact),
+            (
+                format!("record/agent/{tenant_id}/"),
+                MetadataObjectKind::Agent,
+            ),
+            (
+                format!("record/session/{tenant_id}/"),
+                MetadataObjectKind::Session,
+            ),
+            (
+                format!("record/searchable/{tenant_id}/"),
+                MetadataObjectKind::Record,
+            ),
+            (
+                format!("record/artifact/{tenant_id}/"),
+                MetadataObjectKind::Artifact,
+            ),
         ];
 
         let mut ops: Vec<WriteOp> = Vec::new();
@@ -2517,7 +2535,9 @@ impl Persist {
         }
 
         // Export-ledger entries (object id parsed from the ledger key).
-        for (key, value) in self.collect_prefix(export_ledger_tenant_prefix(tenant_id).as_bytes())? {
+        for (key, value) in
+            self.collect_prefix(export_ledger_tenant_prefix(tenant_id).as_bytes())?
+        {
             let Some(object_id) = export_ledger_object_id_from_key(&key).map(str::to_string) else {
                 continue;
             };
@@ -3200,7 +3220,6 @@ impl Persist {
         }
         Ok(out)
     }
-
 }
 
 #[cfg(test)]

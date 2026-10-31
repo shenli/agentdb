@@ -26,6 +26,9 @@ Both land on your `PATH` (usually `~/.cargo/bin`).
 agentdb serve
 ```
 
+Persistent writes fsync the RocksDB WAL by default. Add `--changefeed` if you
+need the changefeed or exports; the ledger is disabled by default.
+
 The server prints its dashboard URL and data path on startup. State is stored in
 a **machine-scoped** directory (`~/.agentdb` by default), so it opens the same
 database no matter which shell you launch it from. The API listens on
@@ -88,7 +91,7 @@ the recent tail in one call, and fork a session:
 pip install -e clients/python
 AGENTDB_URL=http://127.0.0.1:7878 python3 examples/agents/python/quickstart.py
 
-# TypeScript
+# TypeScript (Node.js 22.6+ for --experimental-strip-types)
 cd clients/typescript && npm install && npm run build && cd ../..
 node --experimental-strip-types examples/agents/typescript/quickstart.ts
 ```

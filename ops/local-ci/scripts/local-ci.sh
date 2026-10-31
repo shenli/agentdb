@@ -319,8 +319,8 @@ if [[ "$RUN_CARGO" == "1" ]]; then
 fi
 
 if [[ "$RUN_SDK" == "1" ]]; then
-  run_shell_stage sdk-python "python3 -m pip install -e 'clients/python[async]' pytest && pytest clients/python -q"
-  run_shell_stage sdk-typescript "cd clients/typescript && npm ci && npm run build && npm test"
+  run_shell_stage sdk-python "python3 -m pip install -e 'clients/python[async]' pytest && AGENTDB_PYTHON_SMOKE=1 pytest clients/python -q"
+  run_shell_stage sdk-typescript "cd clients/typescript && npm ci && npm run build && AGENTDB_TYPESCRIPT_SMOKE=1 npm test"
 fi
 
 if [[ "$RUN_LICENSE" == "1" ]]; then

@@ -28,11 +28,11 @@ use agentdb_storage::content::{sha256_hex, ContentBackend, InMemoryContentBacken
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::{
     envelope_dek_version, is_envelope_v2, AllowAllKmsKeyResolver, ContentCryptoAdapter,
-    ContentCryptoContext,
-    CryptoContext, DisabledEnvelopeCrypto, EnvelopeCrypto, IdentityContentCryptoAdapter,
-    IdentityMetadataCryptoAdapter, KeyOperation, KeyPurpose, KeyResolution, KmsError,
-    KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter, PrefixScopedTabletStore,
-    ReplicatedLog, TabletKvStore, TabletStoreLifecycle, TabletStoreManifest, WriteOp,
+    ContentCryptoContext, CryptoContext, DisabledEnvelopeCrypto, EnvelopeCrypto,
+    IdentityContentCryptoAdapter, IdentityMetadataCryptoAdapter, KeyOperation, KeyPurpose,
+    KeyResolution, KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter,
+    PrefixScopedTabletStore, ReplicatedLog, TabletKvStore, TabletStoreLifecycle,
+    TabletStoreManifest, WriteOp,
 };
 
 use crate::agent::{Agent, NewAgent};
@@ -976,7 +976,10 @@ fn in_memory_export_ledger_cursor(tenant_id: &str, seq: u64, item: &ExportLedger
 /// assignment is serialized (the same guarantee the persist sequencer gives).
 fn push_in_memory_export_ledger_item(state: &mut State, item: ExportLedgerItem) {
     let tenant_id = item.tenant_id.as_str().to_string();
-    let seq = state.export_ledger_next_seq.entry(tenant_id.clone()).or_insert(1);
+    let seq = state
+        .export_ledger_next_seq
+        .entry(tenant_id.clone())
+        .or_insert(1);
     let assigned = *seq;
     *seq = seq.saturating_add(1);
     state
@@ -2744,7 +2747,10 @@ impl Runtime {
                 object_id,
             };
             return self.keyring.seal(&context, plaintext).map_err(|e| {
-                Error::new(ErrorCode::Internal, format!("{object_kind} seal failed: {e}"))
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("{object_kind} seal failed: {e}"),
+                )
             });
         }
         let crypto_context = ContentCryptoContext {
@@ -2756,7 +2762,10 @@ impl Runtime {
             .content_crypto
             .encrypt(&crypto_context, plaintext)
             .map_err(|e| {
-                Error::new(ErrorCode::Internal, format!("{object_kind} encrypt failed: {e}"))
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("{object_kind} encrypt failed: {e}"),
+                )
             })?;
         Ok(encode_keyed_envelope(content_key, &encrypted))
     }
@@ -2782,11 +2791,17 @@ impl Runtime {
                 object_id,
             };
             return self.keyring.open(&context, &stored_bytes).map_err(|e| {
-                Error::new(ErrorCode::Internal, format!("{object_kind} open failed: {e}"))
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("{object_kind} open failed: {e}"),
+                )
             });
         }
         let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes).map_err(|e| {
-            Error::new(ErrorCode::Internal, format!("{object_kind} envelope failed: {e}"))
+            Error::new(
+                ErrorCode::Internal,
+                format!("{object_kind} envelope failed: {e}"),
+            )
         })? {
             Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
             None => (fallback_key, stored_bytes),
@@ -2799,7 +2814,10 @@ impl Runtime {
         self.content_crypto
             .decrypt(&crypto_context, &ciphertext)
             .map_err(|e| {
-                Error::new(ErrorCode::Internal, format!("{object_kind} decrypt failed: {e}"))
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("{object_kind} decrypt failed: {e}"),
+                )
             })
     }
 
@@ -3409,8 +3427,12 @@ impl Runtime {
         default_tablet_id: i64,
     ) -> Arc<Self> {
         let tablet_router = Arc::new(
-            RuntimeTabletRouterKvStore::new_with_lifecycle(store_lifecycle, default_tablet_id, logs)
-                .expect("open runtime tablet router"),
+            RuntimeTabletRouterKvStore::new_with_lifecycle(
+                store_lifecycle,
+                default_tablet_id,
+                logs,
+            )
+            .expect("open runtime tablet router"),
         );
         let persist = Persist::with_metadata_crypto(
             tablet_router.clone(),
@@ -3566,8 +3588,9 @@ impl Runtime {
             RuntimeTabletKvStore::single_node(kv, RUNTIME_PRIMARY_TABLET_ID)
                 .expect("open runtime tablet state"),
         );
-        let persist = Persist::with_metadata_crypto(runtime_kv, Arc::new(IdentityMetadataCryptoAdapter))
-            .with_keyring(keyring.clone());
+        let persist =
+            Persist::with_metadata_crypto(runtime_kv, Arc::new(IdentityMetadataCryptoAdapter))
+                .with_keyring(keyring.clone());
         Self::from_persist_with_tablet_router_and_mode(
             persist,
             content,
@@ -3802,7 +3825,8 @@ impl Runtime {
             Some(p) => p.reencrypt_tenant_metadata(tenant_id).map_err(internal)?,
             None => crate::persist::ReencryptReport::default(),
         };
-        self.reencrypt_tenant_content(tenant_id, &mut report).await?;
+        self.reencrypt_tenant_content(tenant_id, &mut report)
+            .await?;
         Ok(report)
     }
 
@@ -4707,7 +4731,10 @@ impl Runtime {
     // alias" — the caller then creates one.
 
     /// Resolve a live tenant by its external key (workspace name), or `None`.
-    pub async fn resolve_tenant_by_external_key(&self, external_key: &str) -> Result<Option<Tenant>> {
+    pub async fn resolve_tenant_by_external_key(
+        &self,
+        external_key: &str,
+    ) -> Result<Option<Tenant>> {
         if external_key.is_empty() {
             return Ok(None);
         }
@@ -8186,7 +8213,7 @@ impl Runtime {
                     .get(session_id.as_str())
                     .map_or(0, |sess| sess.next_seq);
                 let cached_max = s.session_durable_max_seq.get(session_id.as_str()).copied();
-                if cached_max.map_or(true, |max| next_seq <= max) {
+                if cached_max.is_none_or(|max| next_seq <= max) {
                     let max_seq = match persist
                         .max_event_seq(jobs[0].req.tenant_id.as_str(), session_id.as_str())
                     {
@@ -8597,7 +8624,7 @@ impl Runtime {
                 .session_durable_max_seq
                 .get(req.session_id.as_str())
                 .copied();
-            if cached_max.map_or(true, |max| next_seq <= max) {
+            if cached_max.is_none_or(|max| next_seq <= max) {
                 if let Some(max_seq) = persist
                     .max_event_seq(req.tenant_id.as_str(), req.session_id.as_str())
                     .map_err(internal)?
@@ -10930,7 +10957,8 @@ impl Runtime {
         // Resolve the sessions in scope, newest first, so a bounded scan spends
         // its budget on the most recent history.
         let mut sessions: Vec<Session> = if let Some(session_id) = req.session_id.as_ref() {
-            self.ensure_session_cached(&req.tenant_id, session_id).await?;
+            self.ensure_session_cached(&req.tenant_id, session_id)
+                .await?;
             let session = self.get_session(&req.tenant_id, session_id).await?;
             vec![session]
         } else {
@@ -12889,7 +12917,6 @@ fn verify_idem_replay(rec: &IdempotencyRecord, req: &AppendRequest) -> Result<Ap
     let resp: AppendResponse = serde_json::from_str(&rec.result_json).unwrap();
     Ok(resp)
 }
-
 
 /// Map a storage-layer error into a V2 `Internal` error. The persist layer
 /// returns `agentdb_storage::Error`; surfacing it as `Internal` keeps the

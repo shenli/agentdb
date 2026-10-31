@@ -15,3 +15,9 @@ tools/workload/agentdb-workload
 tools/workload/perf-probe
 perf-out/
 bench-out/
+test-sessions/
+# Local credentials and generated security reports must not enter source control.
+.env
+.env.*
+!.env.example
+gitleaks-report.*

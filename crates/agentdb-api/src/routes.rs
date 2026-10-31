@@ -35,8 +35,8 @@ use agentdb_core::{
         ExportWatchRequest, FetchRequest, ForkSessionRequest, RecordUpdate, SearchRequest,
         WatchScope,
     },
-    Agent, Artifact, ErrorCode, Id, IdKind,
-    NewAgent, NewArtifact, NewSession, NewTenant, Session, SourceRef, Tenant,
+    Agent, Artifact, ErrorCode, Id, IdKind, NewAgent, NewArtifact, NewSession, NewTenant, Session,
+    SourceRef, Tenant,
 };
 use agentdb_meta::{
     cells, nodes, placement_scopes, tablet_movements, tablet_ranges, tablet_rebalance,
@@ -45,14 +45,12 @@ use agentdb_meta::{
 
 use crate::dto::{
     AppendAndFetchBody, AppendBatchBody, AppendBatchResponse, AppendBody, ChangesQuery,
-    ChangesResponse,
-    ContextBody, CreateAgentBody, CreateRecordBody,
-    CreateSessionBody, CreateTenantBody, EventSearchQuery, EventSearchResponse, ExportBackfillBody,
+    ChangesResponse, ContextBody, CreateAgentBody, CreateRecordBody, CreateSessionBody,
+    CreateTenantBody, EventSearchQuery, EventSearchResponse, ExportBackfillBody,
     ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
-    FetchQuery, ForkSessionBody, IncludeDeletedQuery, OpenSessionBody,
-    PolicyWorkerRunBody, ReplayQuery, RestoreSessionStorageBody,
-    SearchRecordsBody, SearchRecordsResponse, SweepBody, TenantMetaBody,
-    TransitionSessionLifecycleBody, UpdateRecordBody, WatchQuery,
+    FetchQuery, ForkSessionBody, IncludeDeletedQuery, OpenSessionBody, PolicyWorkerRunBody,
+    ReplayQuery, RestoreSessionStorageBody, SearchRecordsBody, SearchRecordsResponse, SweepBody,
+    TenantMetaBody, TransitionSessionLifecycleBody, UpdateRecordBody, WatchQuery,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::internal_raft_http::{
@@ -123,15 +121,24 @@ pub fn route_catalog() -> &'static [(Stability, &'static str)] {
         (Labs, "/api/tenants/:tenant_id/records/upsert"),
         (Labs, "/api/tenants/:tenant_id/records/:record_id/touch"),
         (Labs, "/api/tenants/:tenant_id/sessions/:session_id/context"),
-        (Labs, "/api/tenants/:tenant_id/sessions/:session_id/replay-prefix"),
-        (Labs, "/api/tenants/:tenant_id/sessions/:session_id/lifecycle"),
+        (
+            Labs,
+            "/api/tenants/:tenant_id/sessions/:session_id/replay-prefix",
+        ),
+        (
+            Labs,
+            "/api/tenants/:tenant_id/sessions/:session_id/lifecycle",
+        ),
         (Labs, "/api/tenants/:tenant_id/sessions/:session_id/storage"),
         (Labs, "/api/tenants/:tenant_id/sessions/:session_id/restore"),
         (Labs, "/api/tenants/:tenant_id/artifacts/verify-lifecycle"),
         (Labs, "/api/tenants/:tenant_id/policy/lifecycle-sweep"),
         (Labs, "/api/tenants/:tenant_id/policy/gc-sweep"),
         // --- Internal / operator machinery (no SDK or quickstart obligation) ---
-        (Internal, "/api/tenants/:tenant_id/sessions/:session_id/events/batch"),
+        (
+            Internal,
+            "/api/tenants/:tenant_id/sessions/:session_id/events/batch",
+        ),
         (Internal, "/metrics"),
         (Internal, "/api/tenants"),
         (Internal, "/api/tenants/:tenant_id/agents"),
@@ -235,10 +242,7 @@ pub fn routes(cluster_mode: bool, labs: bool) -> Router<AppState> {
             get(replay_session),
         )
         .route("/api/tenants/:tenant_id/changes", get(changes))
-        .route(
-            "/api/tenants/:tenant_id/events/search",
-            get(search_events),
-        )
+        .route("/api/tenants/:tenant_id/events/search", get(search_events))
         .route(
             "/api/tenants/:tenant_id/exports/backfill",
             post(export_backfill),
@@ -499,9 +503,10 @@ async fn metrics(State(s): State<AppState>) -> impl axum::response::IntoResponse
     let summary = s.runtime.fleet_storage_summary().await;
     let budget = s.disk_budget_bytes;
     let paths = s.disk_usage_paths.clone();
-    let used = tokio::task::spawn_blocking(move || paths.iter().map(|p| dir_size_bytes(p)).sum::<u64>())
-        .await
-        .unwrap_or(0);
+    let used =
+        tokio::task::spawn_blocking(move || paths.iter().map(|p| dir_size_bytes(p)).sum::<u64>())
+            .await
+            .unwrap_or(0);
     let lc = &summary.lifecycle_counts;
 
     let mut out = String::new();
@@ -517,8 +522,16 @@ async fn metrics(State(s): State<AppState>) -> impl axum::response::IntoResponse
     );
 
     for (name, help, value) in [
-        ("agentdb_tenants", "Number of tenants.", summary.tenant_count as u64),
-        ("agentdb_sessions", "Number of sessions.", summary.session_count as u64),
+        (
+            "agentdb_tenants",
+            "Number of tenants.",
+            summary.tenant_count as u64,
+        ),
+        (
+            "agentdb_sessions",
+            "Number of sessions.",
+            summary.session_count as u64,
+        ),
         (
             "agentdb_active_sessions",
             "Number of active sessions.",
@@ -534,8 +547,16 @@ async fn metrics(State(s): State<AppState>) -> impl axum::response::IntoResponse
             "Number of archive manifests.",
             summary.archive_manifest_count as u64,
         ),
-        ("agentdb_sealed_bytes", "Bytes in sealed segments.", summary.sealed_bytes),
-        ("agentdb_archived_bytes", "Bytes in archives.", summary.archived_bytes),
+        (
+            "agentdb_sealed_bytes",
+            "Bytes in sealed segments.",
+            summary.sealed_bytes,
+        ),
+        (
+            "agentdb_archived_bytes",
+            "Bytes in archives.",
+            summary.archived_bytes,
+        ),
         (
             "agentdb_disk_budget_bytes",
             "Advisory disk budget in bytes (0 = unset).",
@@ -552,7 +573,10 @@ async fn metrics(State(s): State<AppState>) -> impl axum::response::IntoResponse
         let _ = writeln!(out, "{name} {value}");
     }
 
-    let _ = writeln!(out, "# HELP agentdb_sessions_by_lifecycle Sessions by lifecycle tier.");
+    let _ = writeln!(
+        out,
+        "# HELP agentdb_sessions_by_lifecycle Sessions by lifecycle tier."
+    );
     let _ = writeln!(out, "# TYPE agentdb_sessions_by_lifecycle gauge");
     for (tier, value) in [
         ("warm", lc.warm),
@@ -560,7 +584,10 @@ async fn metrics(State(s): State<AppState>) -> impl axum::response::IntoResponse
         ("archive", lc.archive),
         ("derivative_only", lc.derivative_only),
     ] {
-        let _ = writeln!(out, "agentdb_sessions_by_lifecycle{{lifecycle=\"{tier}\"}} {value}");
+        let _ = writeln!(
+            out,
+            "agentdb_sessions_by_lifecycle{{lifecycle=\"{tier}\"}} {value}"
+        );
     }
 
     (
@@ -1912,19 +1939,17 @@ async fn post_internal_tablet_movement_snapshot_export(
         body.shard_count,
     ) {
         Ok(payload) => {
-            let applied_index = match serde_json::from_slice::<
-                agentdb_core::tablet_state::TabletStateSnapshot,
-            >(&payload)
-            {
-                Ok(snapshot) => snapshot.applied_index,
-                Err(err) => {
-                    return internal_raft_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "TABLET_MOVEMENT_SNAPSHOT_INVALID",
-                        format!("exported tablet movement snapshot is invalid: {err}"),
-                    )
-                }
-            };
+            let applied_index =
+                match agentdb_core::tablet_state::TabletStateSnapshot::decode(&payload) {
+                    Ok(snapshot) => snapshot.applied_index,
+                    Err(err) => {
+                        return internal_raft_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "TABLET_MOVEMENT_SNAPSHOT_INVALID",
+                            format!("exported tablet movement snapshot is invalid: {err}"),
+                        )
+                    }
+                };
             (
                 StatusCode::OK,
                 Json(TabletMovementSnapshotExportResponse {
@@ -4906,11 +4931,10 @@ async fn get_disk_budget(State(s): State<AppState>) -> Json<serde_json::Value> {
     let budget = s.disk_budget_bytes;
     let paths = s.disk_usage_paths.clone();
     // The size walk is blocking I/O; keep it off the async worker.
-    let used = tokio::task::spawn_blocking(move || {
-        paths.iter().map(|p| dir_size_bytes(p)).sum::<u64>()
-    })
-    .await
-    .unwrap_or(0);
+    let used =
+        tokio::task::spawn_blocking(move || paths.iter().map(|p| dir_size_bytes(p)).sum::<u64>())
+            .await
+            .unwrap_or(0);
     let fraction = if budget > 0 {
         used as f64 / budget as f64
     } else {
@@ -6688,9 +6712,10 @@ async fn append_events_batch(
 
     let runtime = s.runtime.clone();
     let rt = runtime.clone();
-    let result =
-        with_route_tablet_context(runtime, &route_headers, async move { rt.append_batch(reqs).await })
-            .await;
+    let result = with_route_tablet_context(runtime, &route_headers, async move {
+        rt.append_batch(reqs).await
+    })
+    .await;
     let appended = match result {
         Ok(value) => value,
         Err(error) if error.code == ErrorCode::RaftNotLeader => {
@@ -7104,8 +7129,9 @@ async fn changes(
             .map(|item| export_envelope_from_changefeed(item, observed_at_ms))
             .collect::<Result<Vec<_>, _>>()?;
         let next_cursor = envelopes.last().map(|item| item.cursor.clone());
-        let oldest_available_cursor =
-            runtime.export_oldest_available_cursor(&req_tenant_id).await?;
+        let oldest_available_cursor = runtime
+            .export_oldest_available_cursor(&req_tenant_id)
+            .await?;
         return Ok(Json(ChangesResponse {
             items: envelopes,
             next_cursor,
@@ -7453,14 +7479,7 @@ async fn export_status(
         tenant_id,
         mode: "durable_ledger",
         durable_ledger: s.runtime.durable_export_ledger_enabled(),
-        supported_object_types: vec![
-            "event",
-            "tenant",
-            "agent",
-            "session",
-            "artifact",
-            "record",
-        ],
+        supported_object_types: vec!["event", "tenant", "agent", "session", "artifact", "record"],
         oldest_available_cursor,
         high_watermark,
     }))
@@ -7475,7 +7494,6 @@ fn require_single_tablet_export(s: &AppState) -> Result<(), ApiError> {
     }
     Ok(())
 }
-
 
 fn parse_export_include_query(raw: &str) -> Vec<String> {
     raw.split(',')

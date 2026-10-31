@@ -21,34 +21,40 @@ configure the new value as the current token and temporarily set
 `AGENTDB_API_AUTH_PREVIOUS_TOKEN`; remove the previous value after all clients
 have switched. The previous token follows the same character rule, must differ
 from the current token, and cannot be configured by itself. With no static
-token, a loopback listener leaves non-admin `/api/*` routes
-unauthenticated. Health and dashboard asset routes remain public.
+token, a loopback listener is open only until its first metadata token is
+minted. That first mint closes both admin and data routes; revoking all tokens
+does not reopen bootstrap. Health and dashboard asset routes remain public.
 
-The metadata-backed admin-token API provides narrower credentials for
-`/api/admin/*`: `admin` scope permits every method and `readonly` permits only
-`GET`/`HEAD`. On a loopback server with no static token, admin routes are open
-only while the metadata store has never minted an admin token. Minting the
-first token closes that bootstrap path permanently; revoking every token does
-not reopen it, so configure a static token before revoking the final admin
-credential. The
-plaintext is returned once and only its SHA-256 hash is stored. Persistent
-standalone nodes use
-`<data_dir>/auth-meta.sqlite`, dev mode uses memory, and routed cluster nodes
-reuse the shared metadata store:
+The token API supports three scopes:
+
+| Scope | Access |
+|---|---|
+| `admin` | Admin and tenant data routes, all methods |
+| `readonly` | `GET`/`HEAD` on admin and tenant data routes |
+| `tenant` | Data routes for exactly the bound `tenant_id`, plus `/api/me` and `/api/sessions/open` with workspace-binding validation |
+
+Mint a tenant token only for an existing tenant; tenant scope requires a
+`tenant_id`, while the other scopes reject a tenant binding. Token plaintext is
+returned once; its SHA-256 fingerprint and scope/revocation metadata are stored
+as records under AgentDB's reserved system tenant. Back up the runtime store,
+not only legacy control-plane SQL files, to preserve authentication state.
+The system tenant is inaccessible through public APIs even to admin principals.
 
 ```text
 GET    /api/admin/tokens
 POST   /api/admin/tokens             {"description":"operator","scope":"admin"}
+POST   /api/admin/tokens             {"description":"app","scope":"tenant","tenant_id":"ten_..."}
 DELETE /api/admin/tokens/{token_id}
 ```
 
-The static installation token is coarse-grained and also authorizes admin
-routes; metadata admin tokens do not authorize tenant data routes. This is not
-tenant-scoped end-user authorization. Terminate TLS at the ingress, load
-balancer, or service mesh before sending bearer tokens over a network. Internal
-Raft RPCs continue to use their separate current/previous token pair, with the
-same length and visible-ASCII rules; an internal previous token cannot be
-configured without a current token.
+The static installation token remains a full-access credential. Tenant tokens
+provide a tenant authorization boundary; identity-provider integration and
+end-user role management are separate application/control-plane concerns.
+Configure a static recovery token before revoking the final admin credential.
+Terminate TLS at the ingress, load balancer, or service mesh before sending
+bearer tokens over a network. Internal Raft RPCs use their separate
+current/previous token pair with the same length and visible-ASCII rules; an
+internal previous token cannot be configured without a current token.
 
 Both native SDKs accept either a fixed bearer token or a token callback:
 

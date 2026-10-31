@@ -390,8 +390,10 @@ async fn session_watch_on_parent_discovers_child_via_fork_edge() {
         .unwrap();
 
     assert!(
-        items.iter().any(|i| i.item.object_type == "fork_edge"
-            && i.item.object_id == child.session_id.as_str()),
+        items
+            .iter()
+            .any(|i| i.item.object_type == "fork_edge"
+                && i.item.object_id == child.session_id.as_str()),
         "parent session-scope feed announces the child via a fork-edge"
     );
 }
@@ -458,8 +460,7 @@ async fn fork_edge_is_gap_free_across_resume_and_pagination() {
     );
     assert!(
         after.iter().any(|i| i.item.object_type == "event"
-            && i.item.session_id.as_ref().map(|id| id.as_str())
-                == Some(child.session_id.as_str())),
+            && i.item.session_id.as_ref().map(|id| id.as_str()) == Some(child.session_id.as_str())),
         "child event discovered after resume"
     );
 

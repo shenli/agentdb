@@ -96,16 +96,23 @@ async fn search_ranks_by_token_coverage() {
     let app = spawn_app().await;
     let s = open(&app, "acme", "a1", "s1").await;
     append(&app, &s, "message", json!({ "text": "deploy the service" })).await;
-    append(&app, &s, "message", json!({ "text": "deploy the service to staging now" })).await;
+    append(
+        &app,
+        &s,
+        "message",
+        json!({ "text": "deploy the service to staging now" }),
+    )
+    .await;
 
     let page = search(&app, &s.tenant_id, "q=deploy+staging").await;
     let matches = page["matches"].as_array().unwrap();
     assert_eq!(matches.len(), 2, "both mention deploy");
     // The event containing both tokens ranks first.
-    assert_eq!(matches[0]["event"]["payload"]["text"], "deploy the service to staging now");
-    assert!(
-        matches[0]["score"].as_u64().unwrap() > matches[1]["score"].as_u64().unwrap()
+    assert_eq!(
+        matches[0]["event"]["payload"]["text"],
+        "deploy the service to staging now"
     );
+    assert!(matches[0]["score"].as_u64().unwrap() > matches[1]["score"].as_u64().unwrap());
 }
 
 #[tokio::test]
@@ -121,13 +128,23 @@ async fn search_scopes_to_agent_and_session() {
     assert_eq!(page["matches"].as_array().unwrap().len(), 2);
 
     // Agent scope sees only agent-a's event.
-    let page = search(&app, &a.tenant_id, &format!("q=keyword&agent_id={}", a.agent_id)).await;
+    let page = search(
+        &app,
+        &a.tenant_id,
+        &format!("q=keyword&agent_id={}", a.agent_id),
+    )
+    .await;
     let matches = page["matches"].as_array().unwrap();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0]["event"]["agent_id"], a.agent_id);
 
     // Session scope sees only s2's event.
-    let page = search(&app, &b.tenant_id, &format!("q=keyword&session_id={}", b.session_id)).await;
+    let page = search(
+        &app,
+        &b.tenant_id,
+        &format!("q=keyword&session_id={}", b.session_id),
+    )
+    .await;
     let matches = page["matches"].as_array().unwrap();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0]["event"]["session_id"], b.session_id);

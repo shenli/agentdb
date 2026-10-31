@@ -1,7 +1,7 @@
 # AgentDB Performance Notes
 
 Single-machine numbers to ground the README — not competitive claims
-against tuned databases. Measured on a Linux workstation (li-dev);
+against tuned databases. Measured on a Linux workstation;
 append/fork/vector refreshed 2026-09-04.
 
 ## Setup
@@ -50,9 +50,9 @@ caps throughput near ~8k.
 
 ### Versus Postgres / MongoDB
 
-Same workload (append + fetch-recent, persistent, non-durable) run
-through the `tools/agentdb-bench` comparison harness against normalized
-event-log schemas, c=32:
+Historical measurements of append + fetch-recent, persistent but with sync
+disabled, c=32. AgentDB used `perf-probe`; the database baselines used
+`tools/agentdb-bench` against normalized event-log schemas:
 
 | Backend | append+fetch @ c=32 |
 |---|---:|
@@ -60,15 +60,16 @@ event-log schemas, c=32:
 | PostgreSQL (event-log) | 26,763/s |
 | MongoDB (event-log) | 16,465/s |
 
-AgentDB edges both when the changefeed isn't in the write path. (AgentDB
-is measured with `perf-probe` and the baselines with `agentdb-bench`, so
-read this as order-of-magnitude, not a tuned-benchmark shootout.)
+These different harnesses do not establish a comparative performance claim.
+Re-run all backends with the same harness, durability, workload, duration, and
+repeat count before publishing a ratio or claiming one is faster.
 
 ## Durability
 
 Acknowledged appends fsync the RocksDB WAL when
-`AGENTDB_ROCKSDB_SYNC_WRITES=1` (the numbers above are the non-durable
-default). On this ext4 + NVMe box a synced *single-writer* append is
+`AGENTDB_ROCKSDB_SYNC_WRITES=1`, which is the default. The throughput
+figures above explicitly opt out with `AGENTDB_ROCKSDB_SYNC_WRITES=0`; they
+do not describe default durability or default throughput. On this ext4 + NVMe box a synced *single-writer* append is
 fsync-bound at ~15–17 ms (≈60–70/s); the cost is the device flush, not
 CPU. Group commit amortizes the sync across concurrent writers (c=32 ≈
 800/s), so under load the lever is concurrency / batching, not a faster
@@ -100,7 +101,7 @@ the 100 forks cleared in under 0.7 ms.
 
 ## Tier transition latency
 
-*(Apple M5 laptop; not re-run on li-dev.)*
+*(Apple M5 laptop; not re-run on the Linux workstation.)*
 
 Forced cold/warm transitions via `POST /api/admin/tier/force`, varying
 session size (payload ~500 bytes per event):
@@ -118,7 +119,7 @@ read and a few batched KV puts.
 
 ## Session lifecycle — end-to-end
 
-*(Apple M5 laptop; not re-run on li-dev.)*
+*(Apple M5 laptop; not re-run on the Linux workstation.)*
 
 A 90-second run of the built-in Go workload
 (`tools/workload/config.yaml`, 2 personas at 6 and 3 tickets/min) with

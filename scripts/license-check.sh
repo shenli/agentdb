@@ -66,7 +66,11 @@ check_rust_licenses() {
 check_npm_lock_licenses() {
   echo "==> checking npm lockfile licenses"
   if ! command -v node >/dev/null 2>&1; then
-    warn "node is not installed; skipped npm lockfile license scan"
+    if [[ "$STRICT" == "1" ]]; then
+      fail "node is required when LICENSE_CHECK_STRICT=1"
+    else
+      warn "node is not installed; skipped npm lockfile license scan"
+    fi
     return
   fi
 

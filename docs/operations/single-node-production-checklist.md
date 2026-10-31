@@ -21,6 +21,8 @@ deployment choices, see [deployment.md](deployment.md).
 - [ ] `agentdb doctor --config <path>` passes.
 - [ ] `agentdb serve --config <path>` is used instead of ad hoc flag lists.
 - [ ] `storage.data_dir` is on durable storage.
+- [ ] WAL fsync remains enabled (the default); `AGENTDB_ROCKSDB_SYNC_WRITES=0`
+  is reserved for disposable data and explicitly non-durable benchmarks.
 - [ ] `storage.content_dir`, if separate, is on durable storage.
 - [ ] Object-store-backed deployments have documented bucket, prefix, IAM,
   lifecycle, and encryption ownership.
@@ -39,8 +41,8 @@ deployment choices, see [deployment.md](deployment.md).
 - [ ] The dashboard is reachable only from an approved operator network or
   protected by deployment-level access controls; operators know dashboard
   tokens are page-memory-only and disappear on reload.
-- [ ] Admin tokens and `<data_dir>/auth-meta.sqlite` have an ownership,
-  revocation, and backup procedure.
+- [ ] Token ownership and revocation are documented; runtime-store backups
+  include the reserved system tenant that holds token fingerprints and scopes.
 
 ## Storage And Capacity
 
@@ -118,6 +120,8 @@ deployment choices, see [deployment.md](deployment.md).
 
 ## CDC And Export
 
+- [ ] `serve --changefeed` (or `AGENTDB_CHANGEFEED=1`) is enabled when exports
+  are required; it is disabled by default.
 - [ ] Export capability has been checked for each production tenant.
 - [ ] ClickHouse, JSONL, or Parquet export path is documented if used.
 - [ ] Exporters use a stable `--consumer` checkpoint key (one exporter per tenant).
@@ -150,8 +154,9 @@ deployment choices, see [deployment.md](deployment.md).
 
 Tenant payloads (session events, artifact content and metadata) can be sealed
 at rest under per-tenant keys. This is **opt-in** and currently supported for
-the **single-node persistent** layout only (the in-memory and replicated
-layouts fail closed if it is requested).
+the **single-node persistent** deployment. Replicated prefix and grouped layouts
+also have encryption wiring, but remain experimental cluster deployments.
+In-memory mode rejects envelope encryption.
 
 - [ ] To enable, set on the server:
 
@@ -186,12 +191,13 @@ layouts fail closed if it is requested).
   unreadable (that is also the crypto-shred property). Store it in a secrets
   manager / KMS, back it up independently of the data volume, and never log it.
 - [ ] Enabling on an existing deployment encrypts **new** writes; previously
-  written plaintext stays readable (mixed reader). There is no in-place bulk
-  migration yet.
+  written plaintext stays readable (mixed reader) and is not automatically
+  migrated. `agentdbctl encryption reencrypt` rewrites older encrypted versions;
+  verify storage coverage and backup key retention before retiring old keys.
 - [ ] Wrapped DEKs live in the runtime store under a reserved control-plane
   prefix; they are included in a normal backup and are useless without the KEK.
 - [ ] Startup **fails closed** if `envelope` is set without a KEK secret, with
-  the in-memory runtime, or with the replicated tablet layout. See
+  the in-memory runtime, or for replicated layouts without their shared catalog. See
   [../design/encryption-at-rest.md](../design/encryption-at-rest.md).
 
 ## Routine Operations

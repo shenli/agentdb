@@ -112,7 +112,8 @@ scopes: `admin` (full access to the admin and data planes), `readonly`
 (GET/HEAD anywhere), and `tenant` (data-plane access bound to exactly one
 tenant — mint with `{"scope": "tenant", "tenant_id": "t_..."}` against an
 existing tenant). A tenant-scoped bearer can only reach
-`/api/tenants/{its_tenant}/...` plus `GET /api/me`; everything else returns
+`/api/tenants/{its_tenant}/...`, `GET /api/me`, and `POST /api/sessions/open`
+(which validates the workspace against the token binding); other routes return
 403. `GET /api/me` reports the caller's scope and bound tenant, so an SDK can
 discover its workspace from the credential alone. Verification results are
 memoized in memory for `AGENTDB_AUTH_CACHE_TTL_MS` (default 60000; 0 disables

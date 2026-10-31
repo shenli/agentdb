@@ -32,9 +32,9 @@ COPY crates/agentdb-api/Cargo.toml crates/agentdb-api/
 COPY crates/agentdb-core/Cargo.toml crates/agentdb-core/
 COPY crates/agentdb-dashboard/Cargo.toml crates/agentdb-dashboard/
 COPY crates/agentdb-index/Cargo.toml crates/agentdb-index/
+COPY crates/agentdb-import/Cargo.toml crates/agentdb-import/
 COPY crates/agentdb-meta/Cargo.toml crates/agentdb-meta/
 COPY crates/agentdb-storage/Cargo.toml crates/agentdb-storage/
-COPY crates/agentdb-wire/Cargo.toml crates/agentdb-wire/
 COPY tools/agentdb-bench/Cargo.toml tools/agentdb-bench/
 COPY tools/agentdb-cluster-smoke/Cargo.toml tools/agentdb-cluster-smoke/
 
@@ -45,14 +45,14 @@ COPY tools/agentdb-cluster-smoke/Cargo.toml tools/agentdb-cluster-smoke/
 RUN mkdir -p bin/agentdb-server/src bin/agentdbctl/src crates/agentdb-api/src \
         crates/agentdb-core/src crates/agentdb-dashboard/src \
         crates/agentdb-index/src crates/agentdb-meta/src \
-        crates/agentdb-storage/src crates/agentdb-wire/src \
+        crates/agentdb-storage/src crates/agentdb-import/src \
         crates/agentdb-index/benches tools/agentdb-bench/src \
         tools/agentdb-cluster-smoke/src \
     && echo "fn main(){}" > bin/agentdb-server/src/main.rs \
     && echo "fn main(){}" > bin/agentdbctl/src/main.rs \
     && echo "fn main(){}" > tools/agentdb-bench/src/main.rs \
     && echo "fn main(){}" > tools/agentdb-cluster-smoke/src/main.rs \
-    && for c in api core dashboard index meta storage wire; do \
+    && for c in api core dashboard import index meta storage; do \
            echo "" > crates/agentdb-$c/src/lib.rs; \
        done \
     && echo "fn main(){}" > crates/agentdb-index/benches/vector_bench.rs \
@@ -84,6 +84,7 @@ WORKDIR /data
 
 COPY --from=builder --chown=agentdb:agentdb /src/target/release/agentdb /usr/local/bin/agentdb
 COPY --from=builder --chown=agentdb:agentdb /src/target/release/agentdbctl /usr/local/bin/agentdbctl
+COPY --chown=agentdb:agentdb LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/agentdb/
 
 # REST API. Dashboard shares the REST port.
 EXPOSE 7878

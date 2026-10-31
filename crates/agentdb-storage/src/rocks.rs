@@ -230,9 +230,7 @@ impl KvStore for RocksKvStore {
         // forward scan. `upper` is bound so its borrow outlives the iterator.
         let upper = prefix_upper_bound(prefix);
         let mut iter = match upper.as_deref() {
-            Some(ub) => self
-                .db
-                .iterator(IteratorMode::From(ub, Direction::Reverse)),
+            Some(ub) => self.db.iterator(IteratorMode::From(ub, Direction::Reverse)),
             None => self.db.iterator(IteratorMode::End),
         };
         match iter.next() {

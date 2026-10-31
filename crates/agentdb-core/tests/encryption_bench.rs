@@ -116,11 +116,7 @@ async fn run_mode(mode: &str, events: usize) -> (f64, f64, u64) {
         .map(|r| r.unwrap().1.len() as u64)
         .sum();
 
-    (
-        events as f64 / append_s,
-        events as f64 / fetch_s,
-        kv_bytes,
-    )
+    (events as f64 / append_s, events as f64 / fetch_s, kv_bytes)
 }
 
 /// Isolate the *pure* crypto cost — seal/open a 256-byte value in a tight loop,
@@ -142,7 +138,10 @@ fn keyring_seal_open_primitive_throughput() {
 
     println!();
     println!("crypto primitive — {iters} seals/opens of a 256B value (warm DEK cache)");
-    println!("{:>10}  {:>16}  {:>16}", "suite", "seal_ops_s", "open_ops_s");
+    println!(
+        "{:>10}  {:>16}  {:>16}",
+        "suite", "seal_ops_s", "open_ops_s"
+    );
     for mode in ["xchacha", "aes-gcm"] {
         let kr = keyring_for(mode);
         let sealed = kr.seal(&ctx, &payload).unwrap(); // warm the cache

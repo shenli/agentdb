@@ -6,10 +6,14 @@
 <div align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
   <a href="docs/README.md"><img src="https://img.shields.io/badge/docs-local-0f766e" alt="Docs"></a>
-  <a href="docs/quickstart.md"><img src="https://img.shields.io/badge/quickstart-5_min-7c3aed" alt="Quickstart"></a>
+  <a href="docs/quickstart.md"><img src="https://img.shields.io/badge/quickstart-guide-7c3aed" alt="Quickstart"></a>
 </div>
 
 <br>
+
+**Alpha:** intended for local and single-node evaluation. APIs and storage
+formats may change; back up data before upgrades. Distributed cluster operation
+is experimental and does not provide a Cell-level fault-isolation guarantee.
 
 AgentDB is a durable session log for AI agents. It stores what happened while an
 agent was running: messages, tool calls, tool outputs, artifacts, replay
@@ -29,7 +33,7 @@ runtime surface.
   alternate path.
 - **Keep runtime state together** across events, artifacts, replay, and fork
   history.
-- **Follow live state** through the changefeed — dashboards, supervisors,
+- **Follow live state** through the opt-in changefeed — dashboards, supervisors,
   evaluators, and tools.
 
 General databases can store agent data. AgentDB focuses on the workload shape
@@ -72,6 +76,12 @@ append, then forks the session into an alternate timeline.
 
 For the full walkthrough, including TypeScript and local tooling checks, see
 [docs/quickstart.md](docs/quickstart.md).
+
+Use `agentdb serve` for persistent local storage. RocksDB WAL fsync is enabled
+by default; the development server above loses its data on exit. Add
+`serve --changefeed` when you need the changefeed or exports; they are disabled
+by default. See [deployment](docs/operations/deployment.md) for authentication
+and storage setup.
 
 ## SDKs
 

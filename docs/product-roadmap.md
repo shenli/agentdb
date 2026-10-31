@@ -14,7 +14,7 @@ For the conceptual motivation and positioning, see
   sequence numbers, append-and-fetch, idempotency, and backpressure reporting.
 - Native tenant-scoped HTTP API plus maintained Python and TypeScript SDKs;
   mandatory rotating installation bearer authentication on non-loopback binds,
-  metadata-backed admin/read-only tokens, and separate internal Raft
+  metadata-backed admin/read-only/tenant-scoped tokens, and separate internal Raft
   authentication.
 - Session-first dashboard mounted at `/dashboard`, with assets embedded in the
   binary and bearer credentials kept only in page memory.
@@ -27,7 +27,7 @@ For the conceptual motivation and positioning, see
 - Sandbox snapshot references: `SnapshotRef` / `SnapshotLayer` metadata on
   sessions, resume resolution across fork chains, dangling/expired ref fallback
   semantics, and the external sandbox-service contract.
-- Changefeed and export: a single ledger-ordered `GET /api/tenants/{t}/changes`
+- Changefeed and export (opt-in via `serve --changefeed`): a single ledger-ordered `GET /api/tenants/{t}/changes`
   changefeed carrying events and `fork_edge` control items under `ledger:`
   cursors, export backfill, and client-side export checkpoints (consumers hold
   their own resume cursor and advance it only after a sink accepts a batch).
@@ -50,9 +50,11 @@ For the conceptual motivation and positioning, see
   production preflight checklist, distinct live/ready probes, local artifact
   failure cleanup/startup orphan reconciliation, and explicit startup hydration
   row/byte limits.
-- Release packaging: Docker images and tagged binary archives include both
+- Release packaging: Docker builds and tagged binary archive workflows include both
   `agentdb` and `agentdbctl`, so diagnostic, backup/restore, and export commands
-  do not require a source checkout.
+  do not require a source checkout once artifacts are published. Tagged builds
+  create draft alpha releases for validation before publication. PR/main CI checks
+  formatting, Rust/SDK behavior, release inputs, licenses, and secret history.
 - Credential boundary hardening: opaque event-level `credential_refs`, SDK raw
   secret payload validators, optional server-side raw-secret field rejection,
   and runtime tool-result sanitization.
@@ -66,11 +68,11 @@ For the conceptual motivation and positioning, see
 
 ## Partial / Needs Hardening
 
-- **Authentication and authorization.** Static bearer auth and scoped admin
-  tokens protect non-loopback deployments, but loopback development can remain
-  open and the static token remains installation-wide. Per-principal tenant
-  authorization, identity-provider integration, and audit attribution belong
-  to future hosted or control-plane work.
+- **Authentication and authorization.** Static installation tokens and
+  admin/read-only/tenant-scoped tokens are implemented. Loopback bootstrap
+  closes for both admin and data routes after the first token is minted.
+  Identity-provider integration, richer end-user roles, and audit attribution
+  remain hosted or control-plane work.
 - **Startup and content scale.** Single-node startup hydration is now bounded at
   512 MiB of serialized keys/values and explicit per-prefix row defaults, but
   decoded state can consume more memory and startup still scans each prefix
@@ -93,8 +95,9 @@ For the conceptual motivation and positioning, see
   Code and Codex history, imported by `agentdbctl` — real sessions, not a
   synthetic app — explored through the MCP adapter (replay and search) and the
   dashboard timeline. The release smoke test is the recovery loop (append,
-  crash, resume, artifact recovery, replay, fork) run against those imported
-  sessions.
+  crash, resume, artifact recovery, replay, fork) using synthetic sessions in
+  `scripts/release-smoke.py`; importing personal history is an optional demo,
+  never a CI prerequisite.
 - **Distributed/tablet operation.** The codebase has substantial evaluation
   machinery, but the production-default posture is still single-node. The
   distributed story needs a clear OSS/managed boundary, stable operator
@@ -106,12 +109,13 @@ For the conceptual motivation and positioning, see
   checkpoints, archive-aware compaction, and checkpoint-plus-log bucket restore
   remain proposed in
   [`design/s3-committed-log-archive.md`](design/s3-committed-log-archive.md).
-- **Encryption at rest and BYOK.** KMS availability, key-ID resolution, crypto
-  adapter seams, and envelope framing exist, but the default adapters preserve
-  plaintext. Production authenticated encryption, durable-path coverage, a
-  wrapped-DEK catalog and bounded cache, rotation and revocation workflows,
-  backup/restore validation, and benchmark qualification remain. See
-  [`design/encryption-at-rest.md`](design/encryption-at-rest.md).
+- **Encryption at rest and BYOK.** Opt-in authenticated envelope encryption,
+  wrapped-DEK catalogs, an external KEK command seam, rotation, revocation,
+  re-encryption, and guarded version retirement are implemented. Encryption is
+  disabled by default. Cluster integration remains part of the experimental
+  cluster surface; backup-retention/key-destruction policy and deployment-specific
+  KMS, restore, and performance qualification still need operator validation.
+  See [`design/encryption-at-rest.md`](design/encryption-at-rest.md).
 - **Sandbox snapshot integration.** AgentDB owns refs and resolution; the
   external sandbox service still must implement capture, upload, copy-on-write
   fork, restore, byte retention, metrics, and dangling-ref handling.

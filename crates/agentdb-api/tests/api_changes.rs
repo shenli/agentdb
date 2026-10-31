@@ -49,7 +49,10 @@ async fn append(app: &TestApp, s: &Session, n: i64) {
 
 async fn changes(app: &TestApp, tenant: &str, query: &str) -> Value {
     app.client
-        .get(format!("{}/api/tenants/{}/changes?{}", app.base, tenant, query))
+        .get(format!(
+            "{}/api/tenants/{}/changes?{}",
+            app.base, tenant, query
+        ))
         .send()
         .await
         .unwrap()
@@ -74,18 +77,32 @@ async fn changes_returns_committed_events_and_a_resumable_cursor() {
         .iter()
         .filter(|it| it["object_type"] == "event")
         .count();
-    assert_eq!(event_count, 3, "all three appended events should be in the feed");
-    let next = page["next_cursor"].as_str().expect("a next_cursor").to_string();
+    assert_eq!(
+        event_count, 3,
+        "all three appended events should be in the feed"
+    );
+    let next = page["next_cursor"]
+        .as_str()
+        .expect("a next_cursor")
+        .to_string();
 
     // Resuming from the tail yields no further events.
-    let tail = changes(&app, &s.tenant_id, &format!("from_cursor={}", urlencode(&next))).await;
+    let tail = changes(
+        &app,
+        &s.tenant_id,
+        &format!("from_cursor={}", urlencode(&next)),
+    )
+    .await;
     let tail_events = tail["items"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|it| it["object_type"] == "event")
         .count();
-    assert_eq!(tail_events, 0, "resuming from next_cursor returns no new events");
+    assert_eq!(
+        tail_events, 0,
+        "resuming from next_cursor returns no new events"
+    );
 }
 
 #[tokio::test]

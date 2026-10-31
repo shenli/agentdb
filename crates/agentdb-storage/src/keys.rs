@@ -88,4 +88,3 @@ pub fn record_commit_key(tenant_id: &str, record_id: &str) -> String {
 pub fn record_index_outbox_key(tenant_id: &str, commit_seq: u64, record_id: &str) -> String {
     format!("record/searchable_index_outbox/{tenant_id}/{commit_seq:020}/{record_id}")
 }
-

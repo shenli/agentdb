@@ -29,11 +29,11 @@ pub use content_crypto::{
     ContentCryptoAdapter, ContentCryptoContext, IdentityContentCryptoAdapter,
 };
 pub use crypto::{
-    envelope_dek_version, is_envelope_v2, AeadTenantKeyring, CatalogKeyProvider, CryptoConfig,
-    CryptoContext, CryptoError,
-    CryptoMode, Dek, DekCacheConfig, DekLease, DekRecord, DekStatus, DisabledEnvelopeCrypto,
-    EnvelopeCrypto, EnvelopeParts, KekProvider, KeyCatalog, KeyMetadata, KeyProvider, KeyPurpose,
-    CommandKekProvider, LocalKekProvider, LocalKeyProvider, Suite, WrappedDek,
+    envelope_dek_version, is_envelope_v2, AeadTenantKeyring, CatalogKeyProvider,
+    CommandKekProvider, CryptoConfig, CryptoContext, CryptoError, CryptoMode, Dek, DekCacheConfig,
+    DekLease, DekRecord, DekStatus, DisabledEnvelopeCrypto, EnvelopeCrypto, EnvelopeParts,
+    KekProvider, KeyCatalog, KeyMetadata, KeyProvider, KeyPurpose, LocalKekProvider,
+    LocalKeyProvider, Suite, WrappedDek,
 };
 pub use error::{Error, Result};
 pub use kms::{

@@ -25,14 +25,12 @@ use crate::MetaDialect;
 /// `001_initial.{sql,pg.sql}` in place rather than adding a new numbered
 /// migration. Once there ARE clusters to preserve, resume appending new
 /// entries here (NEVER renumbering the consolidated `1`).
-const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
-    (
-        1,
-        "initial control-plane schema",
-        include_str!("../migrations/001_initial.sql"),
-        include_str!("../migrations/001_initial.pg.sql"),
-    ),
-];
+const MIGRATIONS: &[(i64, &str, &str, &str)] = &[(
+    1,
+    "initial control-plane schema",
+    include_str!("../migrations/001_initial.sql"),
+    include_str!("../migrations/001_initial.pg.sql"),
+)];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
 /// runner which SQL variant to embed.

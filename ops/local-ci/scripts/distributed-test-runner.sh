@@ -11,7 +11,7 @@ usage() {
   cat <<'EOF'
 Usage: ops/local-ci/scripts/distributed-test-runner.sh [OPTIONS]
 
-Runs the distributed test plan gates intended for li-dev:
+Runs the distributed test plan gates on a Linux CI host:
   quick    - authored Rust auto suites
   nightly  - quick + S14-S18 crash/chaos + agent-experience evals + S8 + S9 + S13 smoke
   release  - quick + S14-S18 crash/chaos + agent-experience evals + S8 + S9 + S13 release gate

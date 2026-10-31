@@ -1610,12 +1610,16 @@ async fn internal_tablet_movement_snapshot_export_returns_retargeted_payload() {
         .await
         .unwrap();
     let payload = response.payload().unwrap();
-    let snapshot: agentdb_core::tablet_state::TabletStateSnapshot =
-        serde_json::from_slice(&payload).unwrap();
+    assert!(
+        payload.starts_with(b"ADBS"),
+        "export must use the binary snapshot codec"
+    );
+    let snapshot = agentdb_core::tablet_state::TabletStateSnapshot::decode(&payload).unwrap();
 
     assert_eq!(response.source_tablet_id, 7);
     assert_eq!(response.target_tablet_id, 8);
     assert_eq!(snapshot.tablet_id, 8);
+    assert_eq!(response.applied_index, snapshot.applied_index);
     assert!(snapshot
         .entries
         .iter()

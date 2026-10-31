@@ -135,15 +135,17 @@ GET  /health/ready
 The native API has two bearer-token mechanisms. A rotating static installation
 token protects every external `/api/*` route and is mandatory for a
 non-loopback bind; either its current or previous value is accepted during
-rotation. On `/api/admin/*`, metadata-backed tokens are an alternate credential
-with `admin` or read-only scope. When no static token is configured, loopback
-data routes remain open for local development and local admin bootstrap remains
-open only until the first metadata-backed admin token is ever minted; revoking
-all tokens does not reopen bootstrap. These controls
-are coarse installation/admin authentication, not tenant-scoped end-user
-authorization. Internal Raft routes keep a separate rotating token, while
-health and dashboard assets remain public. Network deployments must terminate
-TLS before the HTTP listener.
+rotation. Metadata-backed bearer tokens additionally support full-access
+`admin`, `readonly` (`GET`/`HEAD`), and `tenant` (one bound tenant) scopes.
+Without a static token, loopback bootstrap permits access only until the first
+metadata token is minted; this closes both admin and data routes permanently,
+even after all tokens are revoked. Token fingerprints and scope/revocation
+records live under the reserved system tenant in the runtime store, not just
+control-plane SQL. The system tenant cannot be accessed via public HTTP routes.
+Identity-provider integration and end-user role management remain separate
+concerns. Internal Raft uses a separate rotating token; health and dashboard
+assets remain public. Network deployments must terminate TLS before the HTTP
+listener.
 
 Dashboard HTML, JavaScript, and CSS are compiled into `agentdb`, so a release
 binary does not depend on a source-tree asset directory. The page keeps a
@@ -221,7 +223,8 @@ endpoint is deprecated in favor of it.
 
 - `replay` reconstructs a fork-aware event view.
 - `changes` (`GET /api/tenants/{tenant_id}/changes`) is the single public
-  changefeed: ledger-ordered tenant/session-scoped items over the export ledger,
+  changefeed (opt-in via `serve --changefeed`; disabled by default):
+  ledger-ordered tenant/session-scoped items over the export ledger,
   addressed by `ledger:` cursors. It is the only changefeed; the earlier
   per-session `watch`/`subscribe` endpoints have been removed.
 - `context` builds a budgeted pack from recent events, searched records, and

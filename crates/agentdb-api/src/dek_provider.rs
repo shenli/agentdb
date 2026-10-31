@@ -132,10 +132,10 @@ impl MetaCatalogKeyProvider {
             .write()
             .expect("dek map poisoned")
             .insert((tenant_id.to_string(), purpose), lease.clone());
-        self.by_version
-            .write()
-            .expect("dek map poisoned")
-            .insert((tenant_id.to_string(), purpose, winner.version as u32), lease);
+        self.by_version.write().expect("dek map poisoned").insert(
+            (tenant_id.to_string(), purpose, winner.version as u32),
+            lease,
+        );
         Ok(meta)
     }
 
@@ -250,14 +250,10 @@ impl MetaCatalogKeyProvider {
         versions_in_use: &[u32],
     ) -> Result<usize, CryptoError> {
         let in_use: Vec<i64> = versions_in_use.iter().map(|&v| v as i64).collect();
-        let retired = dek_catalog::retire_drained_versions(
-            &self.pool,
-            tenant_id,
-            purpose.as_str(),
-            &in_use,
-        )
-        .await
-        .map_err(|e| CryptoError::Config(format!("key catalog retire: {e}")))?;
+        let retired =
+            dek_catalog::retire_drained_versions(&self.pool, tenant_id, purpose.as_str(), &in_use)
+                .await
+                .map_err(|e| CryptoError::Config(format!("key catalog retire: {e}")))?;
         // Reload so the retired versions (now non-readable) leave the maps.
         self.refresh().await?;
         Ok(retired as usize)
@@ -393,12 +389,14 @@ impl agentdb_core::TenantKeyRevoker for CatalogKeyAdmin {
         tenant_id: &str,
         destroy: bool,
     ) -> Result<(), agentdb_core::errors::Error> {
-        self.provider.revoke_tenant(tenant_id, destroy).map_err(|e| {
-            agentdb_core::errors::Error::new(
-                agentdb_core::errors::ErrorCode::Internal,
-                format!("tenant key revocation failed: {e}"),
-            )
-        })?;
+        self.provider
+            .revoke_tenant(tenant_id, destroy)
+            .map_err(|e| {
+                agentdb_core::errors::Error::new(
+                    agentdb_core::errors::ErrorCode::Internal,
+                    format!("tenant key revocation failed: {e}"),
+                )
+            })?;
         Ok(())
     }
 }
@@ -483,7 +481,9 @@ mod tests {
     };
 
     async fn pool() -> AnyPool {
-        let meta = agentdb_meta::MetaStore::open_sqlite(":memory:").await.unwrap();
+        let meta = agentdb_meta::MetaStore::open_sqlite(":memory:")
+            .await
+            .unwrap();
         meta.pool().clone()
     }
 
@@ -521,8 +521,16 @@ mod tests {
         // catalog. Node A provisions + seals; node B, after a refresh, opens the
         // very same ciphertext.
         let pool = pool().await;
-        let node_a = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
-        let node_b = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
+        let node_a = Arc::new(
+            MetaCatalogKeyProvider::load(pool.clone(), kek())
+                .await
+                .unwrap(),
+        );
+        let node_b = Arc::new(
+            MetaCatalogKeyProvider::load(pool.clone(), kek())
+                .await
+                .unwrap(),
+        );
         let ctx = CryptoContext {
             tenant_id: "ten_a",
             purpose: KeyPurpose::Content,
@@ -531,17 +539,22 @@ mod tests {
         };
 
         node_a.provision_all("ten_a").await.unwrap();
-        let sealed = AeadTenantKeyring::new(node_a.clone(), Suite::XChaCha20Poly1305, DekCacheConfig::default())
-            .seal(&ctx, b"payload")
-            .unwrap();
+        let sealed = AeadTenantKeyring::new(
+            node_a.clone(),
+            Suite::XChaCha20Poly1305,
+            DekCacheConfig::default(),
+        )
+        .seal(&ctx, b"payload")
+        .unwrap();
 
         // Node B hasn't refreshed yet → fails closed.
         assert!(node_b.active_dek("ten_a", KeyPurpose::Content).is_err());
         node_b.refresh().await.unwrap();
         // After refresh, node B opens node A's ciphertext under the shared DEK.
-        let opened = AeadTenantKeyring::new(node_b, Suite::XChaCha20Poly1305, DekCacheConfig::default())
-            .open(&ctx, &sealed)
-            .unwrap();
+        let opened =
+            AeadTenantKeyring::new(node_b, Suite::XChaCha20Poly1305, DekCacheConfig::default())
+                .open(&ctx, &sealed)
+                .unwrap();
         assert_eq!(opened, b"payload");
     }
 
@@ -550,8 +563,16 @@ mod tests {
         use agentdb_core::TenantKeyRotator;
 
         let pool = pool().await;
-        let node_a = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
-        let node_b = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
+        let node_a = Arc::new(
+            MetaCatalogKeyProvider::load(pool.clone(), kek())
+                .await
+                .unwrap(),
+        );
+        let node_b = Arc::new(
+            MetaCatalogKeyProvider::load(pool.clone(), kek())
+                .await
+                .unwrap(),
+        );
         let ctx = CryptoContext {
             tenant_id: "ten_a",
             purpose: KeyPurpose::Content,
@@ -620,7 +641,8 @@ mod tests {
             2
         );
         // After refresh node B opens BOTH the v1 and v2 ciphertext.
-        let kr_b = AeadTenantKeyring::new(node_b, Suite::XChaCha20Poly1305, DekCacheConfig::default());
+        let kr_b =
+            AeadTenantKeyring::new(node_b, Suite::XChaCha20Poly1305, DekCacheConfig::default());
         assert_eq!(kr_b.open(&ctx, &sealed_v1).unwrap(), b"v1-payload");
         assert_eq!(kr_b.open(&ctx, &sealed_v2).unwrap(), b"v2-payload");
     }
@@ -628,7 +650,11 @@ mod tests {
     #[tokio::test]
     async fn revoke_tenant_soft_then_shred_stops_serving_and_reloads_empty() {
         let pool = pool().await;
-        let provider = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
+        let provider = Arc::new(
+            MetaCatalogKeyProvider::load(pool.clone(), kek())
+                .await
+                .unwrap(),
+        );
         provider.provision_all("ten_a").await.unwrap();
         assert!(provider.active_dek("ten_a", KeyPurpose::Content).is_ok());
 
@@ -638,7 +664,11 @@ mod tests {
         assert!(provider.active_dek("ten_a", KeyPurpose::Content).is_err());
         // ...and a fresh node loading the catalog does NOT serve the revoked keys
         // (rows are marked revoked, so they never enter the active map).
-        let reloaded = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
+        let reloaded = Arc::new(
+            MetaCatalogKeyProvider::load(pool.clone(), kek())
+                .await
+                .unwrap(),
+        );
         assert!(reloaded.active_dek("ten_a", KeyPurpose::Content).is_err());
 
         // Crypto-shred: the rows are deleted outright.
@@ -658,17 +688,26 @@ mod tests {
             object_kind: "event",
             object_id: "o1",
         };
-        let first = Arc::new(MetaCatalogKeyProvider::load(pool.clone(), kek()).await.unwrap());
+        let first = Arc::new(
+            MetaCatalogKeyProvider::load(pool.clone(), kek())
+                .await
+                .unwrap(),
+        );
         first.provision_all("ten_a").await.unwrap();
-        let sealed = AeadTenantKeyring::new(first, Suite::XChaCha20Poly1305, DekCacheConfig::default())
-            .seal(&ctx, b"payload")
-            .unwrap();
+        let sealed =
+            AeadTenantKeyring::new(first, Suite::XChaCha20Poly1305, DekCacheConfig::default())
+                .seal(&ctx, b"payload")
+                .unwrap();
 
         // A fresh provider (process restart) pre-warms from the catalog and opens it.
         let restarted = Arc::new(MetaCatalogKeyProvider::load(pool, kek()).await.unwrap());
-        let opened = AeadTenantKeyring::new(restarted, Suite::XChaCha20Poly1305, DekCacheConfig::default())
-            .open(&ctx, &sealed)
-            .unwrap();
+        let opened = AeadTenantKeyring::new(
+            restarted,
+            Suite::XChaCha20Poly1305,
+            DekCacheConfig::default(),
+        )
+        .open(&ctx, &sealed)
+        .unwrap();
         assert_eq!(opened, b"payload");
     }
 }

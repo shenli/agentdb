@@ -440,7 +440,11 @@ impl AsyncMirrorContentBackend {
             ..MirrorReconcileReport::default()
         };
         for object in listing.objects {
-            match self.mirror.head(&object.tenant_id, &object.artifact_id).await {
+            match self
+                .mirror
+                .head(&object.tenant_id, &object.artifact_id)
+                .await
+            {
                 Ok(true) => report.already_mirrored += 1,
                 Ok(false) => match self
                     .requeue_local_object(&object.tenant_id, &object.artifact_id)
@@ -498,7 +502,12 @@ impl AsyncMirrorContentBackend {
         {
             Ok(()) => RequeueOutcome::Requeued(byte_len),
             Err(error) => {
-                tracing::warn!(?error, tenant_id, artifact_id, "mirror reconcile enqueue failed");
+                tracing::warn!(
+                    ?error,
+                    tenant_id,
+                    artifact_id,
+                    "mirror reconcile enqueue failed"
+                );
                 RequeueOutcome::Error
             }
         }
